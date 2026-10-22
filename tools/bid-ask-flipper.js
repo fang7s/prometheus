@@ -1,4 +1,4 @@
-import { getPoolDetail, getMyPositions, closePosition, deployPosition } from "./dlmm.js";
+import { getActiveBin, getMyPositions, closePosition, deployPosition } from "./dlmm.js";
 import { getWalletBalances, swapToken } from "./wallet.js";
 import { config } from "../config.js";
 import { log } from "../logger.js";
