@@ -892,6 +892,11 @@ async function runSafetyChecks(name, args) {
       return { pass: true };
     }
 
+    case "get_net_worth": {
+      // Basic check — always allowed since it's read-only
+      return { pass: true };
+    }
+
     default:
       return { pass: true };
   }

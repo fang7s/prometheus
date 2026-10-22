@@ -36,6 +36,7 @@ import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnable
 import { appendDecision } from "./decision-log.js";
 // Import only what we actually need for the new functionality
 import { evaluateEvilPandaCandidate, checkEvilPandaExitConfluence, getEvilPandaRecommendedParams } from "./tools/evil-panda-enhanced.js";
+import { checkAllPositionsForFlip } from "./tools/bid-ask-flipper.js";
 
 import { REPO_ROOT, repoPath } from "./repo-root.js";
 
