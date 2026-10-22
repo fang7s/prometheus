@@ -140,3 +140,63 @@ async function checkFlipConditions(position, metrics) {
   
   return true;
 }
+
+/**
+ * Check all positions for potential flip opportunities
+ * @returns {Promise<void>} 
+ */
+export async function checkAllPositionsForFlip() {
+  try {
+    // Get all my positions
+    const positions = await getMyPositions({ force: true, silent: true });
+    
+    if (!positions || !positions.positions || positions.positions.length === 0) {
+      log("flipper_info", "No positions found to analyze for flip opportunities");
+      return;
+    }
+    
+    log("flipper_info", `Analyzing ${positions.positions.length} positions for flip opportunities`);
+    
+    // Process each position
+    for (const position of positions.positions) {
+      // Skip if this position shouldn't be analyzed
+      if (!shouldAnalyzeForFlip(position)) {
+        continue;
+      }
+      
+      try {
+        // Get pool metrics for this position's pool
+        const metrics = await getPoolMetrics(position.pool_address);
+        
+        if (!metrics) {
+          log("flipper_warn", `Could not get metrics for position ${position.position}`);
+          continue;
+        }
+        
+        // Evaluate if this position should be flipped
+        const result = await evaluateFlipOpportunity(position, metrics);
+        
+        if (result.success) {
+          log("flipper_debug", `Flip evaluation for position ${position.position}: ${result.action} - ${result.reason}`);
+          
+          if (result.action === "FLIP") {
+            // Implement flip logic here
+            log("flipper_info", `Would flip position ${position.position}`);
+            // TODO: implement actual flip logic
+            // For now, just logging
+          } else if (result.action === "CLOSE") {
+            // Implement close logic here
+            log("flipper_info", `Would close position ${position.position}`);
+            // TODO: implement actual close logic
+            // For now, just logging
+          }
+        }
+      } catch (error) {
+        log("flipper_error", `Error evaluating position ${position.position} for flip: ${error.message}`);
+      }
+    }
+  } catch (error) {
+    log("flipper_error", `Error in checkAllPositionsForFlip: ${error.message}`);
+    throw error;
+  }
+}
