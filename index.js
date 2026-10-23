@@ -35,7 +35,7 @@ import { getWeightsSummary } from "./signal-weights.js";
 import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
 import { appendDecision } from "./decision-log.js";
 // Import only what we actually need for the new functionality
-import { evaluateEvilPandaCandidate, checkEvilPandaExitConfluence, getEvilPandaRecommendedParams } from "./tools/evil-panda-enhanced.js";
+import { evaluateEvilPandaCandidate, checkEvilPandaExitConfluence, getEvilPandaRecommendedParams, fetchPriceSeries } from "./tools/evil-panda-enhanced.js";
 import { checkAllPositionsForFlip } from "./tools/bid-ask-flipper.js";
 
 import { REPO_ROOT, repoPath } from "./repo-root.js";
@@ -94,6 +94,7 @@ function buildPrompt() {
 let _cronTasks = [];
 let _managementBusy = false; // prevents overlapping management cycles
 let _screeningBusy = false;  // prevents overlapping screening cycles
+let _flipperBusy = false;    // prevents overlapping bid-ask flipper cycles
 let _screeningLastTriggered = 0; // epoch ms — prevents management from spamming screening
 // Exit/peak confirmation is now done by consecutive-tick counting in state.js
 // (registerExitSignal / confirmPeak), driven by the 3s RPC poller — no setTimeout rechecks.
@@ -264,9 +265,13 @@ export async function runManagementCycle({ silent = false } = {}) {
       }
     }
     
-    // Check for Evil Panda exit conditions 
+    // Evil Panda indicator confluence — merged into the same exit pipeline so a
+    // confluence hit closes the position instead of only sending an alert.
     try {
-      await checkEvilPandaExitConditions(positions);
+      const pandaExits = await checkEvilPandaExitConditions(positions);
+      for (const [positionAddress, reason] of pandaExits) {
+        if (!exitMap.has(positionAddress)) exitMap.set(positionAddress, reason);
+      }
     } catch (error) {
       log("error", `Error checking Evil Panda exit conditions: ${error.message}`);
     }
@@ -697,6 +702,30 @@ export function startCronJobs() {
     await runManagementCycle();
   });
 
+  // Bid-Ask Flipper — range rebalance / close engine, every 10m by default.
+  // Holds the management lock so a flip can't overlap a management/poller close.
+  let flipperTask = null;
+  if (config.flipper?.enabled) {
+    const flipIntervalMin = Math.min(59, Math.max(1, Math.round(Number(config.flipper.intervalMin ?? 10))));
+    flipperTask = cron.schedule(`*/${flipIntervalMin} * * * *`, async () => {
+      if (_flipperBusy || _managementBusy) return;
+      _flipperBusy = true;
+      _managementBusy = true;
+      try {
+        const results = await checkAllPositionsForFlip();
+        const executed = (results || []).filter((entry) => entry.executed);
+        if (executed.length) {
+          log("flipper_info", `Executed: ${executed.map((entry) => `${entry.pair || entry.pool || entry.position} ${entry.action}`).join(" | ")}`);
+        }
+      } catch (error) {
+        log("flipper_error", `Flip cycle failed: ${error.message}`);
+      } finally {
+        _flipperBusy = false;
+        _managementBusy = false;
+      }
+    });
+  }
+
   const screenTask = cron.schedule(`*/${Math.max(1, config.schedule.screeningIntervalMin)} * * * *`, runScreeningCycle);
 
   const healthTask = cron.schedule(`0 * * * *`, async () => {
@@ -744,18 +773,25 @@ Summarize the current portfolio health, total fees earned, and performance of al
       for (const p of result.positions) {
         confirmPeak(p.position, p.pnl_pct, confirmTicks);
 
-        // Detect an exit signal this tick (rule-based exits, then deterministic close rules).
+        // Detect an exit signal this tick (rule-based exits, then deterministic
+        // close rules, then the Evil Panda indicator confluence).
         const exit = updatePnlAndCheckExits(p.position, p, config.management);
         const closeRule = exit ? null : getDeterministicCloseRule(p, config.management);
+        const panda = exit || closeRule ? null : await getPandaExitSignal(p);
         let signal = null, reason = null, rule = "exit";
         if (exit) { signal = exit.action; reason = exit.reason; }
         else if (closeRule) { signal = `RULE_${closeRule.rule}`; reason = closeRule.reason; rule = closeRule.rule; }
+        else if (panda) { signal = panda.signal; reason = panda.reason; rule = panda.signal; }
 
-        // Require N consecutive confirming ticks before acting.
-        const { fire } = registerExitSignal(p.position, signal, confirmTicks);
+        // Require N consecutive confirming ticks before acting. Panda confluence is
+        // stricter, so it uses its own (higher) confirmation threshold.
+        const requiredTicks = signal === "EVIL_PANDA"
+          ? Math.max(1, Number(config.panda?.confirmTicks ?? confirmTicks))
+          : confirmTicks;
+        const { fire } = registerExitSignal(p.position, signal, requiredTicks);
         if (!signal || !fire) continue;
 
-        log("state", `[PnL poll] ${signal} confirmed (${confirmTicks} ticks): ${p.pair} — ${reason} — closing directly`);
+        log("state", `[PnL poll] ${signal} confirmed (${requiredTicks} ticks): ${p.pair} — ${reason} — closing directly`);
         // Hold the management lock so the cron cycle can't double-act on this position.
         _managementBusy = true;
         try {
@@ -832,7 +868,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
     }, oppMs);
   }
 
-  _cronTasks = [mgmtTask, screenTask, healthTask, briefingTask, briefingWatchdog];
+  _cronTasks = [mgmtTask, screenTask, healthTask, briefingTask, briefingWatchdog, flipperTask].filter(Boolean);
   // Store interval refs so stopCronJobs can clear them
   _cronTasks._pnlPollInterval = pnlPollInterval;
   _cronTasks._opportunityPollInterval = opportunityPollInterval;
@@ -2042,49 +2078,59 @@ Focus on: hold duration, entry/exit timing, what win rates look like, whether sc
 }
 
 /**
- * Check for and notify Evil Panda exit conditions for active positions
+ * Fetch a real price series and evaluate the Evil Panda indicator confluence.
+ * Returns { signal, reason } when a confluence exit fires, otherwise null.
+ * @param {Object} position - Position from getMyPositions (needs .pool)
+ */
+async function getPandaExitSignal(position) {
+  if (!config.panda?.enabled || !position?.pool) return null;
+  try {
+    const series = await fetchPriceSeries({
+      pool_address: position.pool,
+      timeframe: config.panda.timeframe,
+      limit: config.panda.candles,
+      cacheSec: config.panda.cacheSec,
+    });
+    if (!series || !Array.isArray(series.prices) || series.prices.length < 35) return null;
+
+    // Signature: checkEvilPandaExitConfluence(prices[], currentPrice)
+    const result = checkEvilPandaExitConfluence(series.prices, series.currentPrice);
+    if (!result?.shouldExit) return null;
+
+    return {
+      signal: "EVIL_PANDA",
+      reason: `${result.reason} [${series.source}, ${series.prices.length} candles ${series.timeframe}]`,
+    };
+  } catch (error) {
+    log("panda_warn", `Panda exit check failed for ${position.pair || position.pool}: ${error.message}`);
+    return null;
+  }
+}
+
+/**
+ * Check active positions for Evil Panda exit confluences.
+ * Returns a Map(position_address -> reason) so the caller feeds the normal
+ * exit pipeline (registerExitSignal / close_position) instead of only alerting.
  * @param {Array} positions - List of current positions
+ * @returns {Promise<Map<string,string>>}
  */
 async function checkEvilPandaExitConditions(positions) {
-  try {
-    if (!positions || !Array.isArray(positions) || positions.length === 0) {
-      return;
-    }
-    
-    // Only check if Telegram is enabled
-    if (!telegramEnabled()) {
-      return;
-    }
+  const exits = new Map();
+  if (!Array.isArray(positions) || positions.length === 0) return exits;
+  if (!config.panda?.enabled) return exits;
 
-    // For each position, check for exit conditions  
-    for (const position of positions) {
-      try {
-        const tracked = getTrackedPosition(position.position);
-        if (!tracked || !tracked.signal_snapshot) {
-          continue;
-        }
+  for (const position of positions) {
+    try {
+      const tracked = getTrackedPosition(position.position);
+      if (!tracked || tracked.closed) continue;
 
-        // Check if exit conditions are met
-        const exitResult = checkEvilPandaExitConfluence(
-          tracked.signal_snapshot.price_data, 
-          tracked.signal_snapshot.indicator_data
-        );
-        
-        if (exitResult.shouldExit) {
-          // Send alert to Telegram
-          await sendMessage(`🐼 [EVIL PANDA BOUNCE EXIT TRIGGERED]
-Reason: ${exitResult.reason}
-Action: Close position and harvest fees!`).catch((error) => {
-            log("telegram_error", `Failed to send Evil Panda exit notification: ${error.message}`);
-          });
-        }
-      } catch (error) {
-        log("error", `Error checking Evil Panda exit condition for position ${position.position}: ${error.message}`);
-      }
+      const panda = await getPandaExitSignal(position);
+      if (panda?.signal) exits.set(position.position, panda.reason);
+    } catch (error) {
+      log("error", `Error checking Evil Panda exit condition for position ${position.position}: ${error.message}`);
     }
-  } catch (error) {
-    log("error", `Error in Evil Panda exit checking: ${error.message}`);
   }
+  return exits;
 }
 
 /**
@@ -2094,33 +2140,31 @@ Action: Close position and harvest fees!`).catch((error) => {
 async function sendEvilPandaPoolAnalysis(pool) {
   try {
     if (!pool) return;
-    
+
     // Evaluate pool against Evil Panda criteria
     const pandaResult = evaluateEvilPandaCandidate(pool);
-    
+    const reasons = Array.isArray(pandaResult.reasons) ? pandaResult.reasons : [];
+    const recommendedParams = getEvilPandaRecommendedParams(pool);
+    const poolLabel = pool.name || `${String(pool.pool_address || "").slice(0, 8)}...`;
+
     // Format the analysis results
-    let analysis = `🐼 Evil Panda Analysis for ${pool.name} (${pool.pool_address.slice(0, 8)}...)\n`;
-    
+    let analysis = `🐼 Evil Panda Analysis for ${poolLabel}\n`;
+
     // Screening criteria results
     analysis += `\n🎯 Screening Criteria:\n`;
-    analysis += `  • Market Cap: ${pandaResult.reasons.mcap.message}\n`;
-    analysis += `  • 24h Volume: ${pandaResult.reasons.volume.message}\n`;
-    analysis += `  • Phishing: ${pandaResult.reasons.phishing.message}\n`;
-    analysis += `  • Bundling: ${pandaResult.reasons.bundling.message}\n`;
-    analysis += `  • Insiders: ${pandaResult.reasons.insiders.message}\n`;
-    analysis += `  • Top 10 Holders: ${pandaResult.reasons.top10Holders.message}\n`;
-    
+    for (const reason of reasons) {
+      analysis += `  • ${reason}\n`;
+    }
+
     // Overall pass/fail
-    analysis += `\n📌 Overall: ${pandaResult.pass ? '✅ PASS' : '❌ FAIL'}\n`;
-    
+    analysis += `\n📌 Overall: ${pandaResult.passed ? "✅ PASS" : "❌ FAIL"}\n`;
+
     // Recommended parameters
-    const recommendedParams = getEvilPandaRecommendedParams(pool);
     analysis += `\n🎯 Recommended DLMM Parameters:\n`;
-    analysis += `  • Range: ${recommendedParams.range.binsBelow}% to 0%\n`;
     analysis += `  • Strategy: ${recommendedParams.strategy}\n`;
-    analysis += `  • Bin Steps: ${recommendedParams.bins.join(', ')}\n`;
-    analysis += `  • Sizing: ${recommendedParams.sizing}\n`;
-    
+    analysis += `  • Range: ${recommendedParams.rangeMinPercent}% to ${recommendedParams.rangeMaxPercent}%\n`;
+    analysis += `  • Bin Steps: ${(recommendedParams.bins || []).join(", ")}\n`;
+
     // Send analysis to Telegram
     await sendMessage(analysis).catch((error) => {
       log("telegram_error", `Failed to send Evil Panda analysis: ${error.message}`);

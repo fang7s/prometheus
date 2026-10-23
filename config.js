@@ -133,6 +133,32 @@ export const config = {
     solMode:               u.solMode               ?? false,
   },
 
+  // ─── Bid-Ask Flipper (range rebalance / close engine) ──
+  flipper: {
+    enabled:            u.flipperEnabled          ?? true,
+    intervalMin:        Number(u.flipperIntervalMin ?? 10),
+    timeframe:          u.flipperTimeframe         ?? "1h",
+    // Positions are treated as token-heavy when token_weight >= this (0.8 = 80%).
+    tokenWeightMin:     Number(u.flipperTokenWeightMin ?? 0.8),
+    // Minimum (volume / TVL) ratio before a rebalance is allowed.
+    minVolumeToTvl:     Number(u.flipperMinVolumeToTvl ?? 0.01),
+    // Rebalance when PnL falls to/below this even if still in range.
+    minPnlToRebalance:  Number(u.flipperMinPnlToRebalance ?? -8),
+    // deployPosition is read-only in LIVE mode, so a FLIP must not close a
+    // position it cannot redeploy. Keep false unless the live deploy path is
+    // restored; DRY_RUN always allows the simulated flip.
+    allowLiveRedeploy:  u.flipperAllowLiveRedeploy ?? false,
+  },
+
+  // ─── Evil Panda indicator exit (RSI/BB/MACD confluence) ──
+  panda: {
+    enabled:       u.pandaExitEnabled      ?? true,
+    timeframe:     u.pandaExitTimeframe    ?? "5m",
+    candles:       Number(u.pandaExitCandles ?? 120),
+    cacheSec:      Number(u.pandaExitCacheSec ?? 60),
+    confirmTicks:  Number(u.pandaExitConfirmTicks ?? 3),
+  },
+
   // ─── Strategy Mapping ───────────────────
   strategy: {
     strategy:     u.strategy     ?? "bid_ask",

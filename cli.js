@@ -641,32 +641,30 @@ switch (subcommand) {
     break;
   }
 
-  // ── withdraw-liquidity ─────────────────────────────────────────
+  // ── withdraw-liquidity (full close; partial withdraw is not supported) ──
   case "withdraw-liquidity": {
-    if (!flags.position) die("Usage: meridian withdraw-liquidity --position <addr> --pool <addr> [--bps 10000]");
-    if (!flags.pool) die("--pool is required");
-    const { withdrawLiquidity } = await import("./tools/dlmm.js");
-    out(await withdrawLiquidity({
+    if (!flags.position) die("Usage: meridian withdraw-liquidity --position <addr> [--reason <text>]");
+    const { closePosition } = await import("./tools/dlmm.js");
+    out(await closePosition({
       position_address: flags.position,
-      pool_address: flags.pool,
-      bps: flags.bps ? parseInt(flags.bps) : 10000,
-      claim_fees: !argv.includes("--no-claim"),
+      reason: flags.reason || "manual CLI withdraw",
     }));
     break;
   }
 
-  // ── add-liquidity ──────────────────────────────────────────────
+  // ── add-liquidity (opens a new position via deployPosition) ────
   case "add-liquidity": {
-    if (!flags.position) die("Usage: meridian add-liquidity --position <addr> --pool <addr> [--amount-x <n>] [--amount-y <n>]");
-    if (!flags.pool) die("--pool is required");
-    const { addLiquidity } = await import("./tools/dlmm.js");
-    out(await addLiquidity({
-      position_address: flags.position,
+    if (!flags.pool) die("Usage: meridian add-liquidity --pool <addr> --amount-sol <n> [--bins-below <n>] [--bins-above <n>] [--strategy <name>]");
+    const amountSol = parseFloat(flags["amount-sol"] ?? flags["amount-y"] ?? "0");
+    if (!Number.isFinite(amountSol) || amountSol <= 0) die("--amount-sol must be a positive number");
+    const { deployPosition } = await import("./tools/dlmm.js");
+    out(await deployPosition({
       pool_address: flags.pool,
-      amount_x: flags["amount-x"] ? parseFloat(flags["amount-x"]) : 0,
-      amount_y: flags["amount-y"] ? parseFloat(flags["amount-y"]) : 0,
-      strategy: flags.strategy || "spot",
-      single_sided_x: argv.includes("--single-sided-x"),
+      amount_sol: amountSol,
+      amount_y: amountSol,
+      strategy: flags.strategy || undefined,
+      bins_below: flags["bins-below"] ? parseInt(flags["bins-below"], 10) : undefined,
+      bins_above: flags["bins-above"] ? parseInt(flags["bins-above"], 10) : undefined,
     }));
     break;
   }
