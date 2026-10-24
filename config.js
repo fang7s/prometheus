@@ -159,6 +159,23 @@ export const config = {
     confirmTicks:  Number(u.pandaExitConfirmTicks ?? 3),
   },
 
+  // ─── Smart-Wallet Radar (optional wallet-convergence tracker) ──
+  // Alerting only by default: auto-deploy requires walletTrackerAutoDeploy.
+  walletTracker: {
+    walletTrackerEnabled:    u.walletTrackerEnabled    ?? false,
+    walletTrackerAutoDeploy: u.walletTrackerAutoDeploy ?? false,
+    trackedWallets:          Array.isArray(u.trackedWallets)
+      ? u.trackedWallets.map((w) => String(w || "").trim()).filter(Boolean)
+      : [],
+    // Rolling convergence window: N distinct tracked wallets on one mint.
+    windowSec:               Number(u.walletTrackerWindowSec ?? 120),
+    minWallets:              Number(u.walletTrackerMinWallets ?? 2),
+    // Optional portfolio poller (only runs if startWalletTracker() is called).
+    pollIntervalSec:         Number(u.walletTrackerPollIntervalSec ?? 30),
+    cooldownSec:             Number(u.walletTrackerCooldownSec ?? 300),
+    minDepositSol:           Number(u.walletTrackerMinDepositSol ?? 0),
+  },
+
   // ─── Strategy Mapping ───────────────────
   strategy: {
     strategy:     u.strategy     ?? "bid_ask",
