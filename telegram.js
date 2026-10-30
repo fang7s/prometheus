@@ -418,7 +418,7 @@ const BOT_COMMANDS = [
   { command: "status",     description: "Wallet + positions snapshot" },
   { command: "wallet",     description: "Wallet, deploy amount, HiveMind status" },
   { command: "positions",  description: "List open positions" },
-  { command: "pool",       description: "Detailed info for one open position" },
+  { command: "pool",       description: "Run AI screening, or /pool <n> for position detail" },
   { command: "close",      description: "Close one position by index" },
   { command: "closeall",   description: "Close all open positions" },
   { command: "set",        description: "Set note/instruction on position" },

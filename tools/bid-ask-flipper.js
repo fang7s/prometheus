@@ -1,6 +1,7 @@
 import { getMyPositions, deployPosition } from "./dlmm.js";
 import { getPoolDetail } from "./screening.js";
 import { getTrackedPosition } from "../state.js";
+import { formatRuleLog, ruleDecision } from "../exit-rules.js";
 import { config } from "../config.js";
 import { log } from "../logger.js";
 
@@ -110,9 +111,8 @@ export async function evaluateFlipOpportunity(position, metrics) {
   const pnlPct = Number(position.pnl_pct);
   if (Number.isFinite(pnlPct) && pnlPct <= metrics.stop_loss_limit) {
     return {
-      action: "CLOSE",
-      reason: `Exceeded stop loss limit (${metrics.stop_loss_limit}%)`,
-      success: true
+      ...ruleDecision("STOP_LOSS", `Exceeded stop loss limit (${metrics.stop_loss_limit}%)`),
+      success: true,
     };
   }
 
@@ -169,8 +169,9 @@ function isExecutionSuccess(result) {
  * The import is lazy so this module stays free of executor/telegram
  * module-load side effects for CLI and test processes.
  */
-async function closeViaExecutor(position, reason) {
+async function closeViaExecutor(position, reason, decision = null) {
   try {
+    if (decision) log("rule_engine", formatRuleLog(position.pair, decision));
     const { executeTool } = await import("./executor.js");
     return await executeTool("close_position", {
       position_address: position.position,
@@ -198,7 +199,8 @@ async function executeFlip(position, reason) {
   const tracked = getTrackedPosition(position.position);
   const binRange = tracked?.bin_range || {};
 
-  const close = await closeViaExecutor(position, `Flipper flip: ${reason}`);
+  const flipDecision = ruleDecision("FLIPPER_REBALANCE", reason);
+  const close = await closeViaExecutor(position, `Flipper flip: ${reason}`, flipDecision);
 
   if (!isExecutionSuccess(close)) {
     return {
@@ -346,7 +348,7 @@ export async function checkAllPositionsForFlip() {
       }
 
       if (decision.action === "CLOSE") {
-        const close = await closeViaExecutor(position, `Flipper close: ${decision.reason}`);
+        const close = await closeViaExecutor(position, `Flipper close: ${decision.reason}`, decision);
         const executed = isExecutionSuccess(close);
         results.push({ ...base, action: "CLOSE", executed, close });
         log(

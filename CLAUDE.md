@@ -80,13 +80,14 @@ Autonomous DLMM liquidity provider agent for Meteora pools on Solana.
 | File | Lines | Purpose |
 |---|---:|---|
 | **Entry / orchestration** | | |
-| `index.js` | ~2016 | Daemon. Cron, REPL, Telegram bot, briefing, HiveMind bootstrap, PnL poller, deterministic close rules, single-candidate skip rule, settings menu. **All** automatic cycles start here. |
+| `index.js` | ~2016 | Daemon. Cron, REPL, Telegram bot, briefing, HiveMind bootstrap, PnL poller, deterministic exit execution, single-candidate skip rule, settings menu. **All** automatic cycles start here. |
+| `exit-rules.js` | ~300 | **The only exit engine.** Pure numeric rule ladder (1 stop-loss, 2 take-profit, 3 pumped-above-range, 4 out-of-range, 5 low-yield, 6 trailing TP, 7 Evil Panda, 8 instruction time limit, 9 flipper rebalance). `detectExit(position, mgmtConfig)` → decision; `formatRuleLog()` emits `[RULE ENGINE] Auto-closing <pair>: Rule N (Name)`. No LLM imports. |
 | `agent.js` | 416 | `agentLoop(goal, maxSteps, history, agentType, model, maxOut, opts)`. The ReAct loop. Provider fallback, JSON repair, once-per-session tool locks, no-tool retries, `onToolStart`/`onToolFinish` callbacks for live Telegram messages. |
 | `cli.js` | 676 | One-shot CLI; every tool exposed as a subcommand. Also writes a `~/.meridian/SKILL.md` at startup for agent discovery. Loads `.env`/`user-config.json` from `~/.meridian/` if present, else from cwd. |
 | `setup.js` | ~750 | Interactive first-run wizard. Three presets (degen/moderate/safe) + custom. Covers strategy, screening filters, position sizing, trailing TP, per-role models. |
 | **Config & state** | | |
 | `config.js` | 278 | Loads `user-config.json` → live `config` object. Sections: `risk`, `screening`, `management`, `strategy`, `schedule`, `llm`, `darwin`, `tokens`, `hiveMind`, `api`, `jupiter`, `indicators`. Exposes `computeDeployAmount(walletSol)`, `reloadScreeningThresholds()`. `MIN_SAFE_BINS_BELOW = 35` (exported). |
-| `prompt.js` | 176 | `buildSystemPrompt(agentType, …)`. Three role-specific prompts. MANAGER is intentionally lean (positions pre-loaded into goal). SCREENER gets bins_below formula. |
+| `prompt.js` | 176 | `buildSystemPrompt(agentType, …)`. Three role-specific prompts. SCREENER is screening-only and must answer with a JSON selection (no deploy). MANAGER/GENERAL are read/report-only — no close/entry tools. |
 | **Tools layer** | | |
 | `tools/definitions.js` | 1124 | OpenAI-format tool schemas. **Source of truth for what the LLM sees.** All 40+ tool names listed. |
 | `tools/executor.js` | 844 | `executeTool(name, args)`. Pre-flight safety checks for `PROTECTED_TOOLS = {deploy, claim, close, swap, self_update}`. Validates pool thresholds via fresh pool discovery call before deploy. Post-tool side-effects: telegram notifications, pool-memory auto-annotation on `low yield` close, auto-swap base→SOL on close. |
@@ -126,13 +127,20 @@ Autonomous DLMM liquidity provider agent for Meteora pools on Solana.
 
 ## Agent roles & tool access
 
+**AI scope boundary:** the LLM may only reason about *screening* (candidate ranking),
+and screening via the LLM is opt-in through the Telegram `/pool` command. Everything
+else — sizing, entry, management monitoring and exit execution — is deterministic code.
+`DETERMINISTIC_ONLY_TOOLS = {close_position, deploy_position}` is filtered out of **every**
+role's tool list in `agent.js#getToolsForRole`, and `agentLoop` rejects any tool call that
+was not offered (hallucination guard).
+
 Three roles (`agent.js:7-8`):
 
 | Role | Tool set (filter on `MANAGER_TOOLS` / `SCREENER_TOOLS` / `INTENT_TOOLS`) | Prompt source |
 |---|---|---|
-| `SCREENER` | `get_active_bin, get_top_candidates, check_smart_wallets_on_pool, get_token_holders, get_token_narrative, get_token_info, search_pools, get_pool_memory, get_wallet_balance, get_my_positions` | `prompt.js:104` — strict regime, "no hallucination" hard rule, must call `deploy_position` to claim success. |
-| `MANAGER` | `close_position, claim_fees, swap_token, get_position_pnl, get_my_positions, get_wallet_balance` | `prompt.js:18` — *mechanical rule-application*; positions + management config pre-loaded in goal. |
-| `GENERAL` | Intent-pattern matched (see `INTENT_PATTERNS` in `agent.js:51`). 17 intents: decisions, deploy, close, claim, swap, selfupdate, blocklist, config, balance, positions, strategy, screen, memory, smartwallet, study, performance, lessons. | `prompt.js:156` — full instruction-following. |
+| `SCREENER` | `get_active_bin, get_top_candidates, check_smart_wallets_on_pool, get_token_holders, get_token_narrative, get_token_info, search_pools, get_pool_memory, get_wallet_balance, get_my_positions` | `prompt.js` — screening only; must answer with a JSON `{action:"DEPLOY"|"NONE", candidate, reason}` selection. Cannot deploy. |
+| `MANAGER` | `claim_fees, swap_token, get_position_pnl, get_my_positions, get_wallet_balance` | `prompt.js` — read/report only; `close_position` is unavailable. (No cron path invokes MANAGER any more.) |
+| `GENERAL` | Intent-pattern matched (see `INTENT_PATTERNS` in `agent.js`). No `deploy_position` / `close_position` in any intent. | `prompt.js` — explains data; points users at `/pool`, `/close <n>`, `/closeall`, `/set`. |
 
 Some tools are explicitly **never** sent to GENERAL unless the goal matches an intent: `self_update`, `update_config`, all `add/remove_*` and `pin_/unpin_` tools, `clear_lessons`, `set_active_strategy` (see `GENERAL_INTENT_ONLY_TOOLS`).
 
@@ -153,9 +161,10 @@ Some tools are explicitly **never** sent to GENERAL unless the goal matches an i
 - **Tool args are JSON-validated** and run through `jsonrepair` if malformed; unrepairable args result in `blocked: true` returned to the LLM.
 - **No-tool-loop guard**: if `mustUseRealTool` is true (action intents, `MUTATING_TOOL_INTENTS` regex) and the LLM responds with text only, we inject a reminder; second failure returns an error message.
 - **Once-per-session tool locks**:
-  - `ONCE_PER_SESSION = { deploy_position, swap_token, close_position }` — blocked on second call regardless of success.
+  - `ONCE_PER_SESSION = { swap_token, close_position }` — blocked on second call regardless of success.
   - `NO_RETRY_TOOLS = { deploy_position }` — locks on first attempt even if it failed.
-  - For `swap_token` / `close_position`, locks only on `result.success === true` so a genuine failure can be retried.
+  - `swap_token` locks only on `result.success === true` so a genuine failure can be retried.
+  - `close_position` / `deploy_position` are in `DETERMINISTIC_ONLY_TOOLS`, so a model never receives them; the lock is a second line of defence.
 - **On every tool call**: `logAction({tool, args, result, duration_ms, success})` writes the audit JSONL.
 
 ---
@@ -185,21 +194,23 @@ The management cycle is **mostly deterministic in JS, LLM only for the hard case
 
 1. `getMyPositions({ force: true })` → snapshot.
 2. `recordPositionSnapshot` per pool.
-3. JS `updatePnlAndCheckExits(position, …)` for each:
-   - `STOP_LOSS` if `pnl_pct <= stopLossPct`
-   - `TRAILING_TP` if `trailing_active && (peak - current) >= trailingDropPct` (queued for 15s recheck)
-   - `OUT_OF_RANGE` if `minutes_out_of_range >= outOfRangeWaitMinutes`
-   - `LOW_YIELD` if `fee_per_tvl_24h < minFeePerTvl24h && age >= minAgeBeforeYieldCheck`
-4. For positions with no exit alert: `getDeterministicCloseRule(p, mgmtConfig)` applies the **5 hard rules** (`index.js:895`):
-   - Rule 1: stop loss, Rule 2: take profit, Rule 3: pumped far above range, Rule 4: OOR wait, Rule 5: low yield.
-5. Positions needing `CLAIM` if `unclaimed_fees_usd >= minClaimAmount`.
-6. Positions with `instruction` set are marked `INSTRUCTION` and deferred to the LLM.
-7. **LLM is invoked only if any actionMap value is not `STAY`**, with a hard-coded goal that already lists positions + their assigned action. The LLM just executes (no re-evaluation). This saves tokens and prevents hallucinated rules.
+3. For every position: `confirmPeak(...)` then `detectExit(position, config.management)` (`exit-rules.js`). The engine evaluates the numeric ladder in priority order:
+   - Rule 1 stop-loss, Rule 2 take-profit, Rule 6 trailing TP, Rule 3 pumped far above range,
+     Rule 4 out-of-range wait, Rule 5 low yield, Rule 8 instruction time limit.
+   - `refreshPositionState()` (state.js) only updates bookkeeping (trailing arm + `out_of_range_since`).
+   - Evil Panda confluence, when enabled, adds Rule 7 through the same pipeline.
+4. Positions needing `CLAIM` if `unclaimed_fees_usd >= minClaimAmount`.
+5. **No LLM is invoked in management.** Each rule close logs
+   `[RULE ENGINE] Auto-closing <pair>: Rule N (Name) — <numbers>` and then calls
+   `executeTool("close_position", …)` directly. The hourly health check is a deterministic summary.
 
-**Trailing TP two-phase confirmation** (15s recheck):
-- First poll: candidate drop queued in state.
-- 15s later: re-fetch positions, `resolvePendingTrailingDrop` — if the drop still holds (within 1% tolerance), fire `confirmed_trailing_exit` and trigger management cycle.
-- Mirror pattern for peak confirmation (`queuePeakConfirmation` / `resolvePendingPeak`).
+**Instruction notes** (`/set <n> <note>`) are parsed deterministically by
+`parseInstructionOverrides()`: `tp <x>%`, `sl <x>%`, `close after <n>m|h`, `min yield <x>%`,
+`hold until <x>% profit`.
+Unparsed text is informational only — it is never sent to a model.
+
+**Real-time exits** come from the 3s PnL poller: `detectExit()` + `registerExitSignal()`
+require `pnlConfirmTicks` consecutive confirming polls before the close fires.
 
 ### The screening cycle (multi-stage pipeline)
 
@@ -230,11 +241,11 @@ deployPosition()                   tools/dlmm.js
         appendDecision({ type: "deploy", actor: "SCREENER", metrics, risks, rejected })
         notifyDeploy (Telegram)   ── skip if live message active
 
-manage cycle (every N min)
+manage cycle (every N min) — 100% deterministic, no LLM
    ├─ recordPositionSnapshot per pool
-   ├─ updatePnlAndCheckExits → STOP_LOSS / TRAILING_TP / OOR / LOW_YIELD
-   ├─ getDeterministicCloseRule → 5 hard rules
-   ├─ LLM invoked only for non-STAY actions (or INSTRUCTION)
+   ├─ detectExit (exit-rules.js) → Rule 1..8 numeric ladder (trailing arm/OOR state refreshed)
+   ├─ Evil Panda confluence → Rule 7
+   ├─ log `[RULE ENGINE] Auto-closing <pair>: Rule N (Name)` → executeTool("close_position")
    └─ on close: recordClose() → recordPerformance() in lessons.js
                  ├─ recordPoolDeploy (pool-memory.json)
                  ├─ derive lesson (PREFER/AVOID/WORKED/FAILED)
@@ -250,7 +261,7 @@ auto-swap on close (executor.js:610)
 
 **OOR detection**: `getMyPositions` calls `markOutOfRange` / `markInRange` for every position every cycle. The first time we see OOR, `out_of_range_since` is set; `minutesOutOfRange` is the diff.
 
-**Position instruction** (`set_position_note`): `instruction` is sanitized (no newlines, max 280 chars, no `<>`) and shown in the system prompt + injected verbatim. The LLM must check `get_position_pnl` against the condition and execute immediately if met. The MANAGER prompt (line 144) says: "BIAS TO HOLD does NOT apply when an instruction condition is met."
+**Position instruction** (`set_position_note`): `instruction` is sanitized (no newlines, max 280 chars, no `<>`). It is parsed **deterministically** by `parseInstructionOverrides()` into numeric rule overrides (`takeProfitPct`, `stopLossPct`, `closeAfterMinutes`, `minFeePerTvl24h`). Text the parser does not understand is informational only — it is never sent to a model and never influences an exit.
 
 **Cooldown logic** (`pool-memory.js`):
 - Single `low yield` close → 4h pool cooldown.
@@ -368,6 +379,7 @@ npm run check                  # syntax + offline env audit + utils/rpc tests
 |---|---|---|
 | `/help` / `/status` / `/wallet` / `/config` | `index.js#telegramHandler` | Read-only. |
 | `/positions` / `/pool <n>` / `/close <n>` / `/set <n> <note>` | `index.js#telegramHandler` | Bypass LLM — direct state mutation. `/close <n>` calls `closePosition` directly. |
+| `/pool` (no argument) | `runScreeningCycle({ useLLM: true })` | **The only LLM-assisted workflow.** The model ranks candidates and returns a JSON selection; `deployCandidate()` sizes and deploys in code. |
 | `/closeall` | index.js | Closes all open positions in sequence. |
 | `/screen` / `/candidates` / `/deploy <n>` | `runDeterministicScreen` + `deployLatestCandidate` | Deterministic — no LLM. The single-candidate skip rule applies. |
 | `/briefing` | `generateBriefing` | On-demand daily report. |
@@ -447,7 +459,7 @@ When scheduling work, follow the **`_busy` flag + cooldown** pattern. `_manageme
 ## What to read next
 
 - Adding a new tool → `tools/definitions.js` + `tools/executor.js` + `agent.js` (see "Adding a new tool" above).
-- Changing safety rules → `tools/executor.js#runSafetyChecks` and `index.js#getDeterministicCloseRule`.
+- Changing safety rules → `tools/executor.js#runSafetyChecks` and `exit-rules.js#evaluateNumericRules`.
 - Adding a new persistent state file → copy `state.js` or `pool-memory.js`. Add a getter to `index.js` system-prompt section if the LLM needs to see it.
 - Changing the LLM contract → `prompt.js` (buildSystemPrompt) and `agent.js` (INTENT_TOOLS + role sets + safety guards).
 - Changing deploy/close behavior → `tools/dlmm.js` (the SDK wrapper) and `tools/executor.js` (the post-tool side effects + Telegram notify + auto-swap).

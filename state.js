@@ -349,26 +349,30 @@ export function getStateSummary() {
 }
 
 /**
- * Check all exit conditions for a position (trailing TP, stop loss, OOR, low yield).
- * Updates peak_pnl_pct, trailing_active, and OOR state.
- * @param {string} position_address
- * @param {object} positionData - fields from getMyPositions: pnl_pct, in_range, fee_per_tvl_24h
- * @param {object} mgmtConfig
- * Returns { action, reason } or null if no exit needed.
+ * Refresh stateful exit bookkeeping for a position:
+ * - arm trailing TP once the confirmed peak clears `trailingTriggerPct`
+ * - stamp / clear `out_of_range_since` from the live `in_range` flag
+ *
+ * Returns the tracked record (or null when unknown/closed). This function never
+ * makes an exit decision — the deterministic engine in `exit-rules.js` owns
+ * that. Safe to call from every poll tick.
  */
-export function updatePnlAndCheckExits(position_address, positionData, mgmtConfig) {
-  const { pnl_pct: currentPnlPct, pnl_pct_suspicious, in_range, fee_per_tvl_24h } = positionData;
+export function refreshPositionState(position_address, positionData = {}, mgmtConfig = {}) {
+  const { in_range } = positionData;
   const state = load();
   const pos = state.positions[position_address];
   if (!pos || pos.closed) return null;
 
   let changed = false;
 
-  // Activate trailing TP once trigger threshold is reached
-  if (mgmtConfig.trailingTakeProfit && !pos.trailing_active && (pos.peak_pnl_pct ?? 0) >= mgmtConfig.trailingTriggerPct) {
-    pos.trailing_active = true;
-    changed = true;
-    log("state", `Position ${position_address} trailing TP activated (confirmed peak: ${pos.peak_pnl_pct}%)`);
+  // Activate trailing TP once the confirmed peak clears the trigger threshold
+  if (mgmtConfig.trailingTakeProfit && !pos.trailing_active) {
+    const trigger = Number(mgmtConfig.trailingTriggerPct);
+    if (Number.isFinite(trigger) && (pos.peak_pnl_pct ?? 0) >= trigger) {
+      pos.trailing_active = true;
+      changed = true;
+      log("state", `Position ${position_address} trailing TP activated (confirmed peak: ${pos.peak_pnl_pct}%)`);
+    }
   }
 
   // Update OOR state
@@ -383,6 +387,25 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   }
 
   if (changed) save(state);
+  return pos;
+}
+
+/**
+ * @deprecated Legacy wrapper kept for API compatibility. New code should use
+ * `detectExit()` from `exit-rules.js`, which is the single deterministic exit
+ * engine (no LLM involved anywhere).
+ *
+ * Check all exit conditions for a position (trailing TP, stop loss, OOR, low yield).
+ * @param {string} position_address
+ * @param {object} positionData - fields from getMyPositions: pnl_pct, in_range, fee_per_tvl_24h
+ * @param {object} mgmtConfig
+ * Returns { action, reason } or null if no exit needed.
+ */
+export function updatePnlAndCheckExits(position_address, positionData, mgmtConfig = {}) {
+  const pos = refreshPositionState(position_address, positionData, mgmtConfig);
+  if (!pos) return null;
+
+  const { pnl_pct: currentPnlPct, pnl_pct_suspicious, fee_per_tvl_24h } = positionData;
 
   // ── Stop loss ──────────────────────────────────────────────────
   if (!pnl_pct_suspicious && currentPnlPct != null && mgmtConfig.stopLossPct != null && currentPnlPct <= mgmtConfig.stopLossPct) {

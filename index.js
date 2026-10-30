@@ -1,6 +1,7 @@
 import "./envcrypt.js";
 import cron from "node-cron";
 import readline from "readline";
+import { jsonrepair } from "jsonrepair";
 import path from "path";
 import { fileURLToPath } from "url";
 import { agentLoop } from "./agent.js";
@@ -25,7 +26,8 @@ import {
   createLiveMessage,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, confirmPeak, registerExitSignal } from "./state.js";
+import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, confirmPeak, registerExitSignal } from "./state.js";
+import { detectExit, formatRuleLog, ruleDecision, parseInstructionOverrides } from "./exit-rules.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
@@ -156,32 +158,20 @@ function stopCronJobs() {
 }
 
 /**
- * Execute the actions decided by the deterministic rules. CLOSE/CLAIM run directly
- * via executeTool (no LLM) — preserving all post-effects (notify, auto-swap,
- * recordPerformance, decision-log, HiveMind). Only INSTRUCTION positions, whose
- * free-text condition JS can't parse, are handed to the MANAGER LLM. Returns a
- * one-line-per-position result string.
+ * Execute the decisions produced by the deterministic rule engine. CLOSE/CLAIM
+ * run directly via executeTool (no LLM) — preserving all post-effects (notify,
+ * auto-swap, recordPerformance, decision-log). There is no LLM path here: rule
+ * decisions are final.
  */
-async function executeManagementActions(actionPositions, actionMap, { liveMessage = null, cur = "$" } = {}) {
+async function executeManagementActions(actionPositions, actionMap, { liveMessage = null } = {}) {
   const lines = [];
-  const instructionPositions = [];
-
-  const mechanical = actionPositions.filter(p => actionMap.get(p.position).action !== "INSTRUCTION");
-  if (mechanical.length) {
-    log("cron", `Management: executing ${mechanical.length} mechanical action(s) — no LLM`);
-  }
 
   for (const p of actionPositions) {
     const act = actionMap.get(p.position);
-    if (act.action === "INSTRUCTION") { instructionPositions.push(p); continue; }
+    if (!act) continue;
 
     if (act.action === "CLOSE") {
-      const reason = act.reason || (act.rule ? `Rule ${act.rule}` : "rule close");
-      await liveMessage?.toolStart("close_position");
-      const res = await executeTool("close_position", { position_address: p.position, reason }).catch(e => ({ error: e.message }));
-      const ok = res?.success !== false && !res?.error && !res?.blocked;
-      await liveMessage?.toolFinish("close_position", res, ok);
-      lines.push(`${p.pair}: ${ok ? `closed (${reason})` : `close FAILED — ${res?.error || res?.reason || "unknown"}`}`);
+      lines.push(await executeRuleClose(p, act, { liveMessage }));
     } else if (act.action === "CLAIM") {
       await liveMessage?.toolStart("claim_fees");
       const res = await executeTool("claim_fees", { position_address: p.position }).catch(e => ({ error: e.message }));
@@ -191,35 +181,23 @@ async function executeManagementActions(actionPositions, actionMap, { liveMessag
     }
   }
 
-  // INSTRUCTION positions need the LLM to evaluate the free-text condition.
-  if (instructionPositions.length > 0) {
-    log("cron", `Management: ${instructionPositions.length} instruction position(s) — invoking LLM [model: ${config.llm.managementModel}]`);
-    const actionBlocks = instructionPositions.map((p) => [
-      `POSITION: ${p.pair} (${p.position})`,
-      `  pool: ${p.pool}`,
-      `  pnl_pct: ${p.pnl_pct}% | unclaimed_fees: ${cur}${p.unclaimed_fees_usd} | value: ${cur}${p.total_value_usd} | fee_per_tvl_24h: ${p.fee_per_tvl_24h ?? "?"}%`,
-      `  bins: lower=${p.lower_bin} upper=${p.upper_bin} active=${p.active_bin} | oor_minutes: ${p.minutes_out_of_range ?? 0}`,
-      `  instruction: "${p.instruction}"`,
-    ].join("\n")).join("\n\n");
-
-    const { content } = await agentLoop(`
-INSTRUCTION EVALUATION — ${instructionPositions.length} position(s)
-
-${actionBlocks}
-
-For each position, evaluate the instruction condition against the live data:
-- If the condition is MET → call close_position (it claims fees internally; do NOT call claim_fees first).
-- If NOT met → HOLD, do nothing.
-
-After evaluating, write a brief one-line result per position.
-    `, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel, 2048, {
-      onToolStart: async ({ name }) => { await liveMessage?.toolStart(name); },
-      onToolFinish: async ({ name, result, success }) => { await liveMessage?.toolFinish(name, result, success); },
-    });
-    if (content) lines.push(content);
-  }
-
   return lines.join("\n");
+}
+
+/**
+ * Deterministic close execution: log the exact rule, then call the close tool
+ * directly. The LLM is never consulted and receives no position evaluation data.
+ */
+async function executeRuleClose(position, decision, { liveMessage = null } = {}) {
+  log("rule_engine", formatRuleLog(position.pair, decision));
+  await liveMessage?.toolStart("close_position");
+  const res = await executeTool("close_position", {
+    position_address: position.position,
+    reason: `Rule ${decision.rule} (${decision.name}): ${decision.reason}`,
+  }).catch(e => ({ error: e.message }));
+  const ok = res?.success !== false && !res?.error && !res?.blocked;
+  await liveMessage?.toolFinish("close_position", res, ok);
+  return `${position.pair}: ${ok ? `closed — Rule ${decision.rule} (${decision.name})` : `close FAILED — ${res?.error || res?.reason || "unknown"}`}`;
 }
 
 export async function runManagementCycle({ silent = false } = {}) {
@@ -252,48 +230,38 @@ export async function runManagementCycle({ silent = false } = {}) {
       return { ...p, recall: recallForPool(p.pool) };
     });
 
-    // JS exit checks. Management is the slow cron backstop: raise peak immediately
-    // (confirmTicks=1) and act on detected exits directly. Real-time 2-tick
-    // confirmation lives in the fast 3s poller below.
+    // Deterministic rule engine — every exit condition is numeric JS. Management
+    // is the slow cron backstop: raise peak immediately (confirmTicks=1) and act
+    // on detected exits directly. Real-time 2-tick confirmation lives in the fast
+    // poller below. No position data is ever sent to an LLM here.
     const exitMap = new Map();
     for (const p of positionData) {
       confirmPeak(p.position, p.pnl_pct, 1);
-      const exit = updatePnlAndCheckExits(p.position, p, config.management);
-      if (exit) {
-        exitMap.set(p.position, exit.reason);
-        log("state", `Exit alert for ${p.pair}: ${exit.reason}`);
+      const decision = detectExit(p, config.management);
+      if (decision) {
+        exitMap.set(p.position, decision);
+        log("rule_engine", `[RULE ENGINE] ${p.pair}: Rule ${decision.rule} (${decision.name}) matched — ${decision.reason}`);
       }
     }
-    
-    // Evil Panda indicator confluence — merged into the same exit pipeline so a
-    // confluence hit closes the position instead of only sending an alert.
+
+    // Evil Panda indicator confluence — deterministic indicator math, merged into
+    // the same exit pipeline so a confluence hit closes the position.
     try {
       const pandaExits = await checkEvilPandaExitConditions(positions);
-      for (const [positionAddress, reason] of pandaExits) {
-        if (!exitMap.has(positionAddress)) exitMap.set(positionAddress, reason);
+      for (const [positionAddress, decision] of pandaExits) {
+        if (!exitMap.has(positionAddress)) exitMap.set(positionAddress, decision);
       }
     } catch (error) {
       log("error", `Error checking Evil Panda exit conditions: ${error.message}`);
     }
 
-    // ── Deterministic rule checks (no LLM) ──────────────────────────
-    // action: CLOSE | CLAIM | STAY | INSTRUCTION (needs LLM)
+    // ── Deterministic action map (no LLM) ───────────────────────────
+    // action: CLOSE (rule engine) | CLAIM | STAY
     const actionMap = new Map();
     for (const p of positionData) {
-      // Hard exit — highest priority
-      if (exitMap.has(p.position)) {
-        actionMap.set(p.position, { action: "CLOSE", rule: "exit", reason: exitMap.get(p.position) });
-        continue;
-      }
-      // Instruction-set — pass to LLM, can't parse in JS
-      if (p.instruction) {
-        actionMap.set(p.position, { action: "INSTRUCTION" });
-        continue;
-      }
-
-      const closeRule = getDeterministicCloseRule(p, config.management);
-      if (closeRule) {
-        actionMap.set(p.position, closeRule);
+      const decision = exitMap.get(p.position);
+      if (decision) {
+        actionMap.set(p.position, decision);
         continue;
       }
       // Claim rule
@@ -313,32 +281,37 @@ export async function runManagementCycle({ silent = false } = {}) {
       const inRange = p.in_range ? "🟢 IN" : `🔴 OOR ${p.minutes_out_of_range ?? 0}m`;
       const val = config.management.solMode ? `◎${p.total_value_usd ?? "?"}` : `$${p.total_value_usd ?? "?"}`;
       const unclaimed = config.management.solMode ? `◎${p.unclaimed_fees_usd ?? "?"}` : `$${p.unclaimed_fees_usd ?? "?"}`;
-      const statusLabel = act.action === "INSTRUCTION" ? "HOLD (instruction)" : act.action;
+      const statusLabel = act.action === "CLOSE" ? `CLOSE (Rule ${act.rule} ${act.name})` : act.action;
       let line = `**${p.pair}** | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | PnL: ${p.pnl_pct ?? "?"}% | Yield: ${p.fee_per_tvl_24h ?? "?"}% | ${inRange} | ${statusLabel}`;
-      if (p.instruction) line += `\nNote: "${p.instruction}"`;
-      if (act.action === "CLOSE" && act.rule === "exit") line += `\n⚡ Trailing TP: ${act.reason}`;
-      if (act.action === "CLOSE" && act.rule && act.rule !== "exit") line += `\nRule ${act.rule}: ${act.reason}`;
+      if (p.instruction) {
+        const overrides = parseInstructionOverrides(p.instruction);
+        const parsed = Object.entries(overrides).map(([k, v]) => `${k}=${v}`).join(", ");
+        line += `\nNote: "${p.instruction}"${parsed ? ` (rules: ${parsed})` : " (informational only)"}`;
+      }
+      if (act.action === "CLOSE") line += `\nRule ${act.rule} (${act.name}): ${act.reason}`;
       if (act.action === "CLAIM") line += `\n→ Claiming fees`;
       return line;
     });
 
     const needsAction = [...actionMap.values()].filter(a => a.action !== "STAY");
     const actionSummary = needsAction.length > 0
-      ? needsAction.map(a => a.action === "INSTRUCTION" ? "EVAL instruction" : `${a.action}${a.reason ? ` (${a.reason})` : ""}`).join(", ")
+      ? needsAction.map(a => a.action === "CLOSE"
+        ? `CLOSE Rule ${a.rule} (${a.name})${a.reason ? ` — ${a.reason}` : ""}`
+        : a.action).join(", ")
       : "no action";
 
     const cur = config.management.solMode ? "◎" : "$";
     mgmtReport = reportLines.join("\n\n") +
       `\n\nSummary: 💼 ${positions.length} positions | ${cur}${totalValue.toFixed(4)} | fees: ${cur}${totalUnclaimed.toFixed(4)} | ${actionSummary}`;
 
-    // ── Call LLM only if action needed ──────────────────────────────
+    // ── Execute rule decisions directly (no LLM) ────────────────────
     const actionPositions = positionData.filter(p => {
       const a = actionMap.get(p.position);
       return a.action !== "STAY";
     });
 
     if (actionPositions.length > 0) {
-      const execReport = await executeManagementActions(actionPositions, actionMap, { liveMessage, cur });
+      const execReport = await executeManagementActions(actionPositions, actionMap, { liveMessage });
       if (execReport) mgmtReport += `\n\n${execReport}`;
     } else {
       log("cron", "Management: all positions STAY — skipping");
@@ -372,7 +345,7 @@ export async function runManagementCycle({ silent = false } = {}) {
   return mgmtReport;
 }
 
-export async function runScreeningCycle({ silent = false } = {}) {
+export async function runScreeningCycle({ silent = false, useLLM = false } = {}) {
   if (_screeningBusy) {
     log("cron", "Screening skipped — previous cycle still running");
     return null;
@@ -422,7 +395,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     liveMessage = await createLiveMessage("🔍 Screening Cycle", "Scanning candidates...");
   }
   timers.screeningLastRun = Date.now();
-  log("cron", `Starting screening cycle [model: ${config.llm.screeningModel}]`);
+  log("cron", `Starting screening cycle [${useLLM ? `LLM selection — model: ${config.llm.screeningModel}` : "deterministic selection (no LLM)"}]`);
   try {
     // Reuse pre-fetched balance — no extra RPC call needed
     const currentBalance = preBalance;
@@ -580,103 +553,90 @@ export async function runScreeningCycle({ silent = false } = {}) {
       return block;
     });
 
-    const weightsSummary = config.darwin?.enabled ? getWeightsSummary() : null;
+    // ── Candidate selection → deterministic execution ───────────────
+    // LLM screening is ONLY used when explicitly requested via the `/pool`
+    // command (useLLM=true). Automatic cycles (cron / startup / opportunity poll)
+    // use the deterministic scorer below — no model is consulted anywhere else.
+    // In both cases the entry itself is executed 100% in code by deployCandidate().
+    let selection;
+    if (useLLM) {
+      const weightsSummary = config.darwin?.enabled ? getWeightsSummary() : null;
+      const candidateMenu = passing
+        .map((_, i) => `#${i + 1}\n${candidateBlocks[i]}`)
+        .join("\n\n");
 
-    let deployAttempted = false;
-    let deploySucceeded = false;
-    const { content } = await agentLoop(`
-SCREENING CYCLE
+      const { content } = await agentLoop(`
+SCREENING ONLY — you do NOT execute trades.
+
 ${strategyBlock}
-Positions: ${prePositions.total_positions}/${config.risk.maxPositions} | SOL: ${currentBalance.sol.toFixed(3)} | Deploy: ${deployAmount} SOL
-
+Positions: ${prePositions.total_positions}/${config.risk.maxPositions} | SOL: ${currentBalance.sol.toFixed(3)} | Deploy budget: ${deployAmount} SOL
+${weightsSummary ? `\n${weightsSummary}\n` : ""}
 PRE-LOADED CANDIDATES (${passing.length} pools):
-${candidateBlocks.join("\n\n")}
+${candidateMenu}
 
-STEPS:
+TASK:
 1. Decide if any candidate is actually worth deploying. One surviving candidate is not automatically good enough.
-2. Pick the best candidate based on narrative quality, smart wallets, and pool metrics.
-3. Call deploy_position (active_bin is pre-fetched above — no need to call get_active_bin).
-   bins_below = round(${config.strategy.minBinsBelow} + (candidate volatility/5)*(${config.strategy.maxBinsBelow - config.strategy.minBinsBelow})) clamped to [${config.strategy.minBinsBelow},${config.strategy.maxBinsBelow}].
-   pass deploy_position.volatility = the candidate volatility value.
-   For single-side SOL deploys, do not invent upside:
-   set amount_y only, keep amount_x = 0, keep bins_above = 0, and let the upper bin stay at the active bin.
-4. Report in this exact format (no tables, no extra sections):
-   🚀 DEPLOYED
+2. Pick at most ONE best candidate based on narrative quality, smart wallets, and pool metrics.
+3. Reply with ONLY a JSON object (no prose, no markdown fences):
+   {"action":"DEPLOY","candidate":<number 1-${passing.length}>,"reason":"<2-4 concise sentences why this pool won and key risks>"}
+   or
+   {"action":"NONE","reason":"<2-4 concise sentences explaining why nothing was good enough>"}
 
-   <pool name>
-   <pool address>
-
-   ◎ <deploy amount> SOL | <strategy> | bin <active_bin>
-   Range: <minPrice> → <maxPrice>
-   Range cover: <downside %> downside | <upside %> upside | <total width %> total
-
-   IMPORTANT:
-   - Do NOT calculate the range percentages yourself.
-   - Use the actual deploy_position tool result:
-     range_coverage.downside_pct
-     range_coverage.upside_pct
-     range_coverage.width_pct
-
-   MARKET
-   Fee/TVL: <x>%
-   Volume: $<x>
-   TVL: $<x>
-   Volatility: <x>
-   Organic: <x>
-   Mcap: $<x>
-   Age: <x>h
-
-   AUDIT
-   Top10: <x>%
-   Bots: <x>%
-   Fees paid: <x> SOL
-   Smart wallets: <names or none>
-
-   WHY THIS WON
-   <2-4 concise sentences on why this pool won, key risks, and why it still beat the alternatives>
-5. If no pool qualifies, report in this exact format instead:
-   ⛔ NO DEPLOY
-
-   Cycle finished with no valid entry.
-
-   BEST LOOKING CANDIDATE
-   <name or none>
-
-   WHY SKIPPED
-   <2-4 concise sentences explaining why nothing was good enough>
-
-   REJECTED
-   <short flat list of top candidate names and why they were skipped>
-IMPORTANT:
-- Keep the whole report compact and highly scannable for Telegram.
-      `, config.llm.maxSteps, [], "SCREENER", config.llm.screeningModel, 2048, {
-        onToolStart: async ({ name }) => {
-          if (name === "deploy_position") deployAttempted = true;
-          await liveMessage?.toolStart(name);
-        },
-        onToolFinish: async ({ name, result, success }) => {
-          if (name === "deploy_position") {
-            deployAttempted = true;
-            deploySucceeded = Boolean(success && result?.success !== false && !result?.error && !result?.blocked);
-          }
-          await liveMessage?.toolFinish(name, result, success);
-        },
+Execution is handled deterministically by code after your choice: size, bins, slippage and
+the transaction are NOT yours to decide. Never invent tool output.
+      `, config.llm.maxSteps, [], "SCREENER", config.llm.screeningModel, 1024, {
+        onToolStart: async ({ name }) => { await liveMessage?.toolStart(name); },
+        onToolFinish: async ({ name, result, success }) => { await liveMessage?.toolFinish(name, result, success); },
       });
-    screenReport = content;
-    if (/⛔\s*NO DEPLOY/i.test(content)) {
+
+      selection = parseScreeningDecision(content, passing.length);
+    } else {
+      selection = selectCandidateDeterministically(passing);
+    }
+    log("screening", `Decision (${useLLM ? "LLM" : "deterministic"}): ${selection.action}${selection.index != null ? ` candidate #${selection.index + 1}` : ""} — ${selection.reason}`);
+
+    if (selection.action !== "DEPLOY") {
+      screenReport = [
+        "⛔ NO DEPLOY",
+        "",
+        "Cycle finished with no valid entry.",
+        "",
+        "BEST LOOKING CANDIDATE",
+        passing[0]?.pool?.name || "none",
+        "",
+        "WHY SKIPPED",
+        selection.reason || "Screening selected no candidate.",
+        "",
+        "REJECTED",
+        passing.map(({ pool }) => `- ${pool.name}`).join("\n"),
+      ].join("\n");
       appendDecision({
         type: "no_deploy",
         actor: "SCREENER",
-        summary: "LLM chose no deploy",
-        reason: stripThink(content).slice(0, 500),
+        summary: "Screening selected no deploy",
+        reason: stripThink(selection.reason || "").slice(0, 500),
+        rejected: passing.slice(0, 5).map(({ pool }) => pool.name),
       });
-    } else if (!deploySucceeded) {
-      appendDecision({
-        type: "no_deploy",
-        actor: "SCREENER",
-        summary: deployAttempted ? "Deploy attempt did not succeed" : "No successful deploy in screening cycle",
-        reason: stripThink(content).slice(0, 500),
-      });
+    } else {
+      const candidate = passing[selection.index].pool;
+      await liveMessage?.toolStart("deploy_position");
+      try {
+        const outcome = await deployCandidate(candidate, { walletBalanceSol: currentBalance.sol });
+        await liveMessage?.toolFinish("deploy_position", outcome.result, true);
+        screenReport = formatDeployReport(outcome, selection.reason);
+        log("screening", `Deterministic deploy complete: ${candidate.name} (${outcome.deployAmount} SOL, ${outcome.binsBelow} bins below)`);
+      } catch (error) {
+        await liveMessage?.toolFinish("deploy_position", { error: error.message }, false);
+        appendDecision({
+          type: "no_deploy",
+          actor: "SCREENER",
+          summary: "Deploy attempt did not succeed",
+          reason: error.message,
+          pool: candidate.pool,
+          pool_name: candidate.name,
+        });
+        screenReport = `⛔ DEPLOY FAILED\n\n${candidate.name}\n${candidate.pool}\n\n${error.message}`;
+      }
     }
   } catch (error) {
     log("cron_error", `Screening cycle failed: ${error.message}`);
@@ -691,6 +651,43 @@ IMPORTANT:
     }
   }
   return screenReport;
+}
+
+/**
+ * Hourly health check — deterministic summary only. No LLM, no recommendations:
+ * it reports portfolio numbers, the rule status of each open position and the
+ * aggregate performance history.
+ */
+export async function runDeterministicHealthCheck({ silent = false } = {}) {
+  const [positionResult, perf] = await Promise.all([
+    getMyPositions({ force: true }).catch(() => null),
+    Promise.resolve(getPerformanceSummary()),
+  ]);
+  const list = positionResult?.positions || [];
+  const cur = config.management.solMode ? "◎" : "$";
+  const totalValue = list.reduce((s, p) => s + (p.total_value_usd ?? 0), 0);
+  const totalUnclaimed = list.reduce((s, p) => s + (p.unclaimed_fees_usd ?? 0), 0);
+  const totalPnl = list.reduce((s, p) => s + (p.pnl_usd ?? 0), 0);
+
+  const ruleLines = list.map((p) => {
+    const decision = detectExit(p, config.management);
+    const status = decision ? `Rule ${decision.rule} (${decision.name})` : "STAY";
+    const range = p.in_range ? "IN" : `OOR ${p.minutes_out_of_range ?? 0}m`;
+    return `- ${p.pair}: ${status} | PnL ${p.pnl_pct ?? "?"}% | ${range} | fees ${cur}${p.unclaimed_fees_usd ?? "?"}`;
+  });
+
+  const report = [
+    "🩺 HEALTH CHECK (deterministic — no LLM)",
+    `Positions: ${list.length}/${config.risk.maxPositions} | value ${cur}${totalValue.toFixed(4)} | unclaimed ${cur}${totalUnclaimed.toFixed(4)} | open PnL ${cur}${totalPnl.toFixed(4)}`,
+    perf
+      ? `Closed: ${perf.total_positions_closed} | win rate ${perf.win_rate_pct}% | avg PnL ${perf.avg_pnl_pct}% | total PnL $${perf.total_pnl_usd}`
+      : "Closed: 0 (no performance history yet)",
+    ...ruleLines,
+  ].join("\n");
+
+  log("cron", `Health check complete (deterministic): ${list.length} position(s)`);
+  if (!silent && telegramEnabled()) await sendMessage(report).catch(() => {});
+  return report;
 }
 
 export function startCronJobs() {
@@ -731,13 +728,9 @@ export function startCronJobs() {
   const healthTask = cron.schedule(`0 * * * *`, async () => {
     if (_managementBusy) return;
     _managementBusy = true;
-    log("cron", "Starting health check");
+    log("cron", "Starting health check (deterministic)");
     try {
-      await agentLoop(`
-HEALTH CHECK
-
-Summarize the current portfolio health, total fees earned, and performance of all open positions. Recommend any high-level adjustments if needed.
-      `, config.llm.maxSteps, [], "MANAGER");
+      await runDeterministicHealthCheck({ silent: true });
     } catch (error) {
       log("cron_error", `Health check failed: ${error.message}`);
     } finally {
@@ -755,11 +748,12 @@ Summarize the current portfolio health, total fees earned, and performance of al
     await maybeRunMissedBriefing();
   }, { timezone: 'UTC' });
 
-  // Fast PnL poller — the real-time exit path between management cycles, no LLM.
-  // Runs on public infra (RPC + Jupiter + Meteora deposits) so it can poll aggressively.
-  // Exits require `confirmTicks` consecutive confirming polls (registerExitSignal) so a
-  // single noisy tick can't close a position; confirmed exits close DIRECTLY here (no
-  // management-interval cooldown gate that used to swallow rule hits).
+  // Fast PnL poller — the real-time exit path between management cycles.
+  // 100% deterministic: `detectExit()` walks the numeric rule ladder and the Evil
+  // Panda confluence (numeric indicators) supplies rule 7. Exits require
+  // `confirmTicks` consecutive confirming polls (registerExitSignal) so a single
+  // noisy tick can't close a position; a confirmed rule fires the close directly
+  // in code — no LLM is consulted and no position data is sent to a model.
   const pnlPollMs = Math.max(1, Number(config.pnl.pollIntervalSec ?? 3)) * 1000;
   const confirmTicks = Math.max(1, Number(config.pnl.confirmTicks ?? 2));
   let _pnlPollBusy = false;
@@ -773,15 +767,17 @@ Summarize the current portfolio health, total fees earned, and performance of al
       for (const p of result.positions) {
         confirmPeak(p.position, p.pnl_pct, confirmTicks);
 
-        // Detect an exit signal this tick (rule-based exits, then deterministic
-        // close rules, then the Evil Panda indicator confluence).
-        const exit = updatePnlAndCheckExits(p.position, p, config.management);
-        const closeRule = exit ? null : getDeterministicCloseRule(p, config.management);
-        const panda = exit || closeRule ? null : await getPandaExitSignal(p);
-        let signal = null, reason = null, rule = "exit";
-        if (exit) { signal = exit.action; reason = exit.reason; }
-        else if (closeRule) { signal = `RULE_${closeRule.rule}`; reason = closeRule.reason; rule = closeRule.rule; }
-        else if (panda) { signal = panda.signal; reason = panda.reason; rule = panda.signal; }
+        // Deterministic detection: numeric rule ladder first, then the Evil Panda
+        // indicator confluence as rule 7.
+        let decision = detectExit(p, config.management);
+        if (!decision) {
+          const panda = await getPandaExitSignal(p);
+          if (panda?.signal) {
+            decision = { ...ruleDecision("EVIL_PANDA", panda.reason), signal: panda.signal };
+          }
+        }
+
+        const signal = decision ? (decision.signal || `RULE_${decision.rule}`) : null;
 
         // Require N consecutive confirming ticks before acting. Panda confluence is
         // stricter, so it uses its own (higher) confirmation threshold.
@@ -789,14 +785,13 @@ Summarize the current portfolio health, total fees earned, and performance of al
           ? Math.max(1, Number(config.panda?.confirmTicks ?? confirmTicks))
           : confirmTicks;
         const { fire } = registerExitSignal(p.position, signal, requiredTicks);
-        if (!signal || !fire) continue;
+        if (!decision || !fire) continue;
 
-        log("state", `[PnL poll] ${signal} confirmed (${requiredTicks} ticks): ${p.pair} — ${reason} — closing directly`);
+        log("rule_engine", `[RULE ENGINE] ${signal} confirmed after ${requiredTicks} ticks for ${p.pair} — executing close`);
         // Hold the management lock so the cron cycle can't double-act on this position.
         _managementBusy = true;
         try {
-          const actMap = new Map([[p.position, { action: "CLOSE", rule, reason }]]);
-          const rpt = await executeManagementActions([p], actMap, {});
+          const rpt = await executeRuleClose(p, decision);
           log("state", `[PnL poll] ${p.pair}: ${rpt || "closed"}`);
         } catch (e) {
           log("cron_error", `Poll-triggered close failed: ${e.message}`);
@@ -812,8 +807,8 @@ Summarize the current portfolio health, total fees earned, and performance of al
 
   // Opportunity poller — catches strong pools between the (slow) screening cycles.
   // Reuses the getTopCandidates pipeline (discovery + holder audit + filters + score);
-  // when the best candidate clears the score pre-gate it triggers the existing screening
-  // deploy decision (runScreeningCycle), which re-checks guards and forces the deploy LLM.
+  // when the best candidate clears the score pre-gate it triggers the deterministic
+  // screening deploy path (runScreeningCycle), which re-checks guards and sizes in code.
   let opportunityPollInterval = null;
   if (config.opportunity.enabled) {
     const oppMs = Math.max(15, Number(config.opportunity.pollIntervalSec ?? 45)) * 1000;
@@ -941,51 +936,6 @@ function formatCandidates(candidates) {
     "  " + "─".repeat(68),
     ...lines,
   ].join("\n");
-}
-
-function getDeterministicCloseRule(position, managementConfig) {
-  const tracked = getTrackedPosition(position.position);
-  const pnlSuspect = (() => {
-    // Couldn't-price-this-tick flag (e.g. Jupiter outage) — never act on PnL rules.
-    if (position.pnl_pct_suspicious) return true;
-    if (position.pnl_pct == null) return false;
-    if (position.pnl_pct > -90) return false;
-    if (tracked?.amount_sol && (position.total_value_usd ?? 0) > 0.01) {
-      log("cron_warn", `Suspect PnL for ${position.pair}: ${position.pnl_pct}% but position still has value — skipping PnL rules`);
-      return true;
-    }
-    return false;
-  })();
-
-  if (!pnlSuspect && position.pnl_pct != null && position.pnl_pct <= managementConfig.stopLossPct) {
-    return { action: "CLOSE", rule: 1, reason: "stop loss" };
-  }
-  if (!pnlSuspect && position.pnl_pct != null && position.pnl_pct >= managementConfig.takeProfitPct) {
-    return { action: "CLOSE", rule: 2, reason: "take profit" };
-  }
-  if (
-    position.active_bin != null &&
-    position.upper_bin != null &&
-    position.active_bin > position.upper_bin + managementConfig.outOfRangeBinsToClose
-  ) {
-    return { action: "CLOSE", rule: 3, reason: "pumped far above range" };
-  }
-  if (
-    position.active_bin != null &&
-    position.upper_bin != null &&
-    position.active_bin > position.upper_bin &&
-    (position.minutes_out_of_range ?? 0) >= managementConfig.outOfRangeWaitMinutes
-  ) {
-    return { action: "CLOSE", rule: 4, reason: "OOR" };
-  }
-  if (
-    position.fee_per_tvl_24h != null &&
-    position.fee_per_tvl_24h < managementConfig.minFeePerTvl24h &&
-    (position.age_minutes ?? 0) >= 60
-  ) {
-    return { action: "CLOSE", rule: 5, reason: "low yield" };
-  }
-  return null;
 }
 
 // ═══════════════════════════════════════════
@@ -1318,22 +1268,26 @@ function formatHelpText() {
     "/status — wallet + positions snapshot",
     "/wallet — wallet, deploy amount, HiveMind status",
     "/positions — list open positions",
+    "/pool — run AI screening (LLM picks a candidate, code executes the entry)",
     "/pool <n> — detailed info for one open position",
     "/close <n> — close one position by index",
     "/closeall — close all open positions",
     "/set <n> <note> — set note/instruction on position",
+    "   deterministic forms: \"tp 8%\", \"sl -20%\", \"close after 90m\", \"min yield 4%\"",
     "/config — show important runtime config",
     "/settings — button menu for common config",
     "/setcfg <key> <value> — update persisted config",
     "/screen — refresh deterministic candidate list",
     "/candidates — show latest cached candidates",
-    "/deploy <n> — deploy candidate by cached index",
+    "/deploy <n> — deploy candidate by cached index (deterministic)",
     "/briefing — morning briefing",
     "/hive — HiveMind sync status",
     "/hive pull — manual HiveMind pull now",
     "/pause — stop cron cycles",
     "/resume — start cron cycles again",
     "/stop — shut down agent",
+    "",
+    "Exits are 100% deterministic rule-engine driven — the LLM never closes positions.",
   ].join("\n");
 }
 
@@ -1355,6 +1309,185 @@ async function runDeterministicScreen(limit = 5) {
   return examples
     ? `No candidates available.\nFiltered examples:\n${examples}`
     : "No candidates available right now.";
+}
+
+/**
+ * Deterministic candidate selector used by automatic screening cycles (no LLM).
+ * Ranks every screened candidate by Degen Score (+ smart-wallet bonus) and only
+ * deploys when the winner clears the configured auto-deploy floor.
+ */
+function selectCandidateDeterministically(passing) {
+  if (!Array.isArray(passing) || passing.length === 0) {
+    return { action: "NONE", reason: "No candidates passed filtering." };
+  }
+
+  const bonus = Number(config.opportunity?.smartWalletScoreBonus ?? 0);
+  const minScore = Number(config.screening?.autoMinDegen ?? 0);
+  let best = null;
+
+  passing.forEach((entry, index) => {
+    const rawDegen = Number(degenScore(entry.pool, config.opportunity));
+    const degen = Number.isFinite(rawDegen) ? rawDegen : 0;
+    const smartWallets = entry.sw?.in_pool?.length ?? 0;
+    const score = degen + (smartWallets > 0 ? bonus : 0);
+    if (!best || score > best.score) {
+      best = { index, score, degen, smartWallets, name: entry.pool?.name || entry.pool?.pool || "candidate" };
+    }
+  });
+
+  if (!best || best.score < minScore) {
+    return {
+      action: "NONE",
+      reason: `Deterministic best score ${best ? best.score.toFixed(1) : "?"} < auto-deploy floor ${minScore}.`,
+    };
+  }
+
+  return {
+    action: "DEPLOY",
+    index: best.index,
+    reason: `Deterministic selection: ${best.name} scored highest (degen ${best.degen.toFixed(1)}${best.smartWallets ? `, ${best.smartWallets} smart wallet(s)` : ""}, score ${best.score.toFixed(1)} >= ${minScore}).`,
+  };
+}
+
+/**
+ * Extract the first balanced JSON object from a model response (ignores prose
+ * before/after it and braces inside strings).
+ */
+function extractFirstJsonObject(text) {
+  const start = text.indexOf("{");
+  if (start < 0) return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+
+/**
+ * Parse the screening LLM's JSON selection. The model only chooses a candidate
+ * index — anything unparseable or out of range resolves to NONE (fail safe).
+ * @param {string} content - raw model output
+ * @param {number} candidateCount - number of candidates offered
+ * @returns {{action: "DEPLOY"|"NONE", index?: number, reason: string}}
+ */
+function parseScreeningDecision(content, candidateCount) {
+  const text = stripThink(content || "");
+
+  const jsonText = extractFirstJsonObject(text);
+  if (jsonText) {
+    let parsed = null;
+    try {
+      parsed = JSON.parse(jsonText);
+    } catch {
+      try {
+        parsed = JSON.parse(jsonrepair(jsonText));
+      } catch {
+        parsed = null;
+      }
+    }
+    if (parsed && typeof parsed === "object") {
+      const action = String(parsed.action || "").toUpperCase();
+      const reason = String(parsed.reason || "").slice(0, 600);
+      const rawIndex = Number(parsed.candidate ?? parsed.index ?? parsed.pool_index);
+      if (action === "DEPLOY" && Number.isFinite(rawIndex) && rawIndex >= 1 && rawIndex <= candidateCount) {
+        return { action: "DEPLOY", index: Math.trunc(rawIndex) - 1, reason };
+      }
+      if (action === "NONE") return { action: "NONE", reason };
+    }
+  }
+
+  // Fallback for models that ignore the JSON instruction.
+  if (/⛔\s*NO DEPLOY/i.test(text)) return { action: "NONE", reason: text.slice(0, 600) };
+
+  return {
+    action: "NONE",
+    reason: `Screening decision was not valid JSON — no deploy. Output: ${text.slice(0, 300) || "(empty)"}`,
+  };
+}
+
+/**
+ * Deterministic entry: size, bin width and every deploy parameter are computed
+ * here. The screening LLM supplies only the candidate choice and its rationale.
+ */
+async function deployCandidate(candidate, { walletBalanceSol = null } = {}) {
+  if (!candidate?.pool) throw new Error("deployCandidate: candidate is missing a pool address");
+
+  const balanceSol = walletBalanceSol ?? (await getWalletBalances()).sol;
+  const deployAmount = computeDeployAmount(balanceSol);
+  const binsBelow = computeBinsBelow(candidate.volatility);
+
+  const result = await executeTool("deploy_position", {
+    pool_address: candidate.pool,
+    amount_y: deployAmount,
+    strategy: config.strategy.strategy,
+    bins_below: binsBelow,
+    bins_above: 0,
+    pool_name: candidate.name,
+    base_mint: candidate.base?.mint || candidate.base_mint || null,
+    bin_step: candidate.bin_step,
+    base_fee: candidate.base_fee,
+    volatility: candidate.volatility,
+    fee_tvl_ratio: candidate.fee_active_tvl_ratio ?? candidate.fee_tvl_ratio,
+    organic_score: candidate.organic_score,
+    initial_value_usd: candidate.tvl ?? candidate.active_tvl ?? null,
+  });
+  if (result?.success === false || result?.error) {
+    throw new Error(result.error || "Deploy failed");
+  }
+  return { result, candidate, deployAmount, binsBelow };
+}
+
+/**
+ * Deterministic Telegram-friendly report for a deploy. Range numbers come from
+ * the deploy tool result — never from the LLM.
+ */
+function formatDeployReport({ candidate, result, deployAmount, binsBelow }, screeningReason = "") {
+  const strategy = result?.strategy || config.strategy.strategy;
+  const activeBin = result?.bin_range?.active ?? "?";
+  const coverage = result?.range_coverage;
+
+  if (result?.dry_run) {
+    return [
+      "🚀 DEPLOYED (DRY RUN)",
+      "",
+      candidate.name || "unknown",
+      candidate.pool,
+      "",
+      `◎ ${deployAmount} SOL | ${strategy} | bins_below ${binsBelow}`,
+      "No transaction sent (DRY_RUN=true).",
+      screeningReason ? `\nWHY THIS WON (screening)\n${screeningReason}` : null,
+    ].filter(Boolean).join("\n");
+  }
+
+  return [
+    "🚀 DEPLOYED",
+    "",
+    candidate.name || "unknown",
+    candidate.pool,
+    "",
+    `◎ ${deployAmount} SOL | ${strategy} | bin ${activeBin}`,
+    result?.price_range ? `Range: ${result.price_range.min} → ${result.price_range.max}` : null,
+    coverage
+      ? `Range cover: ${fmtPct(coverage.downside_pct)} downside | ${fmtPct(coverage.upside_pct)} upside | ${fmtPct(coverage.width_pct)} total`
+      : null,
+    `Position: ${result?.position || "n/a"}`,
+    result?.txs?.length ? `Tx: ${result.txs[0]}` : null,
+    screeningReason ? `\nWHY THIS WON (screening)\n${screeningReason}` : null,
+  ].filter(Boolean).join("\n");
 }
 
 async function deployLatestCandidate(index) {
@@ -1388,27 +1521,7 @@ async function deployLatestCandidate(index) {
       throw new Error(`NO DEPLOY: only cached candidate ${candidate.name} is not worth deploying — ${skipReason}`);
     }
   }
-  const deployAmount = computeDeployAmount((await getWalletBalances()).sol);
-  const binsBelow = computeBinsBelow(candidate.volatility);
-  const result = await executeTool("deploy_position", {
-    pool_address: candidate.pool,
-    amount_y: deployAmount,
-    strategy: config.strategy.strategy,
-    bins_below: binsBelow,
-    bins_above: 0,
-    pool_name: candidate.name,
-    base_mint: candidate.base?.mint || candidate.base_mint || null,
-    bin_step: candidate.bin_step,
-    base_fee: candidate.base_fee,
-    volatility: candidate.volatility,
-    fee_tvl_ratio: candidate.fee_active_tvl_ratio ?? candidate.fee_tvl_ratio,
-    organic_score: candidate.organic_score,
-    initial_value_usd: candidate.tvl ?? candidate.active_tvl ?? null,
-  });
-  if (result?.success === false || result?.error) {
-    throw new Error(result.error || "Deploy failed");
-  }
-  return { result, candidate, deployAmount, binsBelow };
+  return deployCandidate(candidate);
 }
 
 function appendHistory(userMsg, assistantMsg) {
@@ -1504,6 +1617,18 @@ async function telegramHandler(msg) {
       });
       await sendMessage(`📊 Open Positions (${total_positions}):\n\n${lines.join("\n")}\n\n/close <n> to close | /set <n> <note> to set instruction`);
     } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
+    return;
+  }
+
+  // /pool (no argument) — the ONLY LLM-assisted workflow: candidate screening.
+  // The LLM picks a candidate; the deterministic executor sizes and deploys.
+  if (text === "/pool" || text.toLowerCase() === "/pool screen") {
+    try {
+      await sendMessage("🔍 Screening started — LLM selects a candidate, code executes the entry.").catch(() => {});
+      await runScreeningCycle({ useLLM: true });
+    } catch (e) {
+      await sendMessage(`Error: ${e.message}`).catch(() => {});
+    }
     return;
   }
 
@@ -1692,14 +1817,25 @@ async function telegramHandler(msg) {
     return;
   }
 
+  // ── Deterministic execution boundary ─────────────────────────────
+  // Free-form chat may explain data, but it can never execute an entry or exit.
+  // Those are rule-engine / deterministic-command only (no LLM in the loop).
+  const isQuestion = /^\s*(why|what|how|when|which|did|does|is|are|can|could|should|explain|show|list|tell)\b/i.test(text);
+  if (!isQuestion && /\b(close|sell|exit|withdraw)\b/i.test(text)) {
+    await sendMessage("Exits are executed by the deterministic rule engine only. Use /positions then /close <n>, or /closeall.").catch(() => {});
+    return;
+  }
+  if (!isQuestion && /\b(deploy|open position|lp into|add liquidity)\b/i.test(text)) {
+    await sendMessage("Entries are deterministic. Use /pool to run screening (LLM picks the candidate, code executes the deploy) or /deploy <n>.").catch(() => {});
+    return;
+  }
+
   busy = true;
   let liveMessage = null;
   try {
     log("telegram", `Incoming: ${text}`);
-    const hasCloseIntent = /\bclose\b|\bsell\b|\bexit\b|\bwithdraw\b/i.test(text);
-    const isDeployRequest = !hasCloseIntent && /\bdeploy\b|\bopen position\b|\blp into\b|\badd liquidity\b/i.test(text);
-    const agentRole = isDeployRequest ? "SCREENER" : "GENERAL";
-    const agentModel = agentRole === "SCREENER" ? config.llm.screeningModel : config.llm.generalModel;
+    const agentRole = "GENERAL";
+    const agentModel = config.llm.generalModel;
     liveMessage = await createLiveMessage("🤖 Live Update", `Request: ${text.slice(0, 240)}`);
     const { content } = await agentLoop(text, config.llm.maxSteps, sessionHistory, agentRole, agentModel, null, {
       interactive: true,
@@ -2109,10 +2245,10 @@ async function getPandaExitSignal(position) {
 
 /**
  * Check active positions for Evil Panda exit confluences.
- * Returns a Map(position_address -> reason) so the caller feeds the normal
- * exit pipeline (registerExitSignal / close_position) instead of only alerting.
+ * Returns a Map(position_address -> rule decision) so the caller feeds the normal
+ * deterministic exit pipeline (executeRuleClose) instead of only alerting.
  * @param {Array} positions - List of current positions
- * @returns {Promise<Map<string,string>>}
+ * @returns {Promise<Map<string,object>>}
  */
 async function checkEvilPandaExitConditions(positions) {
   const exits = new Map();
@@ -2125,7 +2261,9 @@ async function checkEvilPandaExitConditions(positions) {
       if (!tracked || tracked.closed) continue;
 
       const panda = await getPandaExitSignal(position);
-      if (panda?.signal) exits.set(position.position, panda.reason);
+      if (panda?.signal) {
+        exits.set(position.position, { ...ruleDecision("EVIL_PANDA", panda.reason), signal: panda.signal });
+      }
     } catch (error) {
       log("error", `Error checking Evil Panda exit condition for position ${position.position}: ${error.message}`);
     }

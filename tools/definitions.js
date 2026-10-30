@@ -120,6 +120,40 @@ Only call this if you need the current price to calculate a specific bin range (
       }
     }
   },
+  {
+    type: "function",
+    function: {
+      name: "deploy_position",
+      description: `Open a single-sided SOL liquidity position in a Meteora DLMM pool.
+SOL only: amount_x MUST be 0 and bins_above MUST be 0 — the upper bin is the active bin.
+The pool must still pass the live screening thresholds and every executor safety check.
+Returns { success, position, pool, bin_range, price_range, range_coverage, bin_step, base_fee,
+strategy, amount_y, txs } on success, or { blocked, reason } when a guard rejects the deploy.`,
+      parameters: {
+        type: "object",
+        properties: {
+          pool_address: { type: "string", description: "DLMM pool address (base58)" },
+          amount_y: { type: "number", description: "SOL amount to deposit (single-sided)" },
+          amount_x: { type: "number", description: "Must be 0 — token-side deposits are unsupported" },
+          strategy: { type: "string", enum: ["bid_ask", "spot", "curve"], description: "DLMM distribution shape" },
+          bins_below: { type: "integer", description: "Bins below the active bin; total range must be at least 35 bins" },
+          bins_above: { type: "integer", description: "Must be 0 for single-sided SOL deploys" },
+          downside_pct: { type: "number", description: "Optional downside range in percent (alternative to bins_below)" },
+          upside_pct: { type: "number", description: "Must be 0/omitted for single-sided SOL deploys" },
+          volatility: { type: "number", description: "Pool volatility used for range sizing; must be positive when supplied" },
+          pool_name: { type: "string", description: "Human-readable pool name for tracking and notifications" },
+          bin_step: { type: "number", description: "Pool bin step (learning metadata)" },
+          base_fee: { type: "number", description: "Pool base fee percent (learning metadata)" },
+          fee_tvl_ratio: { type: "number", description: "Entry fee/TVL ratio (learning metadata)" },
+          organic_score: { type: "number", description: "Entry organic score (learning metadata)" },
+          initial_value_usd: { type: "number", description: "Initial pool/market value snapshot (learning metadata)" },
+        },
+        required: ["pool_address", "amount_y"],
+      },
+    },
+  },
+
+
 
   
 

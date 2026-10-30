@@ -4,11 +4,23 @@ import { buildSystemPrompt } from "./prompt.js";
 import { executeTool } from "./tools/executor.js";
 import { tools } from "./tools/definitions.js";
 
-const MANAGER_TOOLS  = new Set(["close_position", "claim_fees", "swap_token", "get_position_pnl", "get_my_positions", "get_wallet_balance"]);
+// ── AI scope boundary ──────────────────────────────────────────────
+// The LLM is allowed to REASON about screening candidates only. These tools
+// change position state or move funds, so they are never offered to a model and
+// are rejected at execution time. Exits/entries are executed exclusively by the
+// deterministic rule engine in code (exit-rules.js / deployCandidate()).
+const DETERMINISTIC_ONLY_TOOLS = new Set([
+  "close_position",
+  "deploy_position",
+]);
+
+const MANAGER_TOOLS  = new Set(["claim_fees", "swap_token", "get_position_pnl", "get_my_positions", "get_wallet_balance"]);
 const SCREENER_TOOLS = new Set(["get_active_bin", "get_top_candidates", "check_smart_wallets_on_pool", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "get_pool_memory", "get_wallet_balance", "get_my_positions"]);
 const GENERAL_INTENT_ONLY_TOOLS = new Set([
   "self_update",
   "update_config",
+  "deploy_position",
+  "close_position",
   "add_to_blacklist",
   "remove_from_blacklist",
   "block_deployer",
@@ -30,7 +42,7 @@ const GENERAL_INTENT_ONLY_TOOLS = new Set([
 const INTENT_TOOLS = {
   decisions:   new Set(["get_recent_decisions"]),
   deploy:      new Set(["get_top_candidates", "get_active_bin", "get_pool_memory", "check_smart_wallets_on_pool", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "get_wallet_balance", "get_my_positions", "add_pool_note"]),
-  close:       new Set(["close_position", "get_my_positions", "get_position_pnl", "get_wallet_balance", "swap_token"]),
+  close:       new Set(["get_my_positions", "get_position_pnl", "get_wallet_balance"]),
   claim:       new Set(["claim_fees", "get_my_positions", "get_position_pnl", "get_wallet_balance"]),
   swap:        new Set(["swap_token", "get_wallet_balance"]),
   config:      new Set(["update_config"]),
@@ -68,8 +80,11 @@ const INTENT_PATTERNS = [
 ];
 
 function getToolsForRole(agentType, goal = "") {
-  if (agentType === "MANAGER")  return tools.filter(t => MANAGER_TOOLS.has(t.function.name));
-  if (agentType === "SCREENER") return tools.filter(t => SCREENER_TOOLS.has(t.function.name));
+  // Deterministic-only tools are never offered to any model, regardless of role.
+  const available = () => tools.filter(t => !DETERMINISTIC_ONLY_TOOLS.has(t.function.name));
+
+  if (agentType === "MANAGER")  return available().filter(t => MANAGER_TOOLS.has(t.function.name));
+  if (agentType === "SCREENER") return available().filter(t => SCREENER_TOOLS.has(t.function.name));
 
   // GENERAL: match intent from goal, combine matched tool sets
   const matched = new Set();
@@ -80,8 +95,8 @@ function getToolsForRole(agentType, goal = "") {
   }
 
   // Fall back to all tools if no intent matched
-  if (matched.size === 0) return tools.filter(t => !GENERAL_INTENT_ONLY_TOOLS.has(t.function.name));
-  return tools.filter(t => matched.has(t.function.name));
+  if (matched.size === 0) return available().filter(t => !GENERAL_INTENT_ONLY_TOOLS.has(t.function.name));
+  return available().filter(t => matched.has(t.function.name));
 }
 import { getWalletBalances } from "./tools/wallet.js";
 import { getMyPositions } from "./tools/dlmm.js";
@@ -108,6 +123,9 @@ const DECISION_EXPLANATION_INTENTS = /\b(why did you|why'd you|why was (?:this|t
 
 function shouldRequireRealToolUse(goal, agentType, interactive = false) {
   if (agentType === "MANAGER") return false;
+  // SCREENER performs screening reasoning only — it must answer with its JSON
+  // selection (no forced tool call, no execution).
+  if (agentType === "SCREENER") return false;
   if (DECISION_EXPLANATION_INTENTS.test(goal)) return false;
   if (CONFIG_READ_ONLY_INTENTS.test(goal)) return false;
   if (MUTATING_TOOL_INTENTS.test(goal)) return true;
@@ -179,8 +197,11 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
   // destructive tool twice (e.g. deploy twice, swap twice after auto-swap)
   const ONCE_PER_SESSION = new Set(["swap_token", "close_position"]);
   // These lock after first attempt regardless of success — retrying them is always wrong
-  const NO_RETRY_TOOLS = new Set([]);
+  const NO_RETRY_TOOLS = new Set(["deploy_position"]);
   const firedOnce = new Set();
+  // Hard AI-scope guard: a model can only execute tools that were actually offered
+  // for this role/goal. Hallucinated close/deploy calls are rejected here.
+  const allowedToolNames = new Set(getToolsForRole(agentType, goal).map((t) => t.function.name));
   const mustUseRealTool = shouldRequireRealToolUse(goal, agentType, interactive);
   let sawToolCall = false;
   let noToolRetryCount = 0;
@@ -198,9 +219,11 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
       const FALLBACK_MODEL = "stepfun/step-3.5-flash:free";
       let response;
       let usedModel = activeModel;
-      // Force a tool call on step 0 for action intents — prevents the model from inventing deploy/close outcomes
+      // Force a tool call on step 0 for action intents — prevents the model from inventing deploy/close outcomes.
+      // Screening/management roles are reasoning-only: never force a tool call there.
       const ACTION_INTENTS = /\b(deploy|open|add liquidity|close|exit|withdraw|claim|swap|block|unblock)\b/i;
-      let toolChoice = (step === 0 && (ACTION_INTENTS.test(goal) || mustUseRealTool)) ? "required" : "auto";
+      const reasoningOnlyRole = agentType === "SCREENER" || agentType === "MANAGER";
+      let toolChoice = (!reasoningOnlyRole && step === 0 && (ACTION_INTENTS.test(goal) || mustUseRealTool)) ? "required" : "auto";
 
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
@@ -315,6 +338,21 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
       const toolResults = await Promise.all(msg.tool_calls.map(async (toolCall) => {
         const functionName = toolCall.function.name.replace(/<.*$/, "").trim();
         let functionArgs;
+
+        if (!allowedToolNames.has(functionName)) {
+          const result = {
+            success: false,
+            blocked: true,
+            error: `Tool ${functionName} is not available in this context. Position exits and entries are executed only by the deterministic rule engine in code — never by the model.`,
+          };
+          log("agent", `Blocked disallowed tool ${functionName} for role ${agentType}`);
+          await onToolFinish?.({ name: functionName, args: {}, result, success: false, step });
+          return {
+            role: "tool",
+            tool_call_id: toolCall.id,
+            content: JSON.stringify(result),
+          };
+        }
 
         if (invalidToolArgErrors.has(toolCall.id)) {
           const result = {

@@ -371,6 +371,7 @@ const toolMap = {
       maxTokenAgeHours: ["screening", "maxTokenAgeHours"],
       minFeePerTvl24h: ["management", "minFeePerTvl24h"],
       loneCandidateMinDegen: ["screening", "loneCandidateMinDegen"],
+      autoMinDegen: ["screening", "autoMinDegen"],
       // management
       minClaimAmount: ["management", "minClaimAmount"],
       autoSwapAfterClaim: ["management", "autoSwapAfterClaim"],

@@ -480,9 +480,19 @@ export async function deployPosition({
 }) {
   const isDryRun = process.env.DRY_RUN === "true";
   
+  // Defense in depth: LIVE mode requires BOTH the absence of DRY_RUN and an explicit
+  // opt-in. Absent/typo/inherited-empty values all fail closed.
+  const enableLiveTrading = process.env.ENABLE_LIVE_TRADING === "true";
+
+  if (!isDryRun && !enableLiveTrading) {
+    throw new Error(
+      "deployPosition refused: LIVE mode requires ENABLE_LIVE_TRADING=true. " +
+      "Set DRY_RUN=true for simulations, or ENABLE_LIVE_TRADING=true for a supervised live deploy.",
+    );
+  }
   if (!isDryRun) {
-    // Throw a hard error to guarantee no on-chain write transactions occur in LIVE mode
-    throw new Error("deployPosition called in LIVE mode - this is not allowed in read-only mode!");
+    // Audit trail: every live deploy records that the gate was explicitly opened.
+    log("deploy", `LIVE deploy authorised (ENABLE_LIVE_TRADING=true) amount_y=${Number(amount_y ?? amount_sol ?? 0)}`);
   }
   pool_address = normalizeMint(pool_address);
   const activeStrategy = strategy || config.strategy.strategy;
