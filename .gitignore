@@ -47,3 +47,8 @@ discord-signals.json
 
 # Claude Code runtime lock
 .claude/scheduled_tasks.lock
+
+# Audit & Remediation Reports
+*_REPORT.md
+*_PLAN.md
+ARCHITECTURE_DIAGRAMS.md
