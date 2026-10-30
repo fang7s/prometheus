@@ -117,7 +117,7 @@ Autonomous DLMM liquidity provider agent for Meteora pools on Solana.
 | `envcrypt.js` | 121 | XOR-cipher with a key from `.envrypt`/`ENVRYPT_KEY`. Encrypts anything matching `*_KEY`, `*SECRET*`, `*TOKEN*`, `*MNEMONIC*`, etc. The `# encrypted` marker in `.env` precedes encrypted lines. |
 | `logger.js` | 75 | Daily-rotating `logs/agent-YYYY-MM-DD.log`. `logAction({tool, args, result, duration_ms, success})` writes JSONL `actions-YYYY-MM-DD.jsonl` audit trail. Level via `LOG_LEVEL` env. |
 | **Other** | | |
-| `discord-listener/`, `test/`, `scripts/`, `utils/` | | Discord listener (above), syntax-checked tests, envcrypt CLI, `safeNumber`. |
+| `discord-listener/`, `test/`, `scripts/`, `utils/` | | Discord listener (above), syntax-checked tests (`test-rpc-utils.js`), envcrypt CLI, `rpc-diagnostic.js` (Helius/RPC health), `check-syntax.js` (cross-platform `node --check`), `utils/rpc.js` (endpoint/key normalization + JSON-RPC probe), `safeNumber`. |
 | `.claude/agents/{screener,manager}.md` | | Claude Code sub-agent configs — used when you run `claude` inside the repo. |
 | `.claude/commands/*.md` | | Slash commands (`/screen`, `/manage`, `/balance`, `/candidates`, `/pool-ohlcv`, etc.) that wrap `cli.js`. |
 | `.claude/settings.json` | | Denies `rm -rf`, `wget`, `Read(./.env*)`. **Forbids `run_in_background: true` via a PreToolUse hook.** |
@@ -316,11 +316,13 @@ All persistent files are loaded/saved on each call — no in-memory caching laye
 | Var | Required | Purpose |
 |---|---|---|
 | `WALLET_PRIVATE_KEY` | yes | Base58 (or JSON array) |
-| `RPC_URL` | yes | Solana RPC. Helius recommended. |
+| `RPC_URL` | yes | Solana RPC. Helius recommended: `https://mainnet.helius-rpc.com/?api-key=YOUR_KEY`. Normalized at load (quotes/whitespace stripped, nested `api-key` repaired). |
 | `OPENROUTER_API_KEY` (or `LLM_API_KEY`) | yes | LLM provider key. |
 | `LLM_BASE_URL` | no | Override for any OpenAI-compatible endpoint (LM Studio: `http://localhost:1234/v1`). |
 | `LLM_MODEL` | no | Default model. Per-role models in `user-config.json` override. |
-| `HELIUS_API_KEY` | recommended | Wallet balance lookups via Helius. |
+| `HELIUS_API_KEY` | recommended | **Bare key only (uuid)** for wallet balance lookups. Pasting a full RPC URL here caused the historical HTTP 401 — `utils/rpc.js` now extracts the bare key defensively. |
+| `RPC_FALLBACK_URL` | no | Read-only fallback endpoint used by health/balance reads when the primary RPC fails. |
+| `ENABLE_PUBLIC_RPC_FALLBACK` | no | `true` → use `https://api.mainnet-beta.solana.com` as the read-only fallback when `RPC_FALLBACK_URL` is unset. |
 | `LPAGENT_API_KEY` | optional | Direct LPAgent positions fetch fallback. |
 | `JUPITER_API_KEY` | optional | Better rate limit on Jupiter Swap. Default key baked in. |
 | `TELEGRAM_BOT_TOKEN` | no | Notifications + REPL. |
@@ -339,6 +341,24 @@ Encrypted env flow (optional, see `scripts/envrypt.js`):
 1. Save plain values to `.env.raw`.
 2. `printf "long-local-key\n" > .envrypt`.
 3. `npm run env:encrypt` reads `.env.raw`, encrypts anything matching `*_KEY`/`*SECRET*`/`*TOKEN*`/`*MNEMONIC*`/etc., writes `.env`. Originals are XOR'd with a positional repeating key — **not** cryptographically secure, but obscures values in plaintext grep.
+
+### RPC / Helius 401 troubleshooting
+
+`HTTP 401 Unauthorized` from Helius means the **key**, not the network, is wrong. The two historical causes:
+
+1. `HELIUS_API_KEY` held a full RPC URL (`https://mainnet.helius-rpc.com/?api-key=…`) instead of the bare uuid, producing `…/balances?api-key=https://…`.
+2. The key was deleted/rotated in the Helius dashboard — every host returns 401, even `https://mainnet.helius-rpc.com/` without a key.
+
+Diagnose (prints `getHealth`, `getBalance` for `11111111111111111111111111111111`, `getSlot` with raw HTTP status per endpoint):
+
+```bash
+npm run check:rpc              # live checks (exit 0 = read path verified)
+npm run check:rpc -- --strict  # exit 1 unless the PRIMARY endpoint works
+npm run check:rpc -- --json    # machine-readable report
+npm run check                  # syntax + offline env audit + utils/rpc tests
+```
+
+`utils/rpc.js` normalizes endpoints (`sanitizeEnvValue`, `extractHeliusApiKey`, `normalizeRpcUrl`, `redactRpcUrl`) and wraps JSON-RPC calls (`rpcCall`, `describeHttpStatus`). `config.js` applies the normalization to `RPC_URL` / `HELIUS_API_KEY` at load, so tools always see a bare key. `tools/wallet.js` falls back to `getBalance` + `getParsedTokenAccountsByOwner` on `config.rpc.fallbackUrl` when Helius is down — **read-only**, signed transactions always use `RPC_URL`.
 
 ---
 

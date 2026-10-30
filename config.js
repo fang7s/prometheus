@@ -1,6 +1,7 @@
 import fs from "fs";
 import { REPO_ROOT, repoPath } from "./repo-root.js";
 import { getScreeningDefaultsForTimeframe, normalizeTimeframe, scaleScreeningToTimeframe, TIMEFRAME_SCREENING_SCALES } from "./screening-scales.js";
+import { extractHeliusApiKey, getFallbackRpcUrl, normalizeRpcUrl, resolveRpcUrl } from "./utils/rpc.js";
 
 export { REPO_ROOT, repoPath, getScreeningDefaultsForTimeframe, normalizeTimeframe, scaleScreeningToTimeframe, TIMEFRAME_SCREENING_SCALES };
 
@@ -42,6 +43,19 @@ if (u.dryRun !== undefined) process.env.DRY_RUN ||= String(u.dryRun);
 if (u.publicApiKey) process.env.PUBLIC_API_KEY ||= u.publicApiKey;
 if (u.agentMeridianApiUrl) process.env.AGENT_MERIDIAN_API_URL ||= u.agentMeridianApiUrl;
 if (u.telegramChatId) process.env.TELEGRAM_CHAT_ID ||= String(u.telegramChatId);
+
+// ─── Normalize RPC / Helius env ──────────────────────────────────
+// `.env` values are frequently pasted with wrapping quotes, trailing spaces, or
+// as a full RPC URL into HELIUS_API_KEY. Any of those makes every Helius request
+// return HTTP 401, so repair them once here — every consumer reads env/config.
+if (process.env.RPC_URL) {
+  const normalizedRpcUrl = normalizeRpcUrl(process.env.RPC_URL, { apiKey: process.env.HELIUS_API_KEY });
+  if (normalizedRpcUrl) process.env.RPC_URL = normalizedRpcUrl;
+}
+if (process.env.HELIUS_API_KEY) {
+  const bareHeliusKey = extractHeliusApiKey(process.env.HELIUS_API_KEY);
+  if (bareHeliusKey) process.env.HELIUS_API_KEY = bareHeliusKey;
+}
 
 const indicatorUserConfig = u.chartIndicators ?? {};
 
@@ -213,6 +227,16 @@ export const config = {
     minSamples:     u.darwinMinSamples  ?? 10,
   },
 
+  // ─── Solana RPC ────────────────────────
+  rpc: {
+    // Normalized main endpoint (quotes/spaces stripped, Helius key repaired).
+    url: resolveRpcUrl(),
+    // Optional read-only fallback: RPC_FALLBACK_URL, or the public mainnet RPC
+    // when ENABLE_PUBLIC_RPC_FALLBACK=true. Never used for signed transactions.
+    fallbackUrl: getFallbackRpcUrl(),
+    heliusApiKey: extractHeliusApiKey(process.env.HELIUS_API_KEY),
+  },
+
   // ─── Common Token Mints ────────────────
   tokens: {
     SOL:  "So11111111111111111111111111111111111111112",
@@ -239,7 +263,9 @@ export const config = {
     // Live position value comes from on-chain reads on this RPC.
     // Defaults to the public pump.helius endpoint so the aggressive poller
     // never burns the main RPC_URL or the LPAgent sponsor budget.
-    rpcUrl: nonEmptyString(u.pnlRpcUrl, process.env.PNL_RPC_URL, "https://pump.helius-rpc.com"),
+    rpcUrl:
+      normalizeRpcUrl(nonEmptyString(u.pnlRpcUrl, process.env.PNL_RPC_URL, "https://pump.helius-rpc.com")) ??
+      "https://pump.helius-rpc.com/",
     source: nonEmptyString(u.pnlSource, "rpc"), // rpc | meteora (fallback-only)
     pollIntervalSec: Number(u.pnlPollIntervalSec ?? 3),
     depositCacheTtlSec: Number(u.pnlDepositCacheTtlSec ?? 300),

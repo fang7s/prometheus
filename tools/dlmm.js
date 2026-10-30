@@ -82,7 +82,12 @@ let _wallet = null;
 
 function getConnection() {
   if (!_connection) {
-    _connection = new Connection(process.env.RPC_URL, "confirmed");
+    if (!config.rpc.url) {
+      throw new Error(
+        "RPC_URL is not set — add it to .env (Helius: https://mainnet.helius-rpc.com/?api-key=YOUR_API_KEY)",
+      );
+    }
+    _connection = new Connection(config.rpc.url, "confirmed");
   }
   return _connection;
 }
