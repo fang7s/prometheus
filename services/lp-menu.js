@@ -284,6 +284,7 @@ export function getLpSession(msg) {
     rangeLabel: "-50%",
     awaiting: null,
     tokenQuery: null,
+    listKind: null,
     deploying: false,
     updatedAt: Date.now(),
   };
@@ -616,24 +617,70 @@ export function buildTokenPoolsKeyboard({ tokenMint = null, pools = [] } = {}) {
 }
 
 // ─── Pool dashboard rendering ─────────────────────────────────────
+/** Meteora rents one bin array per 70 bins; this is the on-chain rent per array. */
+export const BINS_PER_BIN_ARRAY = 70;
+export const BIN_ARRAY_FEE_SOL = 0.07143744;
+
 function mark(isSelected, label) {
   return isSelected ? `✅ ${label}` : label;
 }
 
-function describeAmount(session, wallet) {
-  if (session.amountMode === "pct") {
-    const available = Math.max(0, Number(wallet?.sol ?? 0) - Number(config.management?.gasReserve ?? 0));
-    const sol = (available * Number(session.amountPct ?? 0)) / 100;
-    return `${session.amountPct}% (≈${formatSolAmount(sol)} SOL)`;
-  }
-  return `${formatSolAmount(session.amountSol)} SOL`;
+/** Worst-case bin-array rent for a range (every array uninitialised). */
+export function estimateBinArrayRentSol(totalBins = 0) {
+  const bins = Math.max(0, Math.ceil(Number(totalBins) || 0));
+  if (bins === 0) return 0;
+  return Number((Math.ceil(bins / BINS_PER_BIN_ARRAY) * BIN_ARRAY_FEE_SOL).toFixed(8));
 }
 
-function describeRange(session) {
-  const down = Number(session.downsidePct ?? 0);
-  const up = Number(session.upsidePct ?? 0);
-  if (up > 0) return `-${down}% → +${up}%`;
-  return `-${down}% → 0% (single-sided)`;
+/** Spendable SOL once the gas reserve and bin-array rent are set aside. */
+export function maxSpendableSol({ sol = 0, gasReserve = 0, totalBins = 0 } = {}) {
+  const available = Number(sol) - Number(gasReserve) - estimateBinArrayRentSol(totalBins);
+  if (!Number.isFinite(available)) return 0;
+  return Number(Math.max(0, available).toFixed(4));
+}
+
+/**
+ * Pool health from the TVL / market-cap ratio: `Normal` at ≥ 2 % (liquidity is
+ * deep enough relative to the token), `Thin` below that, `Unknown` without a
+ * market cap.
+ */
+export function poolHealthLabel({ tvl = null, mcap = null } = {}) {
+  const tvlValue = Number(tvl);
+  const mcapValue = Number(mcap);
+  if (!Number.isFinite(tvlValue) || !Number.isFinite(mcapValue) || tvlValue <= 0 || mcapValue <= 0) {
+    return { label: "Unknown", emoji: "❔", ratioPct: null };
+  }
+  const ratioPct = Number(((tvlValue / mcapValue) * 100).toFixed(2));
+  return ratioPct >= 2
+    ? { label: "Normal", emoji: "🩺", ratioPct }
+    : { label: "Thin", emoji: "🪶", ratioPct };
+}
+
+/** `0.08 SOL (≈ $7.36)` — percentage selections show the % used. */
+export function describeAmount(
+  session,
+  wallet = null,
+  { gasReserve = Number(config.management?.gasReserve ?? 0) } = {},
+) {
+  let sol;
+  if (session?.amountMode === "pct") {
+    const available = Math.max(0, Number(wallet?.sol ?? 0) - Number(gasReserve));
+    sol = (available * Number(session.amountPct ?? 0)) / 100;
+  } else {
+    sol = Number(session?.amountSol ?? 0);
+  }
+  const price = Number(wallet?.sol_price ?? 0);
+  const usd = price > 0 ? ` (≈ ${formatUsd(sol * price)})` : "";
+  const pctNote = session?.amountMode === "pct" ? `${session.amountPct}% of balance · ` : "";
+  return `${pctNote}${formatSolAmount(sol)} SOL${usd}`;
+}
+
+/** `-50% to 0%` (single-sided) or `-30% to +40%`. */
+export function describeRange(session) {
+  const down = Number(session?.downsidePct ?? 0);
+  const up = Number(session?.upsidePct ?? 0);
+  if (up > 0) return `-${down}% to +${up}%`;
+  return `-${down}% to 0%`;
 }
 
 export function renderDashboard(session, { wallet = null, note = null } = {}) {
@@ -645,10 +692,16 @@ export function renderDashboard(session, { wallet = null, note = null } = {}) {
   const up = Number(session.upsidePct ?? 0);
   const binStep = pool.binStep ?? "?";
   const baseFee = pool.baseFee != null ? `${formatSolAmount(pool.baseFee, 2)}%` : "?";
+  const health = poolHealthLabel({ tvl: pool.tvl, mcap: pool.mcap });
+  const gasReserve = Number(config.management?.gasReserve ?? 0);
+  const totalBins = Number(session.rangePreview?.totalBins ?? config.strategy?.defaultBinsBelow ?? 69);
+  const binRent = estimateBinArrayRentSol(totalBins);
+  const maxSol = maxSpendableSol({ sol: wallet?.sol ?? 0, gasReserve, totalBins });
+  const presetSol = Number(config.management?.deployAmountSol ?? 0.5);
 
   const lines = [
-    `📊 <b>New Position: ${escapeHtml(pool.name || "pool")}</b>`,
-    `Binstep: ${binStep} · BaseFee: ${baseFee}`,
+    `🆕 <b>New Position: ${escapeHtml(pool.name || "pool")}</b>`,
+    `Binstep: ${binStep} | BaseFee: ${baseFee}`,
     "─────────────────────────",
     pool.activeBinId != null
       ? `🎯 Active bin: <b>${pool.activeBinId}</b>${pool.activeBinSol != null ? ` · ${formatSolAmount(pool.activeBinSol)} SOL in bin` : ""}`
@@ -656,20 +709,25 @@ export function renderDashboard(session, { wallet = null, note = null } = {}) {
     pool.activeBinSol != null && pool.activeBinId != null
       ? `💧 1 bin ≈ ${formatSolAmount(pool.activeBinSol)} SOL`
       : null,
+    `${health.emoji} Pool Health: <b>${health.label}</b>${health.ratioPct != null ? ` (TVL/MC ${health.ratioPct.toFixed(1)}%)` : ""}`,
     pool.tvl != null
       ? `🩺 TVL ${formatUsd(pool.tvl)} · Fee/TVL ${pool.feeTvl != null ? `${Number(pool.feeTvl).toFixed(2)}%` : "?"} · APR≈${pool.apr != null && Number.isFinite(pool.apr) ? `${Number(pool.apr).toFixed(1)}%` : "?"}`
       : null,
     "",
-    `💵 Amount: <b>${amountLabel}</b>`,
-    `🧭 Range: <b>${describeRange(session)}</b>`,
+    `💰 Amount: <b>${amountLabel}</b>`,
+    `📐 Range: <b>${describeRange(session)}</b>`,
     session.rangePreview
       ? `🗂 Bins: <b>${session.rangePreview.minBinId}</b> → <b>${session.rangePreview.maxBinId}</b> (${session.rangePreview.totalBins} bins)`
       : null,
     mcap > 0
       ? `🏦 Range MC: ${formatUsd(mcap * Math.max(0, 1 - down / 100))} → ${formatUsd(mcap * (1 + up / 100))}`
       : null,
-    `🎨 Strategy: <b>${escapeHtml(strategyLabel(session.strategy))}</b>`,
+    `📊 Strategy: <b>${escapeHtml(strategyLabel(session.strategy))}</b>`,
+    `💯 Max: <b>${formatSolAmount(maxSol)} SOL</b> <i>(after ${formatSolAmount(gasReserve)} gas + ${formatSolAmount(binRent)} bin-array rent)</i>`,
     `🛡 Slippage: 10% · Max deploy: ${formatSolAmount(config.risk?.maxDeployAmount ?? 0, 2)} SOL`,
+    "",
+    `⚡ Preset A: 1 SOL · -50% · Spot`,
+    `⚡ Preset B: ${formatSolAmount(presetSol)} SOL · -90% · BidAsk`,
     twoSided
       ? "🧾 Two-sided range: half the SOL is swapped into the base token before deposit."
       : null,
@@ -685,6 +743,7 @@ export function buildDashboardKeyboard(session) {
   const isPct = (value) => amountMode === "pct" && Number(session.amountPct) === value;
   const isCustomAmount = !isSol(1) && !isPct(50) && !isPct(100);
   const rangeSel = (label) => session.rangeLabel === label;
+  const isCustomRange = rangeSel("Custom") || session.awaiting === "range";
 
   return [
     [btn("───────── ⚡ QUICK ZAP ─────────", "noop")],
@@ -692,7 +751,7 @@ export function buildDashboardKeyboard(session) {
 
     [btn("─────── 💧 LIQUIDITY AMOUNT ───────", "noop")],
     [btn(mark(isSol(1), "1 SOL"), "amt:1"), btn(mark(isPct(50), "50%"), "amt:50"), btn(mark(isPct(100), "100%"), "amt:100")],
-    [btn(mark(isCustomAmount, "✏️ Custom"), "amt:custom"), btn("📋 Preset", "amt:preset")],
+    [btn(mark(isCustomAmount, "✏️ Custom"), "amt:custom"), btn("✏️ Preset", "amt:preset")],
 
     [btn("────────── 📐 RANGE ──────────", "noop")],
     [
@@ -700,12 +759,16 @@ export function buildDashboardKeyboard(session) {
       btn(mark(rangeSel("-30 +40"), "-30 +40"), "rng:m30p40"),
       btn(mark(rangeSel("+200%"), "+200%"), "rng:p200"),
     ],
-    [btn(mark(rangeSel("Default"), "⭐ Default"), "rng:default"), btn(mark(rangeSel("Custom"), "Range"), "rng:custom"), btn("📋 Preset", "rng:preset")],
+    [
+      btn(mark(rangeSel("Default"), "⭐ Default"), "rng:default"),
+      btn(mark(isCustomRange, "✏️ Range"), "rng:custom"),
+      btn("✏️ Preset", "rng:preset"),
+    ],
 
-    [btn("────────── 🎨 STRATEGY ──────────", "noop")],
+    [btn("────────── 📊 STRATEGY ──────────", "noop")],
     [
       btn(mark(session.strategy === "spot", "➖ Spot"), "str:spot"),
-      btn(mark(session.strategy === "bid_ask", "⚓ BidAsk"), "str:bid_ask"),
+      btn(mark(session.strategy === "bid_ask", "☍ BidAsk"), "str:bid_ask"),
       btn(mark(session.strategy === "curve", "🔔 Curve"), "str:curve"),
     ],
     [
@@ -713,10 +776,10 @@ export function buildDashboardKeyboard(session) {
       btn(mark(session.strategy === "spot_curve", "⚡ Spot & Curve"), "str:spot_curve"),
     ],
 
-    [btn("────────── OTHER ──────────", "noop")],
+    [btn("────────── ✅ ACTION ──────────", "noop")],
     [btn("✅ Continue", "continue")],
     [btn("⚡ Deploy Position", "deploy")],
-    [btn("🔄 Refresh", "refresh"), btn("🏠 Main Menu", "main")],
+    [btn("🔄 Refresh", "refresh"), btn("⬅️ Back", "back"), btn("🏠 Main Menu", "main")],
   ];
 }
 
@@ -1135,6 +1198,7 @@ export async function showPoolListView({ messageId = null, force = false, note =
   if (session) {
     session.awaiting = null;
     session.pool = null;
+    session.listKind = "list";
     session.messageId = messageId ?? session.messageId;
   }
 
@@ -1202,6 +1266,7 @@ export async function showTrendingView({ messageId = null, force = false, note =
   if (session) {
     session.awaiting = null;
     session.pool = null;
+    session.listKind = "trending";
     session.messageId = messageId ?? session.messageId;
   }
 
@@ -1439,6 +1504,8 @@ async function resolveAmountSol(session, wallet) {
 // ─── Deploy ───────────────────────────────────────────────────────
 export function formatDeployResult(result) {
   const range = result?.bin_range || {};
+  const tx = result?.txs?.[0] ?? result?.tx ?? null;
+  const swapTx = result?.swap_tx ?? null;
   const pr = range.minPrice != null && range.maxPrice != null
     ? `${formatSolAmount(range.minPrice, 8)} → ${formatSolAmount(range.maxPrice, 8)}`
     : "?";
@@ -1451,16 +1518,18 @@ export function formatDeployResult(result) {
     `Pool: <b>${escapeHtml(result?.pool_name || result?.pool || "?")}</b>`,
     result?.pool ? `<code>${escapeHtml(result.pool)}</code>` : null,
     "",
-    `💵 Amount: ${formatSolAmount(result?.amount_sol)} SOL${result?.two_sided && result?.amount_token ? ` + ${formatSolAmount(result.amount_token)} base` : ""}`,
-    `🧭 Bins: ${range.minBinId ?? "?"} → ${range.maxBinId ?? "?"} (active ${range.activeBinId ?? result?.active_bin ?? "?"})`,
+    `💰 Amount: ${formatSolAmount(result?.amount_sol)} SOL${result?.two_sided && result?.amount_token ? ` + ${formatSolAmount(result.amount_token)} base` : ""}`,
+    `📐 Bins: ${range.minBinId ?? "?"} → ${range.maxBinId ?? "?"} (active ${range.activeBinId ?? result?.active_bin ?? "?"})`,
     `📈 Price: ${pr}`,
     range.downsideCoveragePct != null
       ? `🛡 Coverage: -${Math.abs(Number(range.downsideCoveragePct)).toFixed(2)}% / +${Number(range.upsideCoveragePct ?? 0).toFixed(2)}%`
       : null,
-    `🎨 Strategy: ${escapeHtml(result?.strategy_label || strategyLabel(result?.strategy || "bid_ask"))}`,
-    result?.swap_tx ? `🔁 Zap swap: <code>${escapeHtml(result.swap_tx)}</code>` : null,
+    `📊 Strategy: ${escapeHtml(result?.strategy_label || strategyLabel(result?.strategy || "bid_ask"))}`,
+    result?.bin_step != null ? `Binstep: ${result.bin_step}${result?.base_fee != null ? ` | BaseFee: ${formatSolAmount(result.base_fee, 2)}%` : ""}` : null,
+    swapTx ? `🔁 Zap swap: <a href="https://solscan.io/tx/${escapeHtml(swapTx)}">${escapeHtml(swapTx.slice(0, 16))}…</a>` : null,
     positions.length ? `\n📦 Positions:\n${positions.join("\n")}` : null,
-    result?.txs?.length ? `\n🔗 Tx: <code>${escapeHtml(result.txs[0])}</code>` : null,
+    tx ? `\n🔗 Tx: <code>${escapeHtml(tx)}</code>` : null,
+    tx ? `🔍 <a href="https://solscan.io/tx/${escapeHtml(tx)}">View on Solscan</a>` : null,
     result?.txs?.length > 1 ? `<i>+${result.txs.length - 1} more transaction(s)</i>` : null,
     result?.dry_run ? "\nSet <code>DRY_RUN=false</code> + <code>ENABLE_LIVE_TRADING=true</code> to go live." : null,
   ].filter((value) => value !== null && value !== undefined).join("\n");
@@ -1564,6 +1633,7 @@ async function presentTokenPools(msg, result, { note = null, messageId = null } 
   session.pool = null;
   session.awaiting = null;
   session.tokenQuery = { mint: result?.tokenMint ?? null, symbol: result?.symbol ?? null };
+  session.listKind = "token";
 
   const wallet = await getWalletSnapshot();
   const view = renderTokenPools({
@@ -1964,8 +2034,28 @@ export async function handleLpCallback(msg) {
 
   if (action === "back") {
     await ack();
-    if (session.pool) await presentDashboard(msg, { messageId: msg.messageId });
-    else await showPoolListView({ msg, messageId: msg.messageId });
+    // Returning from a "Custom" prompt goes back to the dashboard card…
+    if (session.awaiting) {
+      session.awaiting = null;
+      if (session.pool) await presentDashboard(msg, { messageId: msg.messageId });
+      else await showPoolListView({ msg, messageId: msg.messageId });
+      return true;
+    }
+    // …while Back on the dashboard itself returns to the list it came from
+    // (Top Trending / token search / screening list).
+    if (session.pool) {
+      const origin = session.listKind;
+      session.pool = null;
+      if (origin === "trending") {
+        await showTrendingView({ msg, messageId: msg.messageId });
+      } else if (origin === "token" && session.tokenQuery?.mint) {
+        await openTokenByMint(msg, session.tokenQuery.mint, { messageId: msg.messageId });
+      } else {
+        await showPoolListView({ msg, messageId: msg.messageId });
+      }
+      return true;
+    }
+    await showPoolListView({ msg, messageId: msg.messageId });
     return true;
   }
 

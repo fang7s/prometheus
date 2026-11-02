@@ -5,6 +5,7 @@
 
 import assert from "node:assert/strict";
 import {
+  BIN_ARRAY_FEE_SOL,
   DEFAULT_QUICK_TOKENS,
   NEW_POSITION_PROMPT,
   binsToDownsidePct,
@@ -14,7 +15,10 @@ import {
   buildQuickTokenPicks,
   buildTokenPoolsKeyboard,
   buildTrendingKeyboard,
+  describeAmount,
+  describeRange,
   estimateApr,
+  estimateBinArrayRentSol,
   extractPoolAddress,
   findTokenBalance,
   formatDeployResult,
@@ -24,9 +28,11 @@ import {
   getLpSession,
   isLpAddressCommandWithBadArg,
   isSolanaAddress,
+  maxSpendableSol,
   parseAmountInput,
   parseLpAddressCommand,
   parseRangeInput,
+  poolHealthLabel,
   renderBalances,
   renderChainView,
   renderDashboard,
@@ -742,6 +748,148 @@ test("trending view falls back cleanly and ignores non-SOL pools", () => {
     buildTrendingKeyboard([]).pop().map((button) => button.callback_data),
     ["lp:trending:refresh", "lp:main"],
   );
+});
+
+console.log("\n=== Quick Zap dashboard controls ===");
+
+test("pool health follows the TVL / market-cap ratio", () => {
+  assert.equal(poolHealthLabel({ tvl: 120_000, mcap: 2_400_000 }).label, "Normal"); // 5.0%
+  assert.equal(poolHealthLabel({ tvl: 50_000, mcap: 2_500_000 }).label, "Normal"); // exactly 2%
+  assert.equal(poolHealthLabel({ tvl: 10_000, mcap: 2_400_000 }).label, "Thin"); // 0.42%
+  assert.equal(poolHealthLabel({ tvl: 120_000, mcap: null }).label, "Unknown");
+  assert.equal(poolHealthLabel({}).emoji, "❔");
+  assert.equal(poolHealthLabel({ tvl: 50_000, mcap: 2_500_000 }).ratioPct, 2);
+});
+
+test("bin-array rent and max spendable SOL are conservative", () => {
+  assert.equal(estimateBinArrayRentSol(0), 0);
+  assert.equal(estimateBinArrayRentSol(1), BIN_ARRAY_FEE_SOL);
+  assert.equal(estimateBinArrayRentSol(70), BIN_ARRAY_FEE_SOL);
+  assert.equal(estimateBinArrayRentSol(71), Number((2 * BIN_ARRAY_FEE_SOL).toFixed(8)));
+  assert.equal(
+    maxSpendableSol({ sol: 1.5, gasReserve: 0.2, totalBins: 54 }),
+    Number((1.5 - 0.2 - BIN_ARRAY_FEE_SOL).toFixed(4)),
+  );
+  assert.equal(maxSpendableSol({ sol: 0.1, gasReserve: 0.2 }), 0);
+  assert.equal(maxSpendableSol({ sol: Number.NaN }), 0);
+});
+
+test("amount and range descriptors format USD and percentages", () => {
+  assert.equal(
+    describeAmount({ amountMode: "sol", amountSol: 0.08 }, { sol: 1.2, sol_price: 200 }),
+    "0.08 SOL (≈ $16.00)",
+  );
+  const pctLabel = describeAmount(
+    { amountMode: "pct", amountPct: 50 },
+    { sol: 1.2, sol_price: 200 },
+    { gasReserve: 0.2 },
+  );
+  assert.match(pctLabel, /^50% of balance · 0\.5 SOL \(≈ \$100\.00\)$/);
+  assert.equal(describeRange({ downsidePct: 30, upsidePct: 40 }), "-30% to +40%");
+  assert.equal(describeRange({ downsidePct: 50 }), "-50% to 0%");
+});
+
+test("dashboard card shows health, amount+USD, range, strategy and Max", () => {
+  const session = getLpSession({ chat: { id: 11 }, from: { id: 12 } });
+  session.pool = {
+    ...POOLS[0],
+    activeBinId: 1234,
+    activeBinSol: 0.582,
+    binStep: 20,
+    baseFee: 0.2,
+    tvl: 120_000,
+    mcap: 2_400_000,
+  };
+  session.amountMode = "sol";
+  session.amountSol = 0.08;
+  session.amountPct = null;
+  session.downsidePct = 50;
+  session.upsidePct = 0;
+  session.rangeLabel = "-50%";
+  session.strategy = "bid_ask";
+  session.rangePreview = { minBinId: 1180, maxBinId: 1234, totalBins: 54 };
+
+  const view = renderDashboard(session, { wallet: { sol: 1.5, sol_price: 200 } });
+  assert.match(view.text, /🆕 <b>New Position: Anakin\/SOL<\/b>/);
+  assert.match(view.text, /Binstep: 20 \| BaseFee: 0\.2%/);
+  assert.match(view.text, /1 bin ≈ 0\.582 SOL/);
+  assert.match(view.text, /Pool Health: <b>Normal<\/b> \(TVL\/MC 5\.0%\)/);
+  assert.match(view.text, /💰 Amount: <b>0\.08 SOL \(≈ \$16\.00\)<\/b>/);
+  assert.match(view.text, /📐 Range: <b>-50% to 0%<\/b>/);
+  assert.match(view.text, /📊 Strategy: <b>BidAsk<\/b>/);
+  assert.match(view.text, /💯 Max: <b>[\d.]+ SOL<\/b>/);
+  assert.match(view.text, /⚡ Preset A: 1 SOL · -50% · Spot/);
+  assert.match(view.text, /⚡ Preset B: [\d.]+ SOL · -90% · BidAsk/);
+});
+
+test("dashboard keyboard matches the Zenith control layout", () => {
+  const session = getLpSession({ chat: { id: 21 }, from: { id: 22 } });
+  session.amountMode = "pct";
+  session.amountPct = 50;
+  session.rangeLabel = "Custom";
+  session.strategy = "bid_ask";
+
+  const rows = buildDashboardKeyboard(session);
+  const labels = rows.map((row) => row.map((button) => button.text));
+  assert.deepEqual(labels[1], ["⚡ Preset A", "⚡ Preset B", "🛠 Custom"]);
+  assert.deepEqual(labels[3], ["1 SOL", "✅ 50%", "100%"]);
+  assert.deepEqual(labels[4], ["✏️ Custom", "✏️ Preset"]);
+  assert.deepEqual(labels[6], ["-50%", "-30 +40", "+200%"]);
+  assert.deepEqual(labels[7], ["⭐ Default", "✅ ✏️ Range", "✏️ Preset"]);
+  assert.deepEqual(labels[9], ["➖ Spot", "✅ ☍ BidAsk", "🔔 Curve"]);
+  assert.deepEqual(labels[10], ["⚡ Spot & BA", "⚡ Spot & Curve"]);
+  assert.deepEqual(labels[12], ["✅ Continue"]);
+  assert.deepEqual(labels[13], ["⚡ Deploy Position"]);
+  assert.deepEqual(labels[14], ["🔄 Refresh", "⬅️ Back", "🏠 Main Menu"]);
+
+  const callbacks = rows.flat().map((button) => button.callback_data);
+  const expected = [
+    "lp:zap:a", "lp:zap:b", "lp:zap:custom",
+    "lp:amt:1", "lp:amt:50", "lp:amt:100", "lp:amt:custom", "lp:amt:preset",
+    "lp:rng:-50", "lp:rng:m30p40", "lp:rng:p200", "lp:rng:default", "lp:rng:custom", "lp:rng:preset",
+    "lp:str:spot", "lp:str:bid_ask", "lp:str:curve", "lp:str:spot_ba", "lp:str:spot_curve",
+    "lp:continue", "lp:deploy", "lp:refresh", "lp:back", "lp:main",
+  ];
+  for (const callback of expected) assert.ok(callbacks.includes(callback), `missing ${callback}`);
+  for (const button of rows.flat()) assert.ok(button.callback_data.length <= 64);
+
+  // Typing a custom range also lights the ✏️ Range button up.
+  session.rangeLabel = "-50%";
+  session.awaiting = "range";
+  assert.ok(buildDashboardKeyboard(session).flat().some((button) => button.text === "✅ ✏️ Range"));
+});
+
+test("deploy receipt links the tx on Solscan and shows bin coverage", () => {
+  const text = formatDeployResult({
+    pool: "STONKpool111111111111111111111111111111111",
+    pool_name: "STONK/SOL",
+    amount_sol: 0.1,
+    amount_token: 1250.5,
+    two_sided: true,
+    strategy: "spot_ba",
+    strategy_label: "Spot & BA",
+    bin_step: 20,
+    base_fee: 0.2,
+    swap_tx: "SwapTx1111111111111111111111111111111111111",
+    bin_range: {
+      minBinId: 1180,
+      maxBinId: 1234,
+      activeBinId: 1230,
+      minPrice: 0.0001,
+      maxPrice: 0.0002,
+      downsideCoveragePct: 20,
+      upsideCoveragePct: 10,
+    },
+    positions: [{ strategy: "spot", position: "Pos1111111111111111111111111111111111111111" }],
+    txs: ["Tx111111111111111111111111111111111111111111"],
+  });
+
+  assert.match(text, /Position opened/);
+  assert.match(text, /https:\/\/solscan\.io\/tx\/Tx111111/);
+  assert.match(text, /https:\/\/solscan\.io\/tx\/SwapTx111/);
+  assert.match(text, /Coverage: -20\.00% \/ \+10\.00%/);
+  assert.match(text, /Binstep: 20 \| BaseFee: 0\.2%/);
+  assert.match(text, /Spot &(?:amp;)? BA/);
 });
 
 console.log(`\n✓ ${passed} LP-menu tests passed`);

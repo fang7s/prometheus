@@ -344,6 +344,7 @@ export function toTokenPoolEntry(pool, tokenMint = null) {
     apr: apr != null ? Number(apr.toFixed(2)) : null,
     volume: volume24h > 0 ? volume24h : null,
     activePrice: Number(pool?.current_price ?? 0) || null,
+    mcap: Number(tokenX.market_cap ?? tokenY.market_cap ?? 0) || null,
     isSolPair: solIsTokenX || solIsTokenY,
     solIsQuote: solIsTokenY,
     usable: solIsTokenY,
