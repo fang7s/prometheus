@@ -116,8 +116,11 @@ export function parseAmountInput(text) {
 }
 
 /**
- * Accepts "-50", "-50%", "-30 +40", "+200%", "30/40", "-30,40".
- * The first number is the downside %, the optional second is the upside %.
+ * Accepts "-50", "-50%", "-30 +40", "+200%", "30/40", "-30,40" and the
+ * below-price form "-80 -20" (lower bound -80 %, upper bound -20 %, both below
+ * the active price). The first number is the downside %, the optional second is
+ * the upside % — or, when both numbers are negative and the first is larger,
+ * the upper bound expressed as a negative % (`upperPct`).
  */
 export function parseRangeInput(text) {
   const raw = String(text ?? "").trim().replace(/%/g, "").replace(/,/g, " ");
@@ -129,17 +132,27 @@ export function parseRangeInput(text) {
 
   let downsidePct = 0;
   let upsidePct = 0;
+  let upperPct = null;
+
   if (parts.length === 1) {
     const single = numbers[0];
     if (single < 0) downsidePct = Math.abs(single);
     else upsidePct = single;
+  } else if (numbers[0] < 0 && numbers[1] < 0) {
+    // Below-price limit order: "-80 -20" → lower -80 %, upper -20 %.
+    const down = Math.abs(numbers[0]);
+    const upper = Math.abs(numbers[1]);
+    if (upper <= 0 || upper >= down) return null; // upper must sit above the lower bound
+    downsidePct = down;
+    upperPct = -upper;
   } else {
     downsidePct = Math.abs(numbers[0]);
     upsidePct = Math.abs(numbers[1]);
   }
+
   if (downsidePct >= 100) return null;
-  if (downsidePct === 0 && upsidePct === 0) return null;
-  return { downsidePct, upsidePct };
+  if (downsidePct === 0 && upsidePct === 0 && upperPct == null) return null;
+  return { downsidePct, upsidePct, upperPct };
 }
 
 /** True when the text looks like a Solana address (for paste-a-pool support). */
@@ -283,6 +296,7 @@ export function getLpSession(msg) {
     amountPct: null,
     downsidePct: 50,
     upsidePct: 0,
+    rangeUpperPct: null,
     rangeLabel: "-50%",
     awaiting: null,
     tokenQuery: null,
@@ -679,10 +693,14 @@ export function describeAmount(
   return `${pctNote}${formatSolAmount(sol)} SOL${usd}`;
 }
 
-/** `-50% to 0%` (single-sided) or `-30% to +40%`. */
+/** `-50% to 0%` (single-sided), `-30% to +40%`, or `-80% to -20% (Below Active Price)`. */
 export function describeRange(session) {
   const down = Number(session?.downsidePct ?? 0);
   const up = Number(session?.upsidePct ?? 0);
+  const upper = Number(session?.rangeUpperPct);
+  if (session?.rangeUpperPct != null && Number.isFinite(upper) && upper < 0) {
+    return `-${down}% to ${upper}% (Below Active Price)`;
+  }
   if (up > 0) return `-${down}% to +${up}%`;
   return `-${down}% to 0%`;
 }
@@ -767,6 +785,10 @@ export function buildDashboardKeyboard(session) {
       btn(mark(rangeSel("Default"), "⭐ Default"), "rng:default"),
       btn(mark(isCustomRange, "✏️ Range"), "rng:custom"),
       btn("✏️ Preset", "rng:preset"),
+    ],
+    [
+      btn(mark(rangeSel("-80 -20"), "📉 -80% to -20%"), "rng:b80t20"),
+      btn(mark(rangeSel("-50 -10"), "📉 -50% to -10%"), "rng:b50t10"),
     ],
 
     [btn("────────── 📊 STRATEGY ──────────", "noop")],
@@ -1385,6 +1407,7 @@ async function presentDashboard(msg, { note = null, messageId = null } = {}) {
         },
         downsidePct: Number(session.downsidePct ?? 0),
         upsidePct: Number(session.upsidePct ?? 0),
+        upperPct: session.rangeUpperPct ?? null,
       });
     } catch (error) {
       session.rangePreview = null;
@@ -1545,34 +1568,44 @@ function applyAmountPreset(session, key) {
   return false;
 }
 
-function applyRangePreset(session, key) {
+/** Apply a range preset (exported so the preset table is unit-testable). */
+export function applyRangePreset(session, key) {
   const binStep = Number(session.pool?.binStep ?? 0);
   const defaultBins = Number(config.strategy?.defaultBinsBelow ?? 69);
   const defaultPct = binsToDownsidePct(defaultBins, binStep);
+  const standard = (down, up, label) => {
+    session.downsidePct = down;
+    session.upsidePct = up;
+    session.rangeUpperPct = null;
+    session.rangeLabel = label;
+    return true;
+  };
+
   switch (key) {
     case "-50":
-      session.downsidePct = 50;
-      session.upsidePct = 0;
-      session.rangeLabel = "-50%";
-      return true;
+      return standard(50, 0, "-50%");
     case "m30p40":
-      session.downsidePct = 30;
-      session.upsidePct = 40;
-      session.rangeLabel = "-30 +40";
-      return true;
+      return standard(30, 40, "-30 +40");
     case "p200":
-      session.downsidePct = 0;
-      session.upsidePct = 200;
-      session.rangeLabel = "+200%";
-      return true;
+      return standard(0, 200, "+200%");
     case "default":
     case "preset": {
       if (defaultPct == null) return false;
-      session.downsidePct = defaultPct;
-      session.upsidePct = 0;
-      session.rangeLabel = key === "default" ? "Default" : "Preset";
-      return true;
+      return standard(defaultPct, 0, key === "default" ? "Default" : "Preset");
     }
+    // Below-the-price single-sided SOL limit orders (both bounds under active).
+    case "b80t20":
+      session.downsidePct = 80;
+      session.upsidePct = 0;
+      session.rangeUpperPct = -20;
+      session.rangeLabel = "-80 -20";
+      return true;
+    case "b50t10":
+      session.downsidePct = 50;
+      session.upsidePct = 0;
+      session.rangeUpperPct = -10;
+      session.rangeLabel = "-50 -10";
+      return true;
     default:
       return false;
   }
@@ -1608,7 +1641,11 @@ export function formatDeployResult(result) {
     `📐 Bins: ${range.minBinId ?? "?"} → ${range.maxBinId ?? "?"} (active ${range.activeBinId ?? result?.active_bin ?? "?"})`,
     `📈 Price: ${pr}`,
     range.downsideCoveragePct != null
-      ? `🛡 Coverage: -${Math.abs(Number(range.downsideCoveragePct)).toFixed(2)}% / +${Number(range.upsideCoveragePct ?? 0).toFixed(2)}%`
+      ? (() => {
+        const downCov = -Math.abs(Number(range.downsideCoveragePct));
+        const upCov = Number(range.upsideCoveragePct ?? 0);
+        return `🛡 Coverage: ${downCov.toFixed(2)}% / ${upCov >= 0 ? "+" : ""}${upCov.toFixed(2)}%`;
+      })()
       : null,
     `📊 Strategy: ${escapeHtml(result?.strategy_label || strategyLabel(result?.strategy || "bid_ask"))}`,
     result?.bin_step != null ? `Binstep: ${result.bin_step}${result?.base_fee != null ? ` | BaseFee: ${formatSolAmount(result.base_fee, 2)}%` : ""}` : null,
@@ -1658,6 +1695,7 @@ async function deploySession(msg, session) {
       amountSol,
       downsidePct: Number(session.downsidePct ?? 0),
       upsidePct: Number(session.upsidePct ?? 0),
+      upperPct: session.rangeUpperPct ?? null,
       meta: {
         fee_tvl_ratio: pool.feeTvl ?? null,
         organic_score: pool.organic ?? null,
@@ -1865,7 +1903,10 @@ export async function handleLpText(msg) {
     }
     active.downsidePct = parsed.downsidePct;
     active.upsidePct = parsed.upsidePct;
-    active.rangeLabel = "Custom";
+    active.rangeUpperPct = parsed.upperPct ?? null;
+    active.rangeLabel = parsed.upperPct != null
+      ? `${-parsed.downsidePct} ${parsed.upperPct}`
+      : "Custom";
     active.awaiting = null;
     await presentDashboard(msg, { messageId: active.messageId });
     return true;
@@ -2033,6 +2074,7 @@ export async function handleLpCallback(msg) {
       applyAmountPreset(session, "preset");
       session.downsidePct = 90;
       session.upsidePct = 0;
+      session.rangeUpperPct = null;
       session.rangeLabel = "-90%";
       session.strategy = "bid_ask";
       await ack("Preset B: preset SOL · -90% · BidAsk");
@@ -2161,7 +2203,9 @@ export async function handleLpCallback(msg) {
       "",
       Number(session.upsidePct ?? 0) > 0
         ? "⚠️ Two-sided range — half the SOL will be swapped into the base token first."
-        : "ℹ️ Single-sided SOL range (upper bin = active bin).",
+        : session.rangeUpperPct != null
+          ? "📉 Below-price limit order — the whole position sits under the active price and fills as it drops."
+          : "ℹ️ Single-sided SOL range (upper bin = active bin).",
       "",
       "Tap ⚡ Deploy Position to sign.",
     ].join("\n");

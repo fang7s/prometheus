@@ -618,6 +618,9 @@ export function clearTrendingCache() {
  *
  * `downsidePct = 50`  → lower bound is the bin at (activePrice × 0.5)
  * `upsidePct = 40`    → upper bound is the bin at (activePrice × 1.4)
+ * `upperPct = -20`    → "below the price" limit order: the upper bound sits 20 %
+ *                       BELOW the active price, so `minBinId` and `maxBinId` are
+ *                       both below the active bin (e.g. downsidePct 80 = -80 %).
  * Explicit `binsBelow` / `binsAbove` always win when provided.
  */
 export async function computeBinRange({
@@ -625,6 +628,7 @@ export async function computeBinRange({
   snapshot = null,
   downsidePct = 0,
   upsidePct = 0,
+  upperPct = null,
   binsBelow = null,
   binsAbove = null,
 }) {
@@ -637,6 +641,10 @@ export async function computeBinRange({
 
   const down = Math.max(0, Number(downsidePct) || 0);
   const up = Math.max(0, Number(upsidePct) || 0);
+  const upper = Number(upperPct);
+  // Below-the-price (limit order) mode: an upper bound that is still below the
+  // active price. Explicit binsAbove wins over it.
+  const belowOnly = Number.isFinite(upper) && upper < 0 && upper > -100 && binsAbove == null;
 
   if (below == null) {
     if (down <= 0) {
@@ -649,7 +657,14 @@ export async function computeBinRange({
     }
   }
   if (above == null) {
-    if (up <= 0) {
+    if (belowOnly) {
+      // Upper bound 20 % below active → bin id below the active bin.
+      const target = activePrice * (1 + upper / 100);
+      const upperBinId = Number(getBinIdFromPrice(target, binStep, false));
+      above = Math.min(0, upperBinId - activeBinId);
+      // Guarantee the range stays strictly below the active price.
+      if (above >= 0) above = -1;
+    } else if (up <= 0) {
       above = 0;
     } else {
       const target = activePrice * (1 + up / 100);
@@ -659,7 +674,13 @@ export async function computeBinRange({
   }
 
   below = Math.max(0, Math.round(below));
-  above = Math.max(0, Math.round(above));
+  above = belowOnly ? Math.min(-1, Math.round(above)) : Math.max(0, Math.round(above));
+
+  if (belowOnly && below + above < 0) {
+    throw new Error(
+      `Invalid below-price range: -${down}% to ${upper}% — the upper bound must be closer to the active price (e.g. -80 -20).`,
+    );
+  }
 
   const minBinId = activeBinId - below;
   const maxBinId = activeBinId + above;
@@ -671,12 +692,15 @@ export async function computeBinRange({
     activePrice,
     binStep,
     binsBelow: below,
-    binsAbove: above,
-    totalBins: below + above,
+    // Nothing is deposited above the active bin in a below-price range.
+    binsAbove: belowOnly ? 0 : above,
+    totalBins: belowOnly ? maxBinId - minBinId + 1 : below + above,
     minBinId,
     maxBinId,
     minPrice,
     maxPrice,
+    belowOnly,
+    upperPct: belowOnly ? upper : null,
     downsideCoveragePct: activePrice > 0 ? ((activePrice - minPrice) / activePrice) * 100 : null,
     upsideCoveragePct: activePrice > 0 ? ((maxPrice - activePrice) / activePrice) * 100 : null,
   };
@@ -787,6 +811,8 @@ async function openStrategyLeg({ pool, wallet, connection, sdk, leg, range, slip
  * @param {number} params.amountSol         Total SOL to deposit (before the optional zap swap).
  * @param {number} [params.downsidePct]     Lower bound as % below active price (50 = -50%).
  * @param {number} [params.upsidePct]       Upper bound as % above active price (0 = single-sided).
+ * @param {number} [params.upperPct]        Below-the-price limit order: upper bound as a
+ *                                          negative % (e.g. -20 with downsidePct 80).
  * @param {number} [params.binsBelow]       Explicit bin count below the active bin (overrides %).
  * @param {number} [params.binsAbove]       Explicit bin count above the active bin (overrides %).
  * @param {number} [params.slippagePct]     Deposit slippage in percent (default 10).
@@ -802,6 +828,7 @@ export async function openDlmmPosition({
   amountSol,
   downsidePct = 0,
   upsidePct = 0,
+  upperPct = null,
   binsBelow = null,
   binsAbove = null,
   slippagePct = DEFAULT_SLIPPAGE_PCT,
@@ -835,7 +862,7 @@ export async function openDlmmPosition({
 
   const strategyKind = normalizeStrategyKind(strategy);
   const legs = strategyLegs(strategyKind);
-  const range = await computeBinRange({ poolAddress: address, snapshot, downsidePct, upsidePct, binsBelow, binsAbove });
+  const range = await computeBinRange({ poolAddress: address, snapshot, downsidePct, upsidePct, upperPct, binsBelow, binsAbove });
 
   const minTotalBins = Math.max(MIN_SAFE_BINS_BELOW, Number(config.strategy.minBinsBelow ?? MIN_SAFE_BINS_BELOW));
   if (range.totalBins < minTotalBins) {
@@ -963,6 +990,8 @@ export async function openDlmmPosition({
       max_bin: range.maxBinId,
       downside_pct: downsidePct ?? null,
       upside_pct: upsidePct ?? null,
+      upper_pct: upperPct ?? null,
+      below_only: Boolean(range.belowOnly),
       positions: positions.map((p) => p.position),
     },
   });

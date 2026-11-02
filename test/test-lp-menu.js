@@ -8,6 +8,7 @@ import {
   BIN_ARRAY_FEE_SOL,
   DEFAULT_QUICK_TOKENS,
   NEW_POSITION_PROMPT,
+  applyRangePreset,
   binsToDownsidePct,
   buildDashboardKeyboard,
   buildHubKeyboard,
@@ -109,14 +110,24 @@ test("parseAmountInput accepts percentages and rejects junk", () => {
 });
 
 test("parseRangeInput handles single-sided, two-sided and signed input", () => {
-  assert.deepEqual(parseRangeInput("-50"), { downsidePct: 50, upsidePct: 0 });
-  assert.deepEqual(parseRangeInput("-50%"), { downsidePct: 50, upsidePct: 0 });
-  assert.deepEqual(parseRangeInput("-30 +40"), { downsidePct: 30, upsidePct: 40 });
-  assert.deepEqual(parseRangeInput("+200"), { downsidePct: 0, upsidePct: 200 });
-  assert.deepEqual(parseRangeInput("-30,40"), { downsidePct: 30, upsidePct: 40 });
+  assert.deepEqual(parseRangeInput("-50"), { downsidePct: 50, upsidePct: 0, upperPct: null });
+  assert.deepEqual(parseRangeInput("-50%"), { downsidePct: 50, upsidePct: 0, upperPct: null });
+  assert.deepEqual(parseRangeInput("-30 +40"), { downsidePct: 30, upsidePct: 40, upperPct: null });
+  assert.deepEqual(parseRangeInput("+200"), { downsidePct: 0, upsidePct: 200, upperPct: null });
+  assert.deepEqual(parseRangeInput("-30,40"), { downsidePct: 30, upsidePct: 40, upperPct: null });
   assert.equal(parseRangeInput("0"), null);
   assert.equal(parseRangeInput("-120"), null);
   assert.equal(parseRangeInput("-10 -20 -30"), null);
+});
+
+test("parseRangeInput understands below-price ranges like -80 -20", () => {
+  assert.deepEqual(parseRangeInput("-80 -20"), { downsidePct: 80, upsidePct: 0, upperPct: -20 });
+  assert.deepEqual(parseRangeInput("-50% -10%"), { downsidePct: 50, upsidePct: 0, upperPct: -10 });
+  assert.deepEqual(parseRangeInput("-80,-20"), { downsidePct: 80, upsidePct: 0, upperPct: -20 });
+  // upper bound must sit above (closer to active than) the lower bound
+  assert.equal(parseRangeInput("-20 -80"), null);
+  assert.equal(parseRangeInput("-80 -80"), null);
+  assert.equal(parseRangeInput("-120 -20"), null);
 });
 
 test("address helpers accept a valid pubkey and URLs", () => {
@@ -856,17 +867,19 @@ test("dashboard keyboard matches the Zenith control layout", () => {
   assert.deepEqual(labels[4], ["✏️ Custom", "✏️ Preset"]);
   assert.deepEqual(labels[6], ["-50%", "-30 +40", "+200%"]);
   assert.deepEqual(labels[7], ["⭐ Default", "✅ ✏️ Range", "✏️ Preset"]);
-  assert.deepEqual(labels[9], ["➖ Spot", "✅ ☍ BidAsk", "🔔 Curve"]);
-  assert.deepEqual(labels[10], ["⚡ Spot & BA", "⚡ Spot & Curve"]);
-  assert.deepEqual(labels[12], ["✅ Continue"]);
-  assert.deepEqual(labels[13], ["⚡ Deploy Position"]);
-  assert.deepEqual(labels[14], ["🔄 Refresh", "⬅️ Back", "🏠 Main Menu"]);
+  assert.deepEqual(labels[8], ["📉 -80% to -20%", "📉 -50% to -10%"]);
+  assert.deepEqual(labels[10], ["➖ Spot", "✅ ☍ BidAsk", "🔔 Curve"]);
+  assert.deepEqual(labels[11], ["⚡ Spot & BA", "⚡ Spot & Curve"]);
+  assert.deepEqual(labels[13], ["✅ Continue"]);
+  assert.deepEqual(labels[14], ["⚡ Deploy Position"]);
+  assert.deepEqual(labels[15], ["🔄 Refresh", "⬅️ Back", "🏠 Main Menu"]);
 
   const callbacks = rows.flat().map((button) => button.callback_data);
   const expected = [
     "lp:zap:a", "lp:zap:b", "lp:zap:custom",
     "lp:amt:1", "lp:amt:50", "lp:amt:100", "lp:amt:custom", "lp:amt:preset",
     "lp:rng:-50", "lp:rng:m30p40", "lp:rng:p200", "lp:rng:default", "lp:rng:custom", "lp:rng:preset",
+    "lp:rng:b80t20", "lp:rng:b50t10",
     "lp:str:spot", "lp:str:bid_ask", "lp:str:curve", "lp:str:spot_ba", "lp:str:spot_curve",
     "lp:continue", "lp:deploy", "lp:refresh", "lp:back", "lp:main",
   ];
@@ -1009,6 +1022,114 @@ await testAsync("chart generator returns a valid PNG buffer", async () => {
   );
   assert.equal(small.readUInt32BE(16), 640);
   assert.equal(small.readUInt32BE(20), 320);
+});
+
+console.log("\n=== Below-the-price range presets ===");
+
+test("below-price presets set both bounds under the active price", () => {
+  const session = { pool: { binStep: 20 } };
+  assert.equal(applyRangePreset(session, "b80t20"), true);
+  assert.deepEqual(
+    [session.downsidePct, session.upsidePct, session.rangeUpperPct, session.rangeLabel],
+    [80, 0, -20, "-80 -20"],
+  );
+  assert.equal(describeRange(session), "-80% to -20% (Below Active Price)");
+
+  assert.equal(applyRangePreset(session, "b50t10"), true);
+  assert.equal(session.rangeUpperPct, -10);
+  assert.equal(describeRange(session), "-50% to -10% (Below Active Price)");
+
+  // Switching back to a standard preset clears the below-price upper bound.
+  assert.equal(applyRangePreset(session, "-50"), true);
+  assert.equal(session.rangeUpperPct, null);
+  assert.equal(describeRange(session), "-50% to 0%");
+});
+
+test("range keyboard exposes and marks the below-price presets", () => {
+  const session = getLpSession({ chat: { id: 31 }, from: { id: 32 } });
+  session.downsidePct = 80;
+  session.upsidePct = 0;
+  session.rangeUpperPct = -20;
+  session.rangeLabel = "-80 -20";
+
+  const rows = buildDashboardKeyboard(session);
+  const labels = rows.flat().map((button) => button.text);
+  assert.ok(labels.includes("✅ 📉 -80% to -20%"));
+  assert.ok(labels.includes("📉 -50% to -10%"));
+  // The standard single-sided preset is no longer marked.
+  assert.ok(labels.includes("-50%"));
+
+  const callbacks = rows.flat().map((button) => button.callback_data);
+  assert.ok(callbacks.includes("lp:rng:b80t20"));
+  assert.ok(callbacks.includes("lp:rng:b50t10"));
+});
+
+test("below-price dashboard reads clearly and the chart highlights the left side only", () => {
+  const session = getLpSession({ chat: { id: 41 }, from: { id: 42 } });
+  session.pool = {
+    ...POOLS[0],
+    binStep: 20,
+    baseFee: 0.2,
+    activeBinId: 0,
+    activeBinSol: 0.5,
+    tvl: 120_000,
+    mcap: 2_400_000,
+  };
+  session.rangePreview = { minBinId: -805, maxBinId: -112, totalBins: 694 };
+  applyRangePreset(session, "b80t20");
+
+  const view = renderDashboard(session, { wallet: { sol: 2, sol_price: 180 } });
+  assert.match(view.text, /📐 Range: <b>-80% to -20% \(Below Active Price\)<\/b>/);
+  assert.match(view.text, /🗂 Bins: <b>-805<\/b> → <b>-112<\/b>/);
+
+  // Chart series: only bins strictly below the active bin are in range.
+  const bins = Array.from({ length: 21 }, (_, index) => {
+    const binId = -10 + index;
+    return {
+      binId,
+      price: String(Math.pow(0.998, 10 - binId)),
+      xAmount: { toString: () => "0" }, // single-sided SOL
+      yAmount: { toString: () => "1000000000" },
+    };
+  });
+  const series = buildLiquiditySeries({
+    bins,
+    activeBinId: 0,
+    binStep: 20,
+    xDecimals: 9,
+    yDecimals: 9,
+    yIsSol: true,
+    userRange: { minBinId: -8, maxBinId: -2 },
+  });
+  assert.deepEqual(series.bins.filter((bin) => bin.inRange).map((bin) => bin.binId), [-8, -7, -6, -5, -4, -3, -2]);
+  assert.equal(series.bins.find((bin) => bin.binId === 0).inRange, false);
+  assert.ok(series.bins.filter((bin) => bin.binId > 0).every((bin) => !bin.inRange));
+  assert.equal(series.bins.find((bin) => bin.binId === 0).pct, 0);
+});
+
+await testAsync("computeBinRange keeps below-price bounds under the active bin", async () => {
+  const { computeBinRange } = await import("../services/meteoraService.js");
+  const snapshot = { activeBinId: 0, binStep: 20, activePrice: 1 };
+
+  const below = await computeBinRange({ snapshot, downsidePct: 80, upperPct: -20 });
+  assert.equal(below.belowOnly, true);
+  assert.ok(below.maxBinId < 0, `expected maxBinId below the active bin, got ${below.maxBinId}`);
+  assert.ok(below.minBinId < below.maxBinId);
+  assert.equal(below.binsAbove, 0); // nothing is deposited above the active bin
+  assert.ok(below.totalBins > 100);
+  assert.ok(below.downsideCoveragePct > 79 && below.downsideCoveragePct < 81);
+  assert.ok(below.upsideCoveragePct < 0); // upper bound is below the active price
+  assert.equal(below.upperPct, -20);
+
+  // Standard single-sided ranges are unchanged.
+  const standard = await computeBinRange({ snapshot, downsidePct: 50 });
+  assert.equal(standard.maxBinId, 0);
+  assert.equal(standard.belowOnly, false);
+  assert.equal(standard.binsAbove, 0);
+  assert.equal(standard.upperPct, null);
+
+  // A swapped pair (-20 -80) is rejected instead of producing a huge upside.
+  await assert.rejects(() => computeBinRange({ snapshot, downsidePct: 20, upperPct: -80 }), /Invalid below-price range/);
 });
 
 console.log(`\n✓ ${passed} LP-menu tests passed`);
