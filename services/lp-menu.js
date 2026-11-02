@@ -31,6 +31,8 @@ import {
   sendHTMLWithButtons,
   editHTMLWithButtons,
   sendHTML,
+  sendPhotoWithCaption,
+  editPhotoWithCaption,
   answerCallbackQuery,
 } from "../telegram.js";
 import {
@@ -285,6 +287,8 @@ export function getLpSession(msg) {
     awaiting: null,
     tokenQuery: null,
     listKind: null,
+    chartMessageId: null,
+    chartSignature: null,
     deploying: false,
     updatedAt: Date.now(),
   };
@@ -1292,6 +1296,81 @@ export async function showTrendingView({ messageId = null, force = false, note =
   return newMessageId;
 }
 
+// ─── Liquidity chart attachment ───────────────────────────────────
+/**
+ * Stable signature that decides whether the chart photo has to be replaced.
+ * Only the pool, the active bin and the selected range affect the drawing —
+ * amount/strategy changes reuse the current photo.
+ */
+export function chartSignature({ poolAddress = null, activeBinId = null, minBinId = null, maxBinId = null } = {}) {
+  return [poolAddress || "", activeBinId ?? "", minBinId ?? "", maxBinId ?? ""].join("|");
+}
+
+/**
+ * Attach (or refresh) the liquidity distribution chart as a photo message.
+ *
+ * The interactive Zenith card stays a separate text message so its keyboard is
+ * not duplicated under the photo; the chart carries the same text as caption
+ * (trimmed to Telegram's 1024-char photo-caption limit).
+ *
+ * Any failure (canvas not installed, RPC/bin fetch error, Telegram offline)
+ * leaves the text dashboard untouched — this helper never throws.
+ */
+async function attachLiquidityChart(msg, session, view) {
+  const pool = session?.pool;
+  if (!pool?.address || !view?.text || !msg) return null;
+
+  const range = session.rangePreview
+    ? { minBinId: session.rangePreview.minBinId, maxBinId: session.rangePreview.maxBinId }
+    : null;
+  const signature = chartSignature({
+    poolAddress: pool.address,
+    activeBinId: pool.activeBinId ?? null,
+    minBinId: range?.minBinId ?? null,
+    maxBinId: range?.maxBinId ?? null,
+  });
+  if (session.chartSignature === signature && session.chartMessageId) return session.chartMessageId;
+
+  let chart = null;
+  try {
+    chart = await import("./chartService.js");
+  } catch (error) {
+    log("lp_ui_warn", `Chart module unavailable: ${error.message}`);
+    return null;
+  }
+
+  let buffer = null;
+  try {
+    buffer = await chart.generateLiquidityDistributionChart(
+      {
+        address: pool.address,
+        baseSymbol: pool.baseSymbol ?? null,
+        quoteSymbol: pool.quoteSymbol ?? null,
+      },
+      range,
+    );
+  } catch (error) {
+    log("lp_ui_warn", `Liquidity chart skipped: ${error.message}`);
+    return null;
+  }
+
+  const caption = chart.buildPhotoCaption(view.text);
+  if (session.chartMessageId) {
+    const edited = await editPhotoWithCaption(caption, session.chartMessageId, buffer);
+    if (edited) {
+      session.chartSignature = signature;
+      return session.chartMessageId;
+    }
+  }
+  const sent = await sendPhotoWithCaption(caption, buffer);
+  if (sent) {
+    session.chartMessageId = sent;
+    session.chartSignature = signature;
+    return sent;
+  }
+  return null;
+}
+
 async function presentDashboard(msg, { note = null, messageId = null } = {}) {
   const session = touch(getLpSession(msg));
 
@@ -1318,6 +1397,13 @@ async function presentDashboard(msg, { note = null, messageId = null } = {}) {
   const id = messageId ?? session.messageId ?? msg?.messageId ?? null;
   const newId = await presentMessage(view, id);
   session.messageId = newId;
+
+  // Best-effort photo chart; the text card above is always the source of truth.
+  try {
+    await attachLiquidityChart(msg, session, view);
+  } catch (error) {
+    log("lp_ui_warn", `Chart attach failed: ${error.message}`);
+  }
   return newId;
 }
 

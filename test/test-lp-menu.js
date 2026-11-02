@@ -15,6 +15,7 @@ import {
   buildQuickTokenPicks,
   buildTokenPoolsKeyboard,
   buildTrendingKeyboard,
+  chartSignature,
   describeAmount,
   describeRange,
   estimateApr,
@@ -63,11 +64,30 @@ import {
   toSdkStrategyType,
   toTokenPoolEntry,
 } from "../services/meteoraService.js";
+import {
+  CHART_DEFAULT_HEIGHT,
+  CHART_DEFAULT_WIDTH,
+  MAX_BINS_EACH_SIDE,
+  PHOTO_CAPTION_LIMIT,
+  buildLiquiditySeries,
+  buildPhotoCaption,
+  deriveBinsEachSide,
+  generateLiquidityDistributionChart,
+  normalizeUserRange,
+  selectAxisTicks,
+} from "../services/chartService.js";
 
 let passed = 0;
 
 function test(name, fn) {
   fn();
+  passed += 1;
+  console.log(`  ✓ ${name}`);
+}
+
+/** Async variant for chart rendering (canvas work returns promises). */
+async function testAsync(name, fn) {
+  await fn();
   passed += 1;
   console.log(`  ✓ ${name}`);
 }
@@ -890,6 +910,105 @@ test("deploy receipt links the tx on Solscan and shows bin coverage", () => {
   assert.match(text, /Coverage: -20\.00% \/ \+10\.00%/);
   assert.match(text, /Binstep: 20 \| BaseFee: 0\.2%/);
   assert.match(text, /Spot &(?:amp;)? BA/);
+});
+
+console.log("\n=== Liquidity distribution chart ===");
+
+const CHART_BINS = Array.from({ length: 41 }, (_, index) => {
+  const binId = 1000 + index;
+  const price = 0.002 * Math.pow(1.002, binId - 1020);
+  return {
+    binId,
+    price: String(price),
+    xAmount: { toString: () => String(2_000_000_000) }, // 2,000 tokens (6 decimals)
+    yAmount: { toString: () => String(1_000_000_000) }, // 1 SOL (9 decimals)
+  };
+});
+
+const CHART_SERIES = buildLiquiditySeries({
+  bins: CHART_BINS,
+  activeBinId: 1020,
+  binStep: 20,
+  xDecimals: 6,
+  yDecimals: 9,
+  yIsSol: true,
+  userRange: { minBinId: 1010, maxBinId: 1020 },
+  baseSymbol: "STONK",
+  quoteSymbol: "SOL",
+  poolAddress: "StonkPool11111111111111111111111111111111",
+});
+
+test("chart range helpers normalise bins and size the fetch window", () => {
+  assert.deepEqual(normalizeUserRange({ minBinId: 120, maxBinId: 100 }), { minBinId: 100, maxBinId: 120 });
+  assert.deepEqual(normalizeUserRange({ binsBelow: 30, binsAbove: 20 }, 500), { minBinId: 470, maxBinId: 520 });
+  assert.deepEqual(normalizeUserRange(null), { minBinId: null, maxBinId: null });
+
+  assert.deepEqual(deriveBinsEachSide(500, null), { left: 60, right: 60 });
+  const wide = deriveBinsEachSide(500, { minBinId: 300, maxBinId: 500 });
+  assert.equal(wide.left, 216); // 200 bins + 8 % headroom
+  assert.equal(wide.right, 60); // default window on the upside
+  const capped = deriveBinsEachSide(20_000, { minBinId: 0, maxBinId: 20_000 });
+  assert.equal(capped.left, MAX_BINS_EACH_SIDE);
+});
+
+test("liquidity series converts bins to SOL and flags the user range", () => {
+  assert.equal(CHART_SERIES.bins.length, 41);
+  assert.equal(CHART_SERIES.inRangeBins, 11);
+  assert.equal(CHART_SERIES.bins.find((bin) => bin.binId === 1020).inRange, true);
+  assert.equal(CHART_SERIES.bins.find((bin) => bin.binId === 1021).inRange, false);
+  assert.equal(CHART_SERIES.bins.find((bin) => bin.binId === 1020).pct, 0);
+  assert.ok(CHART_SERIES.bins[0].pct < -3);
+
+  // value = y + x * price (SOL is token Y)
+  const active = CHART_SERIES.bins.find((bin) => bin.binId === 1020);
+  const expected = 1 + 2_000 * Number(CHART_BINS[20].price);
+  assert.ok(Math.abs(active.valueSol - expected) < 1e-6, `${active.valueSol} vs ${expected}`);
+  assert.ok(CHART_SERIES.totalSol > 0 && CHART_SERIES.maxSol > 0);
+  assert.equal(CHART_SERIES.quoteSymbol, "SOL");
+});
+
+test("chart axis ticks target -80/-50/0/+20/+40 percent", () => {
+  const ticks = selectAxisTicks(CHART_SERIES);
+  assert.ok(ticks.length >= 3 && ticks.length <= 6);
+  assert.ok(ticks.some((tick) => tick.binId === 1020 && tick.pct === 0));
+  for (let i = 1; i < ticks.length; i += 1) assert.ok(ticks[i].binId > ticks[i - 1].binId);
+});
+
+test("chart signature changes only with pool, active bin or range", () => {
+  const base = { poolAddress: "pool1", activeBinId: 10, minBinId: 5, maxBinId: 12 };
+  assert.equal(chartSignature(base), chartSignature({ ...base }));
+  assert.notEqual(chartSignature(base), chartSignature({ ...base, maxBinId: 13 }));
+  assert.notEqual(chartSignature(base), chartSignature({ ...base, activeBinId: 11 }));
+  assert.notEqual(chartSignature(base), chartSignature({ ...base, poolAddress: "pool2" }));
+});
+
+test("photo caption stays within Telegram's 1024-char limit", () => {
+  const long = Array.from({ length: 80 }, (_, i) => `line ${i} <b>value</b>`).join("\n");
+  const caption = buildPhotoCaption(long);
+  assert.ok(caption.length <= PHOTO_CAPTION_LIMIT, `caption too long: ${caption.length}`);
+  assert.ok(caption.endsWith("…"));
+  assert.equal(buildPhotoCaption("hello"), "hello");
+});
+
+await testAsync("chart generator returns a valid PNG buffer", async () => {
+  const png = await generateLiquidityDistributionChart(
+    null,
+    { minBinId: 1010, maxBinId: 1020 },
+    { series: CHART_SERIES },
+  );
+  assert.ok(Buffer.isBuffer(png), "expected a Buffer");
+  assert.ok(png.length > 5_000, `suspiciously small PNG: ${png.length} bytes`);
+  assert.equal(png.subarray(0, 8).toString("hex"), "89504e470d0a1a0a"); // PNG magic
+  assert.equal(png.readUInt32BE(16), CHART_DEFAULT_WIDTH);
+  assert.equal(png.readUInt32BE(20), CHART_DEFAULT_HEIGHT);
+
+  const small = await generateLiquidityDistributionChart(
+    null,
+    null,
+    { series: CHART_SERIES, width: 640, height: 320 },
+  );
+  assert.equal(small.readUInt32BE(16), 640);
+  assert.equal(small.readUInt32BE(20), 320);
 });
 
 console.log(`\n✓ ${passed} LP-menu tests passed`);

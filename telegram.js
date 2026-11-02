@@ -216,6 +216,70 @@ export async function answerCallbackQuery(callbackQueryId, text = "") {
   });
 }
 
+/** Multipart upload helper (photos are sent as form data, not JSON). */
+async function postTelegramMultipart(method, form) {
+  if (!TOKEN || !chatId) return null;
+  if (typeof FormData === "undefined" || typeof Blob === "undefined") return null;
+  try {
+    const res = await fetch(`${BASE}/${method}`, { method: "POST", body: form });
+    if (!res.ok) {
+      const err = await res.text();
+      if (res.status === 401) {
+        log("telegram_error", `${method} 401 Unauthorized — check TELEGRAM_BOT_TOKEN in .env (invalid, revoked, or encrypted without .envrypt key)`);
+      } else {
+        log("telegram_error", `${method} ${res.status}: ${err.slice(0, 200)}`);
+      }
+      return null;
+    }
+    return await res.json();
+  } catch (e) {
+    log("telegram_error", `${method} failed: ${e.message}`);
+    return null;
+  }
+}
+
+/**
+ * Send a PNG as a photo with an HTML caption and optional inline keyboard.
+ * Returns the new message id (or null when Telegram is not configured).
+ */
+export async function sendPhotoWithCaption(html, pngBuffer, inlineKeyboard = null) {
+  if (!TOKEN || !chatId || !pngBuffer?.length) return null;
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  form.append("caption", String(html ?? "").slice(0, 1024));
+  form.append("parse_mode", "HTML");
+  if (Array.isArray(inlineKeyboard) && inlineKeyboard.length > 0) {
+    form.append("reply_markup", JSON.stringify({ inline_keyboard: inlineKeyboard }));
+  }
+  form.append("photo", new Blob([pngBuffer], { type: "image/png" }), "liquidity.png");
+  const res = await postTelegramMultipart("sendPhoto", form);
+  return res?.result?.message_id ?? null;
+}
+
+/**
+ * Replace an existing photo message's media + caption (and keyboard).
+ * Falls back to null when the message is not a photo / Telegram is offline.
+ */
+export async function editPhotoWithCaption(html, messageId, pngBuffer, inlineKeyboard = null) {
+  if (!TOKEN || !chatId || !messageId || !pngBuffer?.length) return null;
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  form.append("message_id", String(messageId));
+  const media = {
+    type: "photo",
+    media: "attach://chart.png",
+    caption: String(html ?? "").slice(0, 1024),
+    parse_mode: "HTML",
+  };
+  if (Array.isArray(inlineKeyboard) && inlineKeyboard.length > 0) {
+    media.reply_markup = { inline_keyboard: inlineKeyboard };
+  }
+  form.append("media", JSON.stringify(media));
+  form.append("chart.png", new Blob([pngBuffer], { type: "image/png" }), "chart.png");
+  const res = await postTelegramMultipart("editMessageMedia", form);
+  return res?.result?.message_id ?? (res ? messageId : null);
+}
+
 export function hasActiveLiveMessage() {
   return _liveMessageDepth > 0;
 }
