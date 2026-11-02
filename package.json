@@ -23,6 +23,7 @@
     "test:syntax": "node scripts/check-syntax.js",
     "test:exits": "node test/test-exit-rules.js",
     "test:screen": "node test/test-screening.js",
+    "test:lp": "node test/test-lp-menu.js",
     "test:agent": "DRY_RUN=true node test/test-agent.js",
     "postinstall": "node scripts/patch-anchor.js"
   },

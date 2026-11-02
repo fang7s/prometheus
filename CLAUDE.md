@@ -111,7 +111,9 @@ Autonomous DLMM liquidity provider agent for Meteora pools on Solana.
 | `dev-blocklist.js` | 66 | Deployer wallet → reason. Hard-filtered before LLM, fetched from Jupiter dev field. |
 | `hivemind.js` | 346 | Agent Meridian shared learning. `bootstrapHiveMind` on startup, `startHiveMindBackgroundSync` every 15 min. Pushes lessons + performance events; pulls shared lessons + presets. `getSharedLessonsForPrompt` → injected under `── HIVEMIND ──` in prompt. Failures are non-blocking. |
 | **Integrations** | | |
-| `telegram.js` | 494 | `startPolling(onMessage)`, `stopPolling()`. Long-poll with 35s abort. `createLiveMessage` returns a handle with `toolStart/toolFinish/note/finalize/fail` for live progress. Sends deploy/close/swap/OOR notifications. Auth: `isAuthorizedIncomingMessage` (chatId match + group→allowed user IDs). Registers `/help` `/status` `/positions` `/close` `/closeall` `/set` `/settings` `/setcfg` `/screen` `/candidates` `/deploy` `/briefing` `/hive` `/pause` `/resume` `/stop` via `setMyCommands`. |
+| `telegram.js` | 494 | `startPolling(onMessage)`, `stopPolling()`. Long-poll with 35s abort. `createLiveMessage` returns a handle with `toolStart/toolFinish/note/finalize/fail` for live progress. Sends deploy/close/swap/OOR notifications. Auth: `isAuthorizedIncomingMessage` (chatId match + group→allowed user IDs). Registers `/help` `/status` `/positions` `/close` `/closeall` `/set` `/settings` `/setcfg` `/screen` `/candidates` `/lp` `/deploy` `/briefing` `/hive` `/pause` `/resume` `/stop` via `setMyCommands`. |
+| `services/meteoraService.js` | 646 | **Manual DLMM path.** `openDlmmPosition({ poolAddress, amountSol, downsidePct, upsidePct, strategy })` → `DLMM.create` → `computeBinRange` (percent → `minBinId`/`maxBinId`) → strategy legs (`spot`/`bid_ask`/`curve`; composites split 50/50 across two positions) → bin-array rent guard → `initializePositionAndAddLiquidityByStrategy` (≤69 bins) or `createExtendedEmptyPosition` + `addLiquidityByStrategyChunkable` → `sendAndConfirmTransaction` → `trackPosition` + decision log. Read helpers: `getPoolSnapshot`, `getPoolMetadata`, `assertBinArraysCovered`. Upside ranges zap half the SOL into token X via Jupiter first. Gated by `DRY_RUN` / `ENABLE_LIVE_TRADING`. |
+| `services/lp-menu.js` | 1043 | **Interactive LP Telegram UI** (`/lp`). Screening view with inline pool buttons → pool dashboard (Quick Zap, liquidity amount, range, strategy) → Continue → Deploy. Holds per-chat sessions, routes `lp:*` callbacks, consumes custom text input (amount / range / pasted pool address), resolves `%` amounts against the live balance minus `gasReserve`, enforces `maxDeployAmount`, `minSolToOpen` and the gas reserve before calling `openDlmmPosition`. |
 | `discord-listener/index.js` | 152 | Selfbot (uses `discord.js-selfbot-v13`). Listens to `DISCORD_CHANNEL_IDS` for `Metlex Pool Bot`, extracts Solana addresses, runs pre-check pipeline, appends to `discord-signals.json`. |
 | `discord-listener/pre-checks.js` | 205 | Pipeline: dedup (10min) → blacklist → pool resolution (Meteora direct → DexScreener) → rugcheck.xyz (score>50000 OR top10>60% reject) → deployer blacklist → Jupiter global fees check (`minTokenFeesSol`). |
 | `briefing.js` | 71 | HTML daily report. 24h activity, performance, lessons, current portfolio. Sent at 1:00 UTC. |
@@ -384,10 +386,13 @@ npm run check                  # syntax + offline env audit + utils/rpc tests
 | `/screen` / `/candidates` / `/deploy <n>` | `runDeterministicScreen` + `deployLatestCandidate` | Deterministic — no LLM. The single-candidate skip rule applies. |
 | `/briefing` | `generateBriefing` | On-demand daily report. |
 | `/settings` / `/menu` / `/configmenu` | `renderSettingsMenu` + `applySettingsMenuCallback` | Inline-keyboard menu with toggle/step buttons. Updates flow through `update_config` tool. |
+| `/lp` / `/zap` / `/newposition` / `/pools` | `services/lp-menu.js#showLpMainMenu` | Screening view + Quick-Zap dashboard with inline keyboards. Deploy goes through `openDlmmPosition` (manual path). |
 | `/hive pull` | `pullHiveMindLessons` + `pullHiveMindPresets` | Manual HiveMind fetch. |
 | `/pause` / `/resume` / `/stop` | index.js | Toggle cron jobs / graceful shutdown. |
 | Free-form chat | `agentLoop` with `agentType=GENERAL` | Intent-matched tool subset. |
 | `cfg:*` callback queries | `applySettingsMenuCallback` | Settings menu button presses. |
+| `lp:*` callback queries | `handleLpCallback` | LP menu button presses (pool select, amount, range, strategy, continue, deploy). |
+| LP custom text input | `handleLpText` | Amount (`0.5`, `50%`), range (`-30 +40`) and pasted pool addresses — consumed before the busy queue. |
 
 **Auth** (`telegram.js#isAuthorizedIncomingMessage`):
 - `chatId` must match incoming message's chat (env or persisted `user-config.telegramChatId`).

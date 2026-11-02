@@ -36,6 +36,7 @@ import { stageSignals } from "./signal-tracker.js";
 import { getWeightsSummary } from "./signal-weights.js";
 import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
 import { appendDecision } from "./decision-log.js";
+import { showLpMainMenu, handleLpCallback, handleLpText } from "./services/lp-menu.js";
 // Import only what we actually need for the new functionality
 import { evaluateEvilPandaCandidate, checkEvilPandaExitConfluence, getEvilPandaRecommendedParams, fetchPriceSeries } from "./tools/evil-panda-enhanced.js";
 import { checkAllPositionsForFlip } from "./tools/bid-ask-flipper.js";
@@ -1279,6 +1280,7 @@ function formatHelpText() {
     "/setcfg <key> <value> — update persisted config",
     "/screen — refresh deterministic candidate list",
     "/candidates — show latest cached candidates",
+    "/lp — interactive LP menu (pick a pool, set amount/range/strategy, deploy)",
     "/deploy <n> — deploy candidate by cached index (deterministic)",
     "/briefing — morning briefing",
     "/hive — HiveMind sync status",
@@ -1549,6 +1551,24 @@ async function drainTelegramQueue() {
 async function telegramHandler(msg) {
   const text = msg?.text?.trim();
   if (!text) return;
+  if (msg?.isCallback && text.startsWith("lp:")) {
+    try {
+      await handleLpCallback(msg);
+    } catch (e) {
+      log("telegram_error", `LP callback failed: ${e.message}`);
+      await answerCallbackQuery(msg.callbackQueryId, String(e.message || "LP menu error").slice(0, 180)).catch(() => {});
+    }
+    return;
+  }
+  if (!msg?.isCallback) {
+    try {
+      if (await handleLpText(msg)) return;
+    } catch (e) {
+      log("telegram_error", `LP text input failed: ${e.message}`);
+      await sendMessage(`LP menu error: ${e.message}`).catch(() => {});
+      return;
+    }
+  }
   if (msg?.isCallback && text.startsWith("cfg:")) {
     try {
       await applySettingsMenuCallback(msg);
@@ -1559,6 +1579,15 @@ async function telegramHandler(msg) {
   }
   if (text === "/settings" || text === "/menu" || text === "/configmenu") {
     await showSettingsMenu().catch((e) => sendMessage(`Settings error: ${e.message}`).catch(() => {}));
+    return;
+  }
+  if (text === "/lp" || text === "/zap" || text === "/newposition" || text === "/pools") {
+    try {
+      await showLpMainMenu({ msg });
+    } catch (e) {
+      log("telegram_error", `LP menu failed: ${e.message}`);
+      await sendMessage(`LP menu error: ${e.message}`).catch(() => {});
+    }
     return;
   }
   if (_managementBusy || _screeningBusy || busy) {

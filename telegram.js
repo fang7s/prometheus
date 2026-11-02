@@ -179,6 +179,35 @@ export async function editMessageWithButtons(text, messageId, inlineKeyboard) {
   });
 }
 
+/**
+ * Send an HTML-formatted message with an inline keyboard.
+ * The LP menu uses HTML (bold pool names, <code> addresses) + buttons.
+ * Falls back to plain text automatically if Telegram rejects the markup.
+ */
+export async function sendHTMLWithButtons(html, inlineKeyboard) {
+  if (!TOKEN || !chatId) return null;
+  return postTelegram("sendMessage", {
+    text: String(html).slice(0, 4096),
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: inlineKeyboard },
+  });
+}
+
+/**
+ * Edit an HTML message and replace its inline keyboard.
+ * Returns null when the edit is impossible (e.g. "message is not modified"),
+ * so callers can fall back to sending a fresh message.
+ */
+export async function editHTMLWithButtons(html, messageId, inlineKeyboard) {
+  if (!TOKEN || !chatId || !messageId) return null;
+  return postTelegram("editMessageText", {
+    message_id: messageId,
+    text: String(html).slice(0, 4096),
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: inlineKeyboard },
+  });
+}
+
 export async function answerCallbackQuery(callbackQueryId, text = "") {
   if (!TOKEN || !callbackQueryId) return null;
   return postTelegramRaw("answerCallbackQuery", {
@@ -427,6 +456,7 @@ const BOT_COMMANDS = [
   { command: "setcfg",     description: "Update persisted config key" },
   { command: "screen",     description: "Refresh deterministic candidate list" },
   { command: "candidates", description: "Show latest cached candidates" },
+  { command: "lp",         description: "LP menu — pick a pool and open a position" },
   { command: "deploy",     description: "Deploy candidate by cached index" },
   { command: "briefing",   description: "Morning briefing" },
   { command: "hive",       description: "HiveMind sync status" },
