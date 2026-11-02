@@ -2,9 +2,18 @@
  * Interactive Telegram LP menu (inline keyboards) for Meteora DLMM.
  *
  * Flow:
- *   /lp  →  screening view (pool buttons)
+ *   /start · /lp  →  Main Dashboard Hub (wallet + SOL/USDC/USDT balances, 7-row grid)
+ *        →  💧 New LP Position / 🔥 Top Trending  →  screening list (pool buttons)
  *        →  pool dashboard (Quick Zap / Amount / Range / Strategy)
  *        →  Continue → Deploy → `services/meteoraService.js#openDlmmPosition`
+ *
+ *   /lp <token mint or pool address>  →  token search / pool dashboard
+ *   paste a token CA                  →  every DLMM pair for that mint (SOL first)
+ *
+ * Hub sub-views: 📊 My Positions · 💰 Balance · 📅 Profit Calendar · 🔗 Chain ·
+ * 👛 Wallet · 🌊 DAMM v2 · 👥 Referrals · 💖 Donate · 🆘 Help. Every one of them
+ * carries a 🏠 Main Menu button, and ⚙️ Settings re-uses the existing `cfg:*`
+ * router in index.js.
  *
  * All callback data is prefixed `lp:` so `index.js#telegramHandler` can route it
  * without touching the existing `cfg:` settings-menu router. Session state is
@@ -27,10 +36,12 @@ import {
   openDlmmPosition,
   getPoolSnapshot,
   getPoolMetadata,
+  getPoolsByTokenMint,
   computeBinRange,
   strategyLabel,
   normalizeStrategyKind,
 } from "./meteoraService.js";
+
 
 const CALLBACK_PREFIX = "lp:";
 const POOL_LIST_LIMIT = 6;
@@ -300,6 +311,29 @@ export function extractPoolAddress(text) {
   return null;
 }
 
+const LP_ADDRESS_COMMAND_RE = /^\/(?:lp|zap|newposition|pools)(?:@[A-Za-z0-9_]+)?\s+(\S+)\s*$/i;
+
+/**
+ * `/lp <pool-or-mint>` (also `/zap`, `/newposition`, `/pools`) → address.
+ *
+ * Only the address is extracted here: telling a pool address from a token mint
+ * needs Meteora + RPC, which `openAddressQuery()` does. Returns null when the
+ * text is not that command, or when the argument is not a Solana address.
+ */
+export function parseLpAddressCommand(text) {
+  const match = String(text ?? "").trim().match(LP_ADDRESS_COMMAND_RE);
+  if (!match) return null;
+  return extractPoolAddress(match[1]);
+}
+
+/** True for `/lp something` where `something` is not a Solana address. */
+export function isLpAddressCommandWithBadArg(text) {
+  const raw = String(text ?? "").trim();
+  if (!/^\/(?:lp|zap|newposition|pools)(?:@[A-Za-z0-9_]+)?\s+/i.test(raw)) return false;
+  return parseLpAddressCommand(raw) === null;
+}
+
+
 // ─── Pool list rendering ──────────────────────────────────────────
 export function formatPoolLine(pool, index) {
   const binStep = pool?.binStep != null ? `bin step ${pool.binStep}` : "bin step ?";
@@ -321,7 +355,7 @@ export function formatPoolLine(pool, index) {
   ].filter(Boolean).join("\n");
 }
 
-export function renderMainMenu({ pools = [], wallet = null, note = null } = {}) {
+export function renderMainMenu({ pools = [], wallet = null, note = null, title = null } = {}) {
   const balanceSol = Number(wallet?.sol ?? 0);
   const walletLine = wallet?.wallet
     ? `👛 Wallet: <code>${escapeHtml(String(wallet.wallet).slice(0, 6))}…${escapeHtml(String(wallet.wallet).slice(-6))}</code>`
@@ -350,12 +384,12 @@ export function renderMainMenu({ pools = [], wallet = null, note = null } = {}) 
 
   const tf = config.screening?.timeframe || "30m";
   const body = [
-    `✅ <b>DLMM Pools</b> · ${pools.length} found (by Fee/TVL ${escapeHtml(tf)}) · page 1/1`,
+    title || `✅ <b>DLMM Pools</b> · ${pools.length} found (by Fee/TVL ${escapeHtml(tf)}) · page 1/1`,
     "─────────────────────────",
     ...pools.map((pool, index) => formatPoolLine(pool, index)),
     "",
     note ? `<i>${escapeHtml(note)}</i>` : null,
-    "👆 Tap a pool below to open a position, or paste a pool address / link.",
+    "👆 Tap a pool below to open a position, or paste a pool address / token CA.",
   ].filter((line) => line != null);
 
   return { text: [...header, ...body].join("\n"), keyboard: buildMainKeyboard(pools) };
@@ -377,7 +411,92 @@ export function buildMainKeyboard(pools = []) {
     });
     rows.push(row);
   }
-  rows.push([btn("🔄 Refresh", "refresh"), btn("⬅️ Main Menu", "main")]);
+  rows.push([btn("🔄 Refresh", "refresh"), btn("🏠 Main Menu", "main")]);
+  return rows;
+}
+
+// ─── Token (mint) search results ──────────────────────────────────
+/**
+ * Token search results reuse the pool-list renderer, so the Zenith-style lines
+ * (bin step, base fee, TVL, Fee/TVL, APR, 24h volume) look identical whether a
+ * pool came from the screener or from a token-CA lookup.
+ */
+export function tokenPoolEntries(pools = []) {
+  return (Array.isArray(pools) ? pools : [])
+    .filter((pool) => pool?.address)
+    .map((pool, index) => ({ ...pool, index }));
+}
+
+export function renderTokenPools({ tokenMint = null, symbol = null, pools = [], wallet = null, note = null } = {}) {
+  const all = Array.isArray(pools) ? pools : [];
+  const usable = all.filter((pool) => pool?.usable !== false && pool?.address);
+  const solAsBase = all.filter((pool) => pool?.usable === false && pool?.isSolPair);
+  const otherQuote = all.filter((pool) => !pool?.isSolPair);
+  const title = symbol ? `<b>${escapeHtml(symbol)}</b>` : "token";
+
+  const lines = [
+    `🪙 ${title} · Meteora DLMM`,
+    tokenMint ? `<code>${escapeHtml(tokenMint)}</code>` : null,
+    "─────────────────────────",
+    wallet?.wallet
+      ? `👛 ${escapeHtml(String(wallet.wallet).slice(0, 6))}…${escapeHtml(String(wallet.wallet).slice(-6))} · ${formatSolAmount(wallet?.sol ?? 0)} SOL`
+      : null,
+    "",
+  ].filter((line) => line != null);
+
+  if (all.length === 0) {
+    lines.push(
+      "❌ <b>No DLMM pool found</b>",
+      "",
+      "Meteora has no DLMM pair for this address yet (or it is neither a pool nor a token mint).",
+    );
+  } else if (usable.length === 0) {
+    lines.push(
+      `❌ <b>No SOL-quoted DLMM pool</b> · ${all.length} pair(s) found`,
+      "",
+      "This menu deposits SOL as token Y, so only TOKEN/SOL pools can be opened here.",
+      solAsBase.length ? `<i>${solAsBase.length} pair(s) quote SOL as token X.</i>` : null,
+      otherQuote.length ? `<i>${otherQuote.length} pair(s) use another quote token.</i>` : null,
+    );
+  } else {
+    const skipped = [
+      solAsBase.length ? `${solAsBase.length} skipped (SOL is token X)` : null,
+      otherQuote.length ? `${otherQuote.length} on other quotes` : null,
+    ].filter(Boolean);
+    lines.push(
+      `✅ <b>DLMM Pools</b> · ${usable.length} usable${skipped.length ? ` · ${skipped.join(" · ")}` : ""}`,
+      "─────────────────────────",
+      ...usable.map((pool, offset) => formatPoolLine(pool, pool.index ?? offset)),
+      "",
+      "👆 Tap a pool to open the Quick Zap dashboard.",
+    );
+  }
+
+  if (note) lines.push("", `<i>${escapeHtml(note)}</i>`);
+
+  return {
+    text: lines.filter((line) => line != null).join("\n"),
+    keyboard: buildTokenPoolsKeyboard({ tokenMint, pools: usable }),
+  };
+}
+
+export function buildTokenPoolsKeyboard({ tokenMint = null, pools = [] } = {}) {
+  const rows = [];
+  const list = Array.isArray(pools) ? pools : [];
+  for (let i = 0; i < list.length; i += 2) {
+    rows.push(list.slice(i, i + 2).map((pool, offset) => {
+      // `index` is the position in session.pools, which is what `lp:pool:<n>` selects.
+      const index = pool?.index ?? i + offset;
+      const label = pool?.binStep != null
+        ? `⚡ ${index + 1}. ${pool.name} · bs${pool.binStep}`
+        : `⚡ ${index + 1}. ${pool.name}`;
+      return btn(String(label).slice(0, 64), `pool:${index}`);
+    }));
+  }
+  const footer = [];
+  if (tokenMint) footer.push(btn("🔄 Refresh", `tok:${tokenMint}`));
+  footer.push(btn("🏠 Main Menu", "main"));
+  rows.push(footer);
   return rows;
 }
 
@@ -482,8 +601,359 @@ export function buildDashboardKeyboard(session) {
     [btn("────────── OTHER ──────────", "noop")],
     [btn("✅ Continue", "continue")],
     [btn("⚡ Deploy Position", "deploy")],
-    [btn("🔄 Refresh", "refresh"), btn("⬅️ Main Menu", "main")],
+    [btn("🔄 Refresh", "refresh"), btn("🏠 Main Menu", "main")],
   ];
+}
+
+// ─── Main Dashboard Hub (Zenith-style) ────────────────────────────
+const SOL_MINT = config.tokens?.SOL ?? "So11111111111111111111111111111111111111112";
+const USDC_MINT = config.tokens?.USDC ?? "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const USDT_MINT = config.tokens?.USDT ?? "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
+const HUB_TITLE = "Prometheus LP";
+
+/** `2hT6qabuzFvD2WixkgQCoYqpG2NrwiGnVa5T5XZWs68s` → `2hT6qa...s68s`. */
+export function truncateAddress(address, head = 6, tail = 4) {
+  const raw = String(address ?? "").trim();
+  if (!raw) return "not linked";
+  if (raw.length <= head + tail + 3) return raw;
+  return `${raw.slice(0, head)}...${raw.slice(-tail)}`;
+}
+
+/** Token balance from the wallet snapshot's `tokens[]` (mint first, then symbol). */
+export function findTokenBalance(tokens, mint, symbol = null) {
+  const list = Array.isArray(tokens) ? tokens : [];
+  const hit = list.find((token) => token?.mint === mint) ||
+    (symbol
+      ? list.find((token) => String(token?.symbol || "").toUpperCase() === String(symbol).toUpperCase())
+      : null);
+  if (!hit) return null;
+  const balance = Number(hit.balance ?? 0);
+  const usd = Number(hit.usd);
+  return { balance: Number.isFinite(balance) ? balance : 0, usd: Number.isFinite(usd) ? usd : null };
+}
+
+/**
+ * Root dashboard: banner, copyable wallet (truncated) and live SOL / USDC / USDT
+ * balances, plus the 7-row Zenith-style shortcut grid.
+ */
+export function renderDashboardHub({ wallet = null, note = null } = {}) {
+  const address = wallet?.wallet || null;
+  const sol = Number(wallet?.sol ?? 0);
+  const solUsd = Number(wallet?.sol_usd ?? 0);
+  const usdc = Number(wallet?.usdc ?? findTokenBalance(wallet?.tokens, USDC_MINT, "USDC")?.balance ?? 0);
+  const usdt = findTokenBalance(wallet?.tokens, USDT_MINT, "USDT")?.balance ?? 0;
+  const totalUsd = Number(wallet?.total_usd ?? 0);
+
+  const lines = [
+    `🌌 <b>${HUB_TITLE}</b> · Meteora DLMM Hub`,
+    "═══════════════════════",
+    "👛 <b>Wallet</b>",
+    address ? `<code>${escapeHtml(truncateAddress(address))}</code>` : "<i>not configured</i>",
+    "",
+    "💰 <b>Balances</b>",
+    `• ◎ SOL <b>${formatSolAmount(sol)}</b>${solUsd > 0 ? ` (${formatUsd(solUsd)})` : ""}`,
+    `• USDC <b>${formatSolAmount(usdc, 2)}</b>`,
+    `• USDT <b>${formatSolAmount(usdt, 2)}</b>`,
+    totalUsd > 0 ? `• Total ≈ <b>${formatUsd(totalUsd)}</b>` : null,
+    wallet?.error ? `\n⚠️ ${escapeHtml(wallet.error)}` : null,
+    note ? `\n<i>${escapeHtml(note)}</i>` : null,
+    "",
+    "Pick an option below to continue.",
+  ].filter((line) => line != null);
+
+  return { text: lines.join("\n"), keyboard: buildHubKeyboard(wallet) };
+}
+
+export function buildHubKeyboard(wallet = null) {
+  const short = wallet?.wallet ? truncateAddress(wallet.wallet) : "not linked";
+  return [
+    [btn("💧 New LP Position", "new_position"), btn("📊 My Positions", "positions")],
+    [btn("🔥 Top Trending", "trending"), btn("💰 Balance", "balance")],
+    [btn("📅 Profit Calendar", "calendar"), btn("🔗 Chain: Solana", "chain")],
+    [btn(`👛 Wallet: ${short}`.slice(0, 64), "wallet")],
+    [btn("🌊 DAMM v2 Positions", "damm")],
+    [btn("👥 Referrals", "referrals"), { text: "⚙️ Settings", callback_data: "cfg:page:main" }],
+    [btn("💖 Donate", "donate"), btn("🆘 Help Center", "help")],
+  ];
+}
+
+// ─── Sub-view rendering (positions / balances / stats) ────────────
+const BACK_ROW = (refreshAction = null) => [
+  refreshAction ? btn("🔄 Refresh", refreshAction) : null,
+  btn("🏠 Main Menu", "main"),
+].filter(Boolean);
+
+/** PnL/values are SOL-denominated when `management.solMode` is on, else USD. */
+function currencyMode({ mode = null, solMode = null } = {}) {
+  if (mode) return mode === "SOL" ? "SOL" : "USD";
+  return (solMode ?? config.management?.solMode) ? "SOL" : "USD";
+}
+
+export function formatMoney(value, mode = "USD") {
+  const n = Number(value);
+  if (value == null || !Number.isFinite(n)) return "?";
+  return mode === "SOL" ? `${formatSolAmount(n)} SOL` : formatUsd(n);
+}
+
+export function formatPositionLine(position, index, mode = "USD") {
+  const state = position?.in_range === true ? "🟢" : position?.in_range === false ? "🔴 out of range" : "⚪";
+  const pnlPct = Number(position?.pnl_pct);
+  const pnlValue = Number(position?.pnl_usd);
+  const pnlSign = pnlValue > 0 ? "+" : "";
+  const bins = position?.lower_bin != null && position?.upper_bin != null
+    ? `🗂 ${position.lower_bin}→${position.upper_bin}${position.active_bin != null ? ` (active ${position.active_bin})` : ""}`
+    : null;
+  const age = Number(position?.age_minutes);
+
+  return [
+    `${index + 1}. <b>${escapeHtml(position?.pair || "unknown pool")}</b> ${state}`,
+    `   💵 ${formatMoney(position?.total_value_usd, mode)} · 📈 PnL ${pnlSign}${formatMoney(position?.pnl_usd, mode)}` +
+      `${Number.isFinite(pnlPct) ? ` (${pnlSign}${pnlPct.toFixed(2)}%)` : ""}`,
+    `   🎁 Unclaimed ${formatMoney(position?.unclaimed_fees_usd, mode)}${bins ? ` · ${bins}` : ""}`,
+    `   ⏱ ${Number.isFinite(age) ? `${age}m` : "?"} · 🆔 <code>${escapeHtml(String(position?.position || "?").slice(0, 12))}…</code>`,
+  ].join("\n");
+}
+
+export function renderPositions({ positions = [], wallet = null, note = null, mode = null } = {}) {
+  const list = Array.isArray(positions) ? positions : [];
+  const unit = currencyMode({ mode });
+  const maxPositions = Number(config.risk?.maxPositions ?? 0);
+  const header = [
+    `📊 <b>My Positions</b> · ${list.length}${maxPositions ? `/${maxPositions}` : ""} open`,
+    "═══════════════════════",
+    wallet?.wallet ? `👛 <code>${escapeHtml(truncateAddress(wallet.wallet))}</code>` : null,
+    "",
+  ].filter((line) => line != null);
+
+  const keyboard = [BACK_ROW("positions:refresh"), [btn("💧 New LP Position", "new_position")]];
+
+  if (list.length === 0) {
+    return {
+      text: [
+        ...header,
+        "🫙 <b>No open Meteora DLMM positions</b>",
+        "",
+        "Deploy one from 💧 New LP Position, then tap 🔄 Refresh.",
+        note ? `\n<i>${escapeHtml(note)}</i>` : null,
+      ].filter((line) => line != null).join("\n"),
+      keyboard,
+    };
+  }
+
+  return {
+    text: [
+      ...header,
+      ...list.map((position, index) => formatPositionLine(position, index, unit)),
+      "",
+      note ? `<i>${escapeHtml(note)}</i>` : null,
+      "Tap 🔄 Refresh for up-to-date PnL.",
+    ].filter((line) => line != null).join("\n"),
+    keyboard,
+  };
+}
+
+export function renderBalances({ wallet = null, note = null, limit = 10 } = {}) {
+  const tokens = Array.isArray(wallet?.tokens) ? wallet.tokens : [];
+  const reserved = new Set([SOL_MINT, USDC_MINT, USDT_MINT]);
+  const extras = tokens
+    .filter((token) => token?.mint && !reserved.has(token.mint))
+    .filter((token) => Number(token?.balance ?? 0) > 0 || Number(token?.usd ?? 0) > 0)
+    .sort((a, b) => Number(b?.usd ?? 0) - Number(a?.usd ?? 0));
+
+  const lines = [
+    "💰 <b>Balances</b>",
+    "═══════════════════════",
+    wallet?.wallet ? `<code>${escapeHtml(wallet.wallet)}</code>` : "<i>wallet not configured</i>",
+    "",
+    `• ◎ SOL <b>${formatSolAmount(wallet?.sol ?? 0)}</b>${Number(wallet?.sol_usd) > 0 ? ` (${formatUsd(wallet.sol_usd)})` : ""}`,
+    `• USDC <b>${formatSolAmount(wallet?.usdc ?? findTokenBalance(tokens, USDC_MINT, "USDC")?.balance ?? 0, 2)}</b>`,
+    `• USDT <b>${formatSolAmount(findTokenBalance(tokens, USDT_MINT, "USDT")?.balance ?? 0, 2)}</b>`,
+    Number(wallet?.total_usd) > 0 ? `• Total ≈ <b>${formatUsd(wallet.total_usd)}</b>` : null,
+    "",
+    extras.length ? `🧾 <b>SPL tokens</b> · ${extras.length}` : "🧾 <b>SPL tokens</b> · none",
+  ].filter((line) => line != null);
+
+  for (const token of extras.slice(0, limit)) {
+    const usd = Number(token?.usd);
+    const symbol = escapeHtml(token?.symbol || String(token?.mint || "?").slice(0, 6));
+    lines.push(`• ${symbol} <b>${formatSolAmount(token?.balance ?? 0)}</b>${Number.isFinite(usd) && usd > 0 ? ` (${formatUsd(usd)})` : ""}`);
+  }
+  if (extras.length > limit) lines.push(`<i>+${extras.length - limit} more token(s)</i>`);
+  if (wallet?.error) lines.push("", `⚠️ ${escapeHtml(wallet.error)}`);
+  if (note) lines.push("", `<i>${escapeHtml(note)}</i>`);
+
+  return { text: lines.join("\n"), keyboard: [BACK_ROW("balance:refresh")] };
+}
+
+// ─── History / info views ─────────────────────────────────────────
+export function formatProfitLine(record, index = 0) {
+  const pnl = Number(record?.pnl_usd);
+  const pct = Number(record?.pnl_pct);
+  const fees = Number(record?.fees_earned_usd);
+  const minutes = Number(record?.minutes_held);
+  const icon = pnl > 0 ? "🟢" : pnl < 0 ? "🔴" : "⚪";
+  const when = record?.closed_at ? String(record.closed_at).slice(5, 16).replace("T", " ") : null;
+  return [
+    `${index + 1}. ${icon} <b>${escapeHtml(record?.pool_name || record?.pool || "unknown")}</b> ` +
+      `${pnl > 0 ? "+" : ""}${formatUsd(pnl)}${Number.isFinite(pct) ? ` (${pct > 0 ? "+" : ""}${pct.toFixed(2)}%)` : ""}`,
+    `   ${Number.isFinite(fees) && fees > 0 ? `🎁 fees ${formatUsd(fees)} · ` : ""}` +
+      `${Number.isFinite(minutes) ? `⏱ ${minutes}m · ` : ""}` +
+      `${escapeHtml(record?.close_reason || "closed")}${when ? ` · ${escapeHtml(when)}` : ""}`,
+  ].join("\n");
+}
+
+/** Profit Calendar = closed-position performance from lessons.json records. */
+export function renderProfitCalendar({ summary = null, history = null, hours = 24, note = null } = {}) {
+  const records = Array.isArray(history?.positions) ? history.positions : [];
+  const lines = [`📅 <b>Profit Calendar</b> · last ${hours}h`, "═══════════════════════"];
+
+  if (history?.count) {
+    lines.push(
+      `🏁 Closed <b>${history.count}</b> · ✅ Win rate <b>${history.win_rate_pct ?? "?"}%</b> · ` +
+      `💵 Realised <b>${formatUsd(history.total_pnl_usd)}</b>`,
+    );
+  } else {
+    lines.push("🫙 No closed positions in this window.");
+  }
+  if (summary) {
+    lines.push(
+      `📈 All time: ${summary.total_positions_closed} closed · ${formatUsd(summary.total_pnl_usd)} · ` +
+      `win ${summary.win_rate_pct}% · avg ${summary.avg_pnl_pct}%`,
+    );
+  }
+  if (records.length) {
+    lines.push("─────────────────────────");
+    lines.push(...records.slice(-8).reverse().map((record, index) => formatProfitLine(record, index)));
+  }
+  lines.push("", note ? `<i>${escapeHtml(note)}</i>` : "<i>History comes from lessons.json performance records.</i>");
+
+  return {
+    text: lines.join("\n"),
+    keyboard: [BACK_ROW("calendar:refresh"), [btn("📊 My Positions", "positions")]],
+  };
+}
+
+export function renderChainView({ note = null } = {}) {
+  let rpcHost = "not configured";
+  try {
+    rpcHost = config.rpc?.url ? new URL(config.rpc.url).host : "not configured";
+  } catch {
+    rpcHost = "invalid RPC url";
+  }
+
+  return {
+    text: [
+      "🔗 <b>Chain: Solana</b> · mainnet-beta",
+      "═══════════════════════",
+      "🌊 DEX: Meteora DLMM (bin-based, dynamic fees)",
+      "🧩 Program: <code>LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo</code>",
+      `📡 RPC: <code>${escapeHtml(rpcHost)}</code>`,
+      `🎛 Mode: ${config.management?.solMode ? "SOL" : "USD"} · 🧪 Dry run: ${process.env.DRY_RUN === "true" ? "yes" : "no"}`,
+      `⚙️ Strategy: ${escapeHtml(config.strategy?.strategy || "?")} · deploy ${formatSolAmount(config.management?.deployAmountSol ?? 0)} SOL · ` +
+      `max ${config.risk?.maxPositions ?? "?"} positions`,
+      note ? `\n<i>${escapeHtml(note)}</i>` : null,
+    ].filter((line) => line != null).join("\n"),
+    keyboard: [BACK_ROW(), [btn("💧 New LP Position", "new_position")]],
+  };
+}
+
+export function renderWalletView({ wallet = null, note = null } = {}) {
+  const address = wallet?.wallet || null;
+  const tokens = Array.isArray(wallet?.tokens) ? wallet.tokens : [];
+  const lines = [
+    "👛 <b>Wallet</b>",
+    "═══════════════════════",
+    address ? `<code>${escapeHtml(address)}</code>` : "<i>not configured — set WALLET_PRIVATE_KEY in .env</i>",
+    address
+      ? `<a href="https://solscan.io/account/${escapeHtml(address)}">View on Solscan</a>`
+      : null,
+    "",
+    `◎ SOL <b>${formatSolAmount(wallet?.sol ?? 0)}</b>${Number(wallet?.sol_usd) > 0 ? ` (${formatUsd(wallet.sol_usd)})` : ""}`,
+    `USDC <b>${formatSolAmount(wallet?.usdc ?? findTokenBalance(tokens, USDC_MINT, "USDC")?.balance ?? 0, 2)}</b> · ` +
+    `USDT <b>${formatSolAmount(findTokenBalance(tokens, USDT_MINT, "USDT")?.balance ?? 0, 2)}</b>`,
+    Number(wallet?.total_usd) > 0 ? `Total ≈ <b>${formatUsd(wallet.total_usd)}</b>` : null,
+    wallet?.error ? `\n⚠️ ${escapeHtml(wallet.error)}` : null,
+    note ? `\n<i>${escapeHtml(note)}</i>` : null,
+  ].filter((line) => line != null);
+
+  return { text: lines.join("\n"), keyboard: [BACK_ROW("wallet:refresh")] };
+}
+
+// ─── Placeholder / utility views ──────────────────────────────────
+export function renderDammView() {
+  return {
+    text: [
+      "🌊 <b>DAMM v2 Positions</b>",
+      "═══════════════════════",
+      "This agent manages Meteora <b>DLMM</b> positions only.",
+      "",
+      "DAMM v2 (dynamic AMM) pools are not wired in yet — the installed",
+      "@meteora-ag/dlmm SDK cannot read or manage them.",
+      "",
+      "Use 💧 New LP Position to open a DLMM position.",
+    ].join("\n"),
+    keyboard: [BACK_ROW(), [btn("💧 New LP Position", "new_position")]],
+  };
+}
+
+export function renderReferralsView() {
+  const account = config.jupiter?.referralAccount || null;
+  const bps = Number(config.jupiter?.referralFeeBps ?? 0);
+  return {
+    text: [
+      "👥 <b>Referrals</b>",
+      "═══════════════════════",
+      account ? `🔗 Jupiter referral account:\n<code>${escapeHtml(account)}</code>` : "No referral account configured.",
+      bps > 0 ? `💸 Referral fee: ${bps} bps (${(bps / 100).toFixed(2)}%) of swap fees` : null,
+      "",
+      "Referral fees are attached automatically to the SOL → token zap swaps this bot makes.",
+      "Override with <code>JUPITER_REFERRAL_ACCOUNT</code> / <code>JUPITER_REFERRAL_FEE_BPS</code> in .env.",
+    ].filter((line) => line != null).join("\n"),
+    keyboard: [BACK_ROW()],
+  };
+}
+
+export function renderDonateView({ wallet = null } = {}) {
+  const address = wallet?.wallet || null;
+  return {
+    text: [
+      "💖 <b>Donate</b>",
+      "═══════════════════════",
+      "Prometheus is free and open source. If it made you money, a tip keeps the RPC bill paid.",
+      "",
+      address ? `◎ SOL · USDC · USDT on Solana:\n<code>${escapeHtml(address)}</code>` : "<i>Wallet not configured.</i>",
+      "",
+      "<i>Tips are voluntary and never affect position sizing.</i>",
+    ].filter((line) => line != null).join("\n"),
+    keyboard: [BACK_ROW()],
+  };
+}
+
+export function renderHelpView() {
+  return {
+    text: [
+      "🆘 <b>Help Center</b>",
+      "═══════════════════════",
+      "<b>Dashboard</b>",
+      "• 💧 New LP Position — screening list, paste a pool address or a token CA",
+      "• 📊 My Positions — open DLMM positions with live PnL / unclaimed fees",
+      "• 🔥 Top Trending — pools ranked by 24h volume",
+      "• 💰 Balance — SOL / USDC / USDT + SPL tokens",
+      "• 📅 Profit Calendar — closed-position PnL history",
+      "• ⚙️ Settings — the existing config menu",
+      "",
+      "<b>Commands</b>",
+      "/lp — this dashboard",
+      "/lp &lt;token mint | pool address&gt; — every DLMM pair for a token",
+      "/positions — plain-text position list",
+      "/close &lt;n&gt; · /closeall — close positions",
+      "/settings — config menu · /help — command list",
+      "",
+      "Amounts accept SOL (<code>0.5</code>) or a balance % (<code>35%</code>).",
+      "Ranges accept <code>-40</code>, <code>-30 +40</code> or <code>+150</code>.",
+    ].join("\n"),
+    keyboard: [BACK_ROW(), [btn("💧 New LP Position", "new_position"), btn("📊 My Positions", "positions")]],
+  };
 }
 
 // ─── Sending / editing ────────────────────────────────────────────
@@ -491,6 +961,16 @@ const _lastView = new Map(); // messageId -> signature, to avoid "not modified" 
 
 function viewSignature(text, keyboard) {
   return `${text}::${JSON.stringify(keyboard)}`;
+}
+
+/**
+ * Drop the cached view signature for a message.
+ * Needed when another menu (e.g. the `cfg:*` settings router) edited that same
+ * Telegram message, so the next LP render is not skipped as "not modified".
+ */
+export function forgetLpMessageView(messageId) {
+  if (messageId) _lastView.delete(messageId);
+  else _lastView.clear();
 }
 
 async function presentMessage({ text, keyboard }, messageId = null) {
@@ -510,7 +990,32 @@ async function presentMessage({ text, keyboard }, messageId = null) {
   return id;
 }
 
+/**
+ * Root dashboard — sent by `/start`, `/lp`, `/dashboard`, `lp:main` and every
+ * 🏠 Main Menu button. Clears any in-progress position selection so nothing
+ * stale leaks into the hub.
+ */
 export async function showLpMainMenu({ messageId = null, force = false, note = null, msg = null } = {}) {
+  const session = msg ? getLpSession(msg) : null;
+  if (session) {
+    session.awaiting = null;
+    session.pool = null;
+    session.messageId = messageId ?? session.messageId;
+  }
+
+  const wallet = await getWalletSnapshot({ force });
+  const view = renderDashboardHub({ wallet, note });
+  const newMessageId = await presentMessage(view, messageId ?? session?.messageId ?? null);
+  if (session) session.messageId = newMessageId;
+  return newMessageId;
+}
+
+/**
+ * 💧 New LP Position / 🔥 Top Trending — the screening list (tap a pool, paste a
+ * pool address, or paste a token CA to search all of its pairs).
+ * `sort: "volume"` re-orders the same candidates by 24h volume.
+ */
+export async function showPoolListView({ messageId = null, force = false, note = null, msg = null, sort = "fee" } = {}) {
   const session = msg ? getLpSession(msg) : null;
   if (session) {
     session.awaiting = null;
@@ -526,6 +1031,9 @@ export async function showLpMainMenu({ messageId = null, force = false, note = n
     scanError = error.message;
     log("lp_ui_warn", `Screening failed: ${error.message}`);
   }
+  if (sort === "volume") {
+    pools = [...pools].sort((a, b) => Number(b?.volume ?? 0) - Number(a?.volume ?? 0));
+  }
   if (session) session.pools = pools;
 
   const wallet = await getWalletSnapshot();
@@ -536,6 +1044,9 @@ export async function showLpMainMenu({ messageId = null, force = false, note = n
     pools,
     wallet,
     note: scanError ? `Scan error: ${scanError}` : emptyNote || note,
+    title: sort === "volume"
+      ? `🔥 <b>Top Trending</b> · ${pools.length} pool(s) by 24h volume`
+      : null,
   });
   const newMessageId = await presentMessage(view, messageId ?? session?.messageId ?? null);
   if (session) session.messageId = newMessageId;
@@ -571,6 +1082,82 @@ async function presentDashboard(msg, { note = null, messageId = null } = {}) {
   return newId;
 }
 
+// ─── Dashboard navigation ────────────────────────────────────────
+/** Shared presenter: keeps the session pointed at the message being edited. */
+async function presentHubView(msg, view, { messageId = null } = {}) {
+  const session = msg ? touch(getLpSession(msg)) : null;
+  const id = messageId ?? session?.messageId ?? msg?.messageId ?? null;
+  const newId = await presentMessage(view, id);
+  if (session) session.messageId = newId;
+  return newId;
+}
+
+/** 📊 My Positions — open Meteora DLMM positions with live PnL / unclaimed fees. */
+export async function showPositionsView(msg, { force = false, messageId = null } = {}) {
+  let positions = [];
+  let note = null;
+  try {
+    // Lazy import: keeps this module light and avoids pulling the SDK wrapper in tests.
+    const { getMyPositions } = await import("../tools/dlmm.js");
+    const snapshot = await getMyPositions({ force, silent: true });
+    if (snapshot?.error) note = snapshot.error;
+    positions = Array.isArray(snapshot?.positions) ? snapshot.positions : [];
+  } catch (error) {
+    note = `Could not read positions: ${error.message}`;
+    log("lp_ui_warn", `Positions view failed: ${error.message}`);
+  }
+  const wallet = await getWalletSnapshot();
+  return presentHubView(msg, renderPositions({ positions, wallet, note }), { messageId });
+}
+
+/** 💰 Balance — full SOL / USDC / USDT + SPL token breakdown. */
+export async function showBalancesView(msg, { force = true, messageId = null } = {}) {
+  const wallet = await getWalletSnapshot({ force });
+  return presentHubView(msg, renderBalances({ wallet }), { messageId });
+}
+
+/** 📅 Profit Calendar — closed-position performance from the lessons history. */
+export async function showProfitCalendarView(msg, { hours = 24, messageId = null } = {}) {
+  let summary = null;
+  let history = null;
+  let note = null;
+  try {
+    const lessons = await import("../lessons.js");
+    summary = lessons.getPerformanceSummary();
+    history = lessons.getPerformanceHistory({ hours, limit: 50 });
+  } catch (error) {
+    note = `History unavailable: ${error.message}`;
+    log("lp_ui_warn", `Profit calendar failed: ${error.message}`);
+  }
+  return presentHubView(msg, renderProfitCalendar({ summary, history, hours, note }), { messageId });
+}
+
+export async function showChainView(msg, { messageId = null } = {}) {
+  return presentHubView(msg, renderChainView(), { messageId });
+}
+
+export async function showWalletView(msg, { force = false, messageId = null } = {}) {
+  const wallet = await getWalletSnapshot({ force });
+  return presentHubView(msg, renderWalletView({ wallet }), { messageId });
+}
+
+export async function showDammView(msg, { messageId = null } = {}) {
+  return presentHubView(msg, renderDammView(), { messageId });
+}
+
+export async function showReferralsView(msg, { messageId = null } = {}) {
+  return presentHubView(msg, renderReferralsView(), { messageId });
+}
+
+export async function showDonateView(msg, { messageId = null } = {}) {
+  const wallet = await getWalletSnapshot();
+  return presentHubView(msg, renderDonateView({ wallet }), { messageId });
+}
+
+export async function showHelpView(msg, { messageId = null } = {}) {
+  return presentHubView(msg, renderHelpView(), { messageId });
+}
+
 // ─── Pool selection ───────────────────────────────────────────────
 async function selectPool(msg, index) {
   const session = touch(getLpSession(msg));
@@ -579,7 +1166,7 @@ async function selectPool(msg, index) {
   }
   const entry = session.pools[index];
   if (!entry) {
-    await showLpMainMenu({ msg, messageId: msg.messageId, note: "That pool is no longer in the list — refreshed." });
+    await showPoolListView({ msg, messageId: msg.messageId, note: "That pool is no longer in the list — refreshed." });
     return;
   }
 
@@ -707,7 +1294,7 @@ export function formatDeployResult(result) {
 
 async function deploySession(msg, session) {
   const pool = session.pool;
-  if (!pool?.address) throw new Error("Pick a pool first — tap ⬅️ Main Menu and choose one.");
+  if (!pool?.address) throw new Error("Pick a pool first — tap 🏠 Main Menu → 💧 New LP Position.");
   if (session.deploying) throw new Error("A deploy is already running in this chat — wait for it to finish.");
 
   const wallet = await getWalletSnapshot({ force: true });
@@ -756,7 +1343,12 @@ async function deploySession(msg, session) {
 
 
 // ─── Pool address entry ───────────────────────────────────────────
-export async function openPoolByAddress(msg, address) {
+/**
+ * Open the dashboard for a known pool address.
+ * Returns false (without touching the session's selected pool) when the address
+ * is not a readable DLMM pool, so callers can fall back to token-mint search.
+ */
+export async function openPoolByAddress(msg, address, { quiet = false } = {}) {
   const session = touch(getLpSession(msg));
   let note = null;
   const entry = session.pools.find((pool) => pool.address === address) || { address };
@@ -770,8 +1362,10 @@ export async function openPoolByAddress(msg, address) {
       }),
     ]);
     if (!snapshot && !meta) {
-      await showLpMainMenu({ msg, messageId: msg.messageId, note: `Pool ${address.slice(0, 8)}… is not readable.` });
-      return;
+      if (!quiet) {
+        await showPoolListView({ msg, messageId: msg.messageId, note: `Pool ${address.slice(0, 8)}… is not readable.` });
+      }
+      return false;
     }
     if (meta?.name) entry.name = meta.name;
     if (snapshot) {
@@ -786,21 +1380,134 @@ export async function openPoolByAddress(msg, address) {
   session.pool = { ...entry, address };
   session.awaiting = null;
   await presentDashboard(msg, { note, messageId: msg.messageId });
+  return true;
+}
+
+// ─── Token mint search ────────────────────────────────────────────
+async function presentTokenPools(msg, result, { note = null, messageId = null } = {}) {
+  const session = touch(getLpSession(msg));
+  session.pools = tokenPoolEntries(result?.pools);
+  session.pool = null;
+  session.awaiting = null;
+  session.tokenQuery = { mint: result?.tokenMint ?? null, symbol: result?.symbol ?? null };
+
+  const wallet = await getWalletSnapshot();
+  const view = renderTokenPools({
+    tokenMint: result?.tokenMint ?? null,
+    symbol: result?.symbol ?? null,
+    pools: session.pools,
+    wallet,
+    note,
+  });
+  const id = messageId ?? session.messageId ?? msg?.messageId ?? null;
+  const newId = await presentMessage(view, id);
+  session.messageId = newId;
+  return newId;
+}
+
+/**
+ * Show every Meteora DLMM pool for a token mint (SOL pairs first).
+ * Used by `/lp <mint>`, a pasted token CA, and the `lp:tok:<mint>` refresh button.
+ */
+export async function openTokenByMint(msg, tokenMint, { force = false, messageId = null } = {}) {
+  const mint = String(tokenMint ?? "").trim();
+  const session = touch(getLpSession(msg));
+  if (!isSolanaAddress(mint)) {
+    await sendHTML("❌ That is not a valid Solana token mint address.");
+    return null;
+  }
+
+  let result = null;
+  let note = null;
+  try {
+    result = await getPoolsByTokenMint(mint, { force });
+  } catch (error) {
+    note = `Pool search failed: ${error.message}`;
+    log("lp_ui_warn", `Token pool search failed for ${mint.slice(0, 8)}: ${error.message}`);
+    result = { tokenMint: mint, symbol: null, pools: [], totalPools: 0, solPools: 0, usablePools: 0 };
+  }
+
+  await presentTokenPools(msg, result, {
+    note,
+    messageId: messageId ?? session.messageId ?? msg?.messageId ?? null,
+  });
+  return result;
+}
+
+/**
+ * Resolve a pasted/typed address.
+ *
+ * A pool the menu already knows opens straight away. Anything else is looked up
+ * as a token mint first (one HTTP call) — when Meteora returns pairs for it, the
+ * user gets the token's pool list; otherwise the address is probed as a pool.
+ *
+ * @returns {Promise<{ kind: "pool" | "token" | "unknown", address: string, pools?: object[] }>}
+ */
+export async function openAddressQuery(msg, address) {
+  const cleaned = String(address ?? "").trim();
+  const session = touch(getLpSession(msg));
+
+  if (session.pools.some((pool) => pool?.address === cleaned)) {
+    await openPoolByAddress(msg, cleaned);
+    return { kind: "pool", address: cleaned };
+  }
+
+  let result = null;
+  try {
+    result = await getPoolsByTokenMint(cleaned);
+  } catch (error) {
+    log("lp_ui_warn", `Address lookup failed for ${cleaned.slice(0, 8)}: ${error.message}`);
+  }
+  if (result?.pools?.length) {
+    log(
+      "lp_ui",
+      `Token ${result.symbol || cleaned.slice(0, 6)}: ${result.usablePools}/${result.totalPools} usable DLMM pool(s)`,
+    );
+    await presentTokenPools(msg, result);
+    return { kind: "token", address: cleaned, pools: result.pools };
+  }
+
+  if (await openPoolByAddress(msg, cleaned, { quiet: true })) {
+    return { kind: "pool", address: cleaned };
+  }
+
+  await presentTokenPools(
+    msg,
+    { tokenMint: cleaned, symbol: null, pools: [] },
+    { note: "No Meteora DLMM pool matched this address." },
+  );
+  return { kind: "unknown", address: cleaned };
 }
 
 // ─── Custom text input ────────────────────────────────────────────
 /**
  * Consume a plain-text message when it answers a Custom prompt
- * (`lp:amt:custom`, `lp:rng:custom`) or is a pasted pool address/link.
+ * (`lp:amt:custom`, `lp:rng:custom`), runs `/lp <address>`, or is a pasted
+ * token CA / pool address / Meteora link.
  * Returns true when the message was handled here.
  */
 export async function handleLpText(msg) {
   const text = String(msg?.text ?? "").trim();
-  if (!text || msg?.isCallback || text.startsWith("/")) return false;
+  if (!text || msg?.isCallback) return false;
+
+  // `/lp <token mint | pool address>` — works even before the menu was opened.
+  const commandAddress = parseLpAddressCommand(text);
+  if (commandAddress) {
+    await openAddressQuery(msg, commandAddress);
+    return true;
+  }
+  if (isLpAddressCommandWithBadArg(text)) {
+    await sendHTML(
+      "❌ That is not a Solana address.\n" +
+      "Send <code>/lp</code> for the pool menu, or <code>/lp &lt;token mint | pool address&gt;</code>.",
+    );
+    return true;
+  }
+  if (text.startsWith("/")) return false;
 
   const session = sessions.get(sessionKey(msg));
-  if (!session || Date.now() - session.updatedAt >= SESSION_TTL_MS) return false;
-  const awaiting = session.awaiting;
+  const active = session && Date.now() - session.updatedAt < SESSION_TTL_MS ? session : null;
+  const awaiting = active?.awaiting ?? null;
 
   if (awaiting === "amount") {
     const parsed = parseAmountInput(text);
@@ -808,15 +1515,15 @@ export async function handleLpText(msg) {
       await sendHTML("❌ Could not read that amount. Send a number like <code>0.5</code> or a percentage like <code>50%</code>.");
       return true;
     }
-    session.amountMode = parsed.mode;
+    active.amountMode = parsed.mode;
     if (parsed.mode === "pct") {
-      session.amountPct = parsed.value;
+      active.amountPct = parsed.value;
     } else {
-      session.amountSol = parsed.value;
-      session.amountPct = null;
+      active.amountSol = parsed.value;
+      active.amountPct = null;
     }
-    session.awaiting = null;
-    await presentDashboard(msg, { messageId: session.messageId });
+    active.awaiting = null;
+    await presentDashboard(msg, { messageId: active.messageId });
     return true;
   }
 
@@ -826,20 +1533,21 @@ export async function handleLpText(msg) {
       await sendHTML("❌ Could not read that range. Try <code>-40</code>, <code>-30 +40</code> or <code>+150</code>.");
       return true;
     }
-    session.downsidePct = parsed.downsidePct;
-    session.upsidePct = parsed.upsidePct;
-    session.rangeLabel = "Custom";
-    session.awaiting = null;
-    await presentDashboard(msg, { messageId: session.messageId });
+    active.downsidePct = parsed.downsidePct;
+    active.upsidePct = parsed.upsidePct;
+    active.rangeLabel = "Custom";
+    active.awaiting = null;
+    await presentDashboard(msg, { messageId: active.messageId });
     return true;
   }
 
-  const address = (isSolanaAddress(text) || /^https?:\/\/\S+$/i.test(text))
-    ? extractPoolAddress(text)
-    : null;
-  if (address) {
-    await openPoolByAddress(msg, address);
-    return true;
+  // A bare address / token CA / Meteora link: pool dashboard or token pool list.
+  if (isSolanaAddress(text) || /^https?:\/\/\S+$/i.test(text)) {
+    const address = extractPoolAddress(text);
+    if (address) {
+      await openAddressQuery(msg, address);
+      return true;
+    }
   }
   return false;
 }
@@ -880,14 +1588,86 @@ export async function handleLpCallback(msg) {
       }
       await presentDashboard(msg, { messageId: msg.messageId });
     } else {
-      await showLpMainMenu({ msg, messageId: msg.messageId, force: true });
+      await showPoolListView({ msg, messageId: msg.messageId, force: true });
     }
+    return true;
+  }
+
+  if (action === "new_position" || action === "pools") {
+    await ack();
+    await showPoolListView({ msg, messageId: msg.messageId, force: Boolean(arg) });
+    return true;
+  }
+
+  if (action === "trending") {
+    await ack("Ranking pools by 24h volume…");
+    await showPoolListView({ msg, messageId: msg.messageId, sort: "volume" });
+    return true;
+  }
+
+  if (action === "positions") {
+    await ack(arg === "refresh" ? "Refreshing positions…" : "");
+    await showPositionsView(msg, { force: arg === "refresh", messageId: msg.messageId });
+    return true;
+  }
+
+  if (action === "balance") {
+    await ack(arg === "refresh" ? "Refreshing balances…" : "");
+    await showBalancesView(msg, { force: true, messageId: msg.messageId });
+    return true;
+  }
+
+  if (action === "calendar") {
+    await ack(arg === "refresh" ? "Refreshing history…" : "");
+    await showProfitCalendarView(msg, { messageId: msg.messageId });
+    return true;
+  }
+
+  if (action === "chain") {
+    await ack();
+    await showChainView(msg, { messageId: msg.messageId });
+    return true;
+  }
+
+  if (action === "wallet") {
+    await ack(arg === "refresh" ? "Refreshing wallet…" : "");
+    await showWalletView(msg, { force: arg === "refresh", messageId: msg.messageId });
+    return true;
+  }
+
+  if (action === "damm") {
+    await ack();
+    await showDammView(msg, { messageId: msg.messageId });
+    return true;
+  }
+
+  if (action === "referrals") {
+    await ack();
+    await showReferralsView(msg, { messageId: msg.messageId });
+    return true;
+  }
+
+  if (action === "donate") {
+    await ack();
+    await showDonateView(msg, { messageId: msg.messageId });
+    return true;
+  }
+
+  if (action === "help") {
+    await ack();
+    await showHelpView(msg, { messageId: msg.messageId });
     return true;
   }
 
   if (action === "pool") {
     await ack();
     await selectPool(msg, Number(arg));
+    return true;
+  }
+
+  if (action === "tok") {
+    await ack("Refreshing token pools…");
+    await openTokenByMint(msg, arg, { force: true });
     return true;
   }
 
@@ -989,7 +1769,7 @@ export async function handleLpCallback(msg) {
   if (action === "back") {
     await ack();
     if (session.pool) await presentDashboard(msg, { messageId: msg.messageId });
-    else await showLpMainMenu({ msg, messageId: msg.messageId });
+    else await showPoolListView({ msg, messageId: msg.messageId });
     return true;
   }
 

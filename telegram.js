@@ -443,6 +443,7 @@ async function poll(onMessage) {
 }
 
 const BOT_COMMANDS = [
+  { command: "start",      description: "Main dashboard — wallet, balances, LP shortcuts" },
   { command: "help",       description: "Show commands" },
   { command: "status",     description: "Wallet + positions snapshot" },
   { command: "wallet",     description: "Wallet, deploy amount, HiveMind status" },
@@ -456,7 +457,7 @@ const BOT_COMMANDS = [
   { command: "setcfg",     description: "Update persisted config key" },
   { command: "screen",     description: "Refresh deterministic candidate list" },
   { command: "candidates", description: "Show latest cached candidates" },
-  { command: "lp",         description: "LP menu — pick a pool and open a position" },
+  { command: "lp",         description: "LP dashboard / pool search (/lp <token mint | pool address>)" },
   { command: "deploy",     description: "Deploy candidate by cached index" },
   { command: "briefing",   description: "Morning briefing" },
   { command: "hive",       description: "HiveMind sync status" },

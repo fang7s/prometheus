@@ -1,9 +1,11 @@
 /**
  * Meteora DLMM transaction service.
  *
- * Purpose: expose ONE modular entry point — `openDlmmPosition()` — that the
- * interactive Telegram LP UI (and any future caller) can use to open a real
- * DLMM position from explicit user parameters (pool, amount, range, strategy).
+ * Purpose: expose the modular entry points the interactive Telegram LP UI (and
+ * any future caller) needs:
+ *   - `getPoolsByTokenMint()` — token CA → every Meteora DLMM pair (SOL first);
+ *   - `openDlmmPosition()`    — open a real DLMM position from explicit
+ *     user parameters (pool, amount, range, strategy).
  *
  * This is intentionally separate from `tools/dlmm.js#deployPosition()`:
  *   - `deployPosition` is the autonomous screener path (config-driven, cooldowns,
@@ -267,6 +269,150 @@ function baseFeePctFromPool(pool) {
   // SDK: feeFraction = baseFactor × binStep × 10 × 10^powerFactor / FEE_PRECISION(1e9)
   const fraction = (baseFactor * binStep * 10 * Math.pow(10, powerFactor)) / 1e9;
   return Number((fraction * 100).toFixed(4));
+}
+
+// ─── Token mint → pool discovery ──────────────────────────────────
+/**
+ * Find every Meteora DLMM pair that holds `tokenMintAddress` on either side.
+ *
+ * `https://dlmm-api.meteora.ag/pair/all_by_groups` is retired (it answers 404),
+ * so search goes through the same discovery API the screener uses. Its `query`
+ * parameter is a text search, so results are filtered client-side to an exact
+ * token-address match and blacklisted pairs are dropped.
+ *
+ * `openDlmmPosition()` deposits SOL as token Y, therefore:
+ *   - `solIsQuote` (token is X, SOL is Y) → usable from the Telegram menu;
+ *   - `isSolPair` but SOL is token X       → listed, but not deployable here.
+ *
+ * Ranking (see `rankPoolsForToken`) puts SOL-quoted pools first, then scores by
+ * 24h fee/TVL ratio, 24h volume and TVL — fee efficiency dominates, then
+ * activity, then depth.
+ */
+const POOL_DISCOVERY_BASE = "https://dlmm.datapi.meteora.ag";
+const TOKEN_POOL_PAGE_SIZE = 50;
+const TOKEN_POOL_RESULT_LIMIT = 12;
+const TOKEN_POOL_CACHE_TTL_MS = 60_000;
+const BASE58_ADDRESS_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+
+const _tokenPoolCache = new Map(); // mint -> { at, data }
+
+/** Relative attractiveness of a single token pool (higher = better). */
+export function scoreTokenPool(pool) {
+  const safe = (n) => (Number.isFinite(n) ? n : 0);
+  const feeTvl = safe(Number(pool?.feeTvl ?? 0)); // 24h fee/TVL in %
+  const volume = safe(Number(pool?.volume ?? 0)); // 24h volume, USD
+  const tvl = safe(Number(pool?.tvl ?? 0)); // total value locked, USD
+  return feeTvl * 100 + volume / 1_000 + tvl / 10_000;
+}
+
+/** Sort token pools: SOL-quoted first, then by score, then by TVL. */
+export function rankPoolsForToken(pools = []) {
+  return [...pools].sort((a, b) => {
+    if (Boolean(a?.solIsQuote) !== Boolean(b?.solIsQuote)) return a?.solIsQuote ? -1 : 1;
+    if (Boolean(a?.isSolPair) !== Boolean(b?.isSolPair)) return a?.isSolPair ? -1 : 1;
+    const delta = scoreTokenPool(b) - scoreTokenPool(a);
+    if (Number.isFinite(delta) && delta !== 0) return delta;
+    return Number(b?.tvl ?? 0) - Number(a?.tvl ?? 0);
+  });
+}
+
+/** Meteora discovery pair → compact UI entry (same fields the LP menu renders). */
+export function toTokenPoolEntry(pool, tokenMint = null) {
+  const tokenX = pool?.token_x || {};
+  const tokenY = pool?.token_y || {};
+  const binStep = Number(pool?.pool_config?.bin_step ?? 0);
+  const baseFee = Number(pool?.pool_config?.base_fee_pct ?? 0);
+  const feeTvlPct = Number(pool?.fee_tvl_ratio?.["24h"] ?? 0) * 100;
+  const volume24h = Number(pool?.volume?.["24h"] ?? 0);
+  const tvl = Number(pool?.tvl ?? 0);
+  const solIsTokenX = tokenX.address === SOL_MINT;
+  const solIsTokenY = tokenY.address === SOL_MINT;
+  const apr = Number.isFinite(feeTvlPct) && feeTvlPct > 0 ? feeTvlPct * 365 : null;
+
+  return {
+    address: pool?.address || null,
+    name: pool?.name || `${tokenX.symbol || "?"}/${tokenY.symbol || "?"}`,
+    tokenMint: tokenMint || null,
+    baseSymbol: tokenX.symbol ?? null,
+    quoteSymbol: tokenY.symbol ?? null,
+    tokenXMint: tokenX.address ?? null,
+    tokenYMint: tokenY.address ?? null,
+    binStep: binStep > 0 ? binStep : null,
+    baseFee: Number.isFinite(baseFee) && baseFee > 0 ? baseFee : null,
+    tvl: tvl > 0 ? tvl : null,
+    feeTvl: Number.isFinite(feeTvlPct) ? Number(feeTvlPct.toFixed(4)) : null,
+    apr: apr != null ? Number(apr.toFixed(2)) : null,
+    volume: volume24h > 0 ? volume24h : null,
+    activePrice: Number(pool?.current_price ?? 0) || null,
+    isSolPair: solIsTokenX || solIsTokenY,
+    solIsQuote: solIsTokenY,
+    usable: solIsTokenY,
+  };
+}
+
+/**
+ * @param {string} tokenMintAddress Solana mint address (token CA).
+ * @param {{ limit?: number, force?: boolean }} [options]
+ * @returns {Promise<{
+ *   tokenMint: string, symbol: string|null, name: string|null, decimals: number|null,
+ *   pools: object[], totalPools: number, solPools: number, usablePools: number,
+ * }>}
+ */
+export async function getPoolsByTokenMint(tokenMintAddress, { limit = TOKEN_POOL_RESULT_LIMIT, force = false } = {}) {
+  const mint = String(tokenMintAddress ?? "").trim();
+  if (!mint) throw new Error("getPoolsByTokenMint: tokenMintAddress is required.");
+  if (!BASE58_ADDRESS_RE.test(mint)) {
+    throw new Error("getPoolsByTokenMint: not a valid Solana mint address.");
+  }
+
+  const cached = _tokenPoolCache.get(mint);
+  if (!force && cached && Date.now() - cached.at < TOKEN_POOL_CACHE_TTL_MS) return cached.data;
+
+  const url = `${POOL_DISCOVERY_BASE}/pools?query=${encodeURIComponent(mint)}` +
+    `&sort_by=${encodeURIComponent("tvl:desc")}&page_size=${TOKEN_POOL_PAGE_SIZE}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Meteora pool search failed (HTTP ${res.status}).`);
+  const payload = await res.json().catch(() => null);
+  const rawPools = Array.isArray(payload?.data) ? payload.data : [];
+
+  const matched = rawPools.filter((pool) =>
+    Boolean(pool?.address) &&
+    pool?.is_blacklisted !== true &&
+    (pool?.token_x?.address === mint || pool?.token_y?.address === mint),
+  );
+
+  const ranked = rankPoolsForToken(matched.map((pool) => toTokenPoolEntry(pool, mint)));
+
+  // The searched mint's display metadata comes from whichever side matched.
+  let tokenMeta = { symbol: null, name: null, decimals: null };
+  for (const pool of matched) {
+    const token = [pool?.token_x, pool?.token_y].find((side) => side?.address === mint);
+    if (token) {
+      tokenMeta = {
+        symbol: token.symbol ?? null,
+        name: token.name ?? null,
+        decimals: Number.isFinite(Number(token.decimals)) ? Number(token.decimals) : null,
+      };
+      break;
+    }
+  }
+
+  const data = {
+    tokenMint: mint,
+    ...tokenMeta,
+    pools: ranked.slice(0, Math.max(1, Number(limit) || TOKEN_POOL_RESULT_LIMIT)),
+    totalPools: ranked.length,
+    solPools: ranked.filter((pool) => pool.isSolPair).length,
+    usablePools: ranked.filter((pool) => pool.usable).length,
+  };
+  _tokenPoolCache.set(mint, { at: Date.now(), data });
+  if (_tokenPoolCache.size > 100) _tokenPoolCache.clear();
+  return data;
+}
+
+export function clearTokenPoolCache(tokenMint = null) {
+  if (tokenMint == null) _tokenPoolCache.clear();
+  else _tokenPoolCache.delete(String(tokenMint).trim());
 }
 
 /**

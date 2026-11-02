@@ -36,7 +36,7 @@ import { stageSignals } from "./signal-tracker.js";
 import { getWeightsSummary } from "./signal-weights.js";
 import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
 import { appendDecision } from "./decision-log.js";
-import { showLpMainMenu, handleLpCallback, handleLpText } from "./services/lp-menu.js";
+import { showLpMainMenu, showPoolListView, forgetLpMessageView, handleLpCallback, handleLpText } from "./services/lp-menu.js";
 // Import only what we actually need for the new functionality
 import { evaluateEvilPandaCandidate, checkEvilPandaExitConfluence, getEvilPandaRecommendedParams, fetchPriceSeries } from "./tools/evil-panda-enhanced.js";
 import { checkAllPositionsForFlip } from "./tools/bid-ask-flipper.js";
@@ -1104,6 +1104,7 @@ function renderSettingsMenu(page = "main") {
       settingButton("Refresh", `cfg:page:${page}`),
       settingButton("Close", "cfg:close"),
     ],
+    [settingButton("🏠 Main Menu", "cfg:main")],
   ];
 
   let rows;
@@ -1196,9 +1197,16 @@ async function applySettingsMenuCallback(msg) {
   const parts = data.split(":");
   const action = parts[1];
   let page = "main";
+  // The settings menu edits the same Telegram message the LP dashboard may own.
+  forgetLpMessageView(msg.messageId);
 
   if (action === "noop") {
     await answerCallbackQuery(msg.callbackQueryId);
+    return;
+  }
+  if (action === "main") {
+    await answerCallbackQuery(msg.callbackQueryId);
+    await showLpMainMenu({ msg, messageId: msg.messageId });
     return;
   }
   if (action === "close") {
@@ -1265,6 +1273,7 @@ function formatHelpText() {
   return [
     "Telegram commands",
     "",
+    "/start — main dashboard (wallet, balances, LP shortcuts)",
     "/help — show commands",
     "/status — wallet + positions snapshot",
     "/wallet — wallet, deploy amount, HiveMind status",
@@ -1280,7 +1289,8 @@ function formatHelpText() {
     "/setcfg <key> <value> — update persisted config",
     "/screen — refresh deterministic candidate list",
     "/candidates — show latest cached candidates",
-    "/lp — interactive LP menu (pick a pool, set amount/range/strategy, deploy)",
+    "/lp — LP dashboard (positions, balances, trending, settings)",
+    "/lp <token mint | pool address> — list every DLMM pool for a token CA, then deploy",
     "/deploy <n> — deploy candidate by cached index (deterministic)",
     "/briefing — morning briefing",
     "/hive — HiveMind sync status",
@@ -1552,6 +1562,9 @@ async function telegramHandler(msg) {
   const text = msg?.text?.trim();
   if (!text) return;
   if (msg?.isCallback && text.startsWith("lp:")) {
+    // Dashboard hub + every sub-view (`lp:main`, `lp:positions`, `lp:balance`,
+    // `lp:new_position`, `lp:trending`, `lp:calendar`, `lp:chain`, `lp:wallet`,
+    // `lp:damm`, `lp:referrals`, `lp:donate`, `lp:help`, …) is routed here.
     try {
       await handleLpCallback(msg);
     } catch (e) {
@@ -1581,9 +1594,18 @@ async function telegramHandler(msg) {
     await showSettingsMenu().catch((e) => sendMessage(`Settings error: ${e.message}`).catch(() => {}));
     return;
   }
-  if (text === "/lp" || text === "/zap" || text === "/newposition" || text === "/pools") {
+  if (text === "/start" || text === "/dashboard" || text === "/lp") {
     try {
       await showLpMainMenu({ msg });
+    } catch (e) {
+      log("telegram_error", `LP dashboard failed: ${e.message}`);
+      await sendMessage(`LP menu error: ${e.message}`).catch(() => {});
+    }
+    return;
+  }
+  if (text === "/zap" || text === "/newposition" || text === "/pools") {
+    try {
+      await showPoolListView({ msg });
     } catch (e) {
       log("telegram_error", `LP menu failed: ${e.message}`);
       await sendMessage(`LP menu error: ${e.message}`).catch(() => {});
