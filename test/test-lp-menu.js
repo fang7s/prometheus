@@ -5,10 +5,15 @@
 
 import assert from "node:assert/strict";
 import {
+  DEFAULT_QUICK_TOKENS,
+  NEW_POSITION_PROMPT,
   binsToDownsidePct,
   buildDashboardKeyboard,
   buildHubKeyboard,
+  buildNewPositionKeyboard,
+  buildQuickTokenPicks,
   buildTokenPoolsKeyboard,
+  buildTrendingKeyboard,
   estimateApr,
   extractPoolAddress,
   findTokenBalance,
@@ -30,18 +35,23 @@ import {
   renderDonateView,
   renderHelpView,
   renderMainMenu,
+  renderNewPositionView,
   renderPositions,
   renderProfitCalendar,
   renderReferralsView,
   renderTokenPools,
+  renderTrendingPools,
   renderWalletView,
   tokenPoolEntries,
   toPoolEntry,
   truncateAddress,
 } from "../services/lp-menu.js";
 import {
+  filterTrendingPools,
   normalizeStrategyKind,
   rankPoolsForToken,
+  rankTrendingPools,
+  scoreTrendingPool,
   strategyLabel,
   strategyLegs,
   toSdkStrategyType,
@@ -582,6 +592,156 @@ test("every sub-view offers a way back to the hub", () => {
     /<code>2hT6qabuzFvD2WixkgQCoYqpG2NrwiGnVa5T5XZWs68s<\/code>/,
   );
   assert.match(renderDammView().text, /DAMM v2/);
+});
+
+console.log("\n=== New LP landing & trending ===");
+
+const TRENDING_FIXTURES = [
+  { address: "AnakinPool111111111111111111111111111111", name: "Anakin/SOL", tokenXMint: "AnakinMint1111111111111111111111111111111", binStep: 50, tvl: 120_000, volume: 900_000, feeTvl: 3.2, usable: true },
+  { address: "PeacePool1111111111111111111111111111111", name: "PEACE/SOL", tokenXMint: "PeaceMint11111111111111111111111111111111", binStep: 100, tvl: 80_000, volume: 1_500_000, feeTvl: 1.1, usable: true },
+  { address: "FloatPool1111111111111111111111111111111", name: "FLOAT/SOL", tokenXMint: "FloatMint11111111111111111111111111111111", binStep: 25, tvl: 40_000, volume: 300_000, feeTvl: 9.5, usable: true },
+  { address: "AnakinPool222222222222222222222222222222", name: "Anakin/SOL", tokenXMint: "AnakinMint1111111111111111111111111111111", binStep: 250, tvl: 60_000, volume: 500_000, feeTvl: 2.0, usable: true },
+  { address: "DustPool11111111111111111111111111111111", name: "DUST/SOL", tokenXMint: "DustMint111111111111111111111111111111111", binStep: 10, tvl: 100, volume: 50, feeTvl: 20, usable: true },
+  { address: "SolUsdcPool11111111111111111111111111111", name: "SOL/USDC", tokenXMint: "So11111111111111111111111111111111111111112", binStep: 4, tvl: 4_338_248, volume: 36_186_336, feeTvl: 32, usable: false },
+];
+
+test("new-position landing prompts for a CA before any pool scan", () => {
+  const picks = buildQuickTokenPicks({});
+  const view = renderNewPositionView({ picks });
+
+  assert.match(view.text, /💧 <b>New LP Position<\/b>/);
+  assert.ok(view.text.includes(NEW_POSITION_PROMPT), "landing copy must match the spec");
+  assert.match(view.text, /Quick picks/);
+
+  const flat = view.keyboard.flat();
+  const labels = flat.map((button) => button.text);
+  const callbacks = flat.map((button) => button.callback_data);
+  assert.ok(labels.includes("🔥 Top Trending"));
+  assert.ok(labels.includes("⬅️ Main Menu"));
+  assert.ok(callbacks.includes("lp:trending"));
+  assert.ok(callbacks.includes("lp:main"));
+
+  // Exactly 3 quick picks, each carrying a mint in its callback payload.
+  const quickButtons = flat.filter((button) => button.callback_data.startsWith("lp:tok:"));
+  assert.equal(quickButtons.length, 3);
+  for (const button of quickButtons) {
+    assert.ok(isSolanaAddress(button.callback_data.slice("lp:tok:".length)));
+    assert.match(button.text, /^🪐 /);
+    assert.ok(button.callback_data.length <= 64);
+  }
+  // The defaults themselves must be valid mainnet mints.
+  for (const token of DEFAULT_QUICK_TOKENS) assert.ok(isSolanaAddress(token.mint));
+});
+
+test("quick token picks prefer recent tokens, dedupe and cap at 3", () => {
+  const recentMint = "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump";
+  const picks = buildQuickTokenPicks({
+    tokenQuery: { mint: recentMint, symbol: "FARTCOIN" },
+    pools: [
+      { baseMint: DEFAULT_QUICK_TOKENS[0].mint, baseSymbol: "BONK" },
+      { baseMint: recentMint, baseSymbol: "DUP" },
+      { baseMint: "not-an-address", baseSymbol: "BAD" },
+    ],
+  });
+
+  assert.equal(picks.length, 3);
+  assert.equal(picks[0].mint, recentMint);
+  assert.equal(picks.filter((pick) => pick.mint === recentMint).length, 1);
+  assert.equal(picks[1].mint, DEFAULT_QUICK_TOKENS[0].mint);
+  assert.match(picks[0].label, /^🪐 FARTCOIN · 9BB6NF\.\.\.pump$/);
+});
+
+test("new-position keyboard wires quick picks to the token search", () => {
+  const rows = buildNewPositionKeyboard([
+    { mint: DEFAULT_QUICK_TOKENS[0].mint, label: "🪐 BONK · DezXAZ...B263" },
+  ]);
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0][0].callback_data, `lp:tok:${DEFAULT_QUICK_TOKENS[0].mint}`);
+  assert.deepEqual(rows[1].map((button) => button.callback_data), ["lp:trending", "lp:main"]);
+  assert.deepEqual(buildNewPositionKeyboard([]), [
+    [{ text: "🔥 Top Trending", callback_data: "lp:trending" }, { text: "⬅️ Main Menu", callback_data: "lp:main" }],
+  ]);
+});
+
+test("filterTrendingPools drops illiquid and non-SOL-quoted pools", () => {
+  const kept = filterTrendingPools(TRENDING_FIXTURES);
+  assert.deepEqual(kept.map((pool) => pool.address), [
+    "AnakinPool111111111111111111111111111111",
+    "PeacePool1111111111111111111111111111111",
+    "FloatPool1111111111111111111111111111111",
+    "AnakinPool222222222222222222222222222222",
+  ]);
+  // Relaxing the thresholds keeps the dust pool but never the non-SOL-quoted one.
+  const loose = filterTrendingPools(TRENDING_FIXTURES, { minTvl: 0, minVolume: 0 });
+  assert.equal(loose.length, 5);
+  assert.equal(loose.some((pool) => pool.usable === false), false);
+});
+
+test("rankTrendingPools ranks by volume/TVL/fee and keeps one pool per token", () => {
+  const liquid = filterTrendingPools(TRENDING_FIXTURES);
+  assert.deepEqual(
+    rankTrendingPools(liquid, { limit: 10 }).map((pool) => pool.address),
+    [
+      "PeacePool1111111111111111111111111111111",
+      "AnakinPool111111111111111111111111111111",
+      "FloatPool1111111111111111111111111111111",
+    ],
+  );
+  const perTokenTwo = rankTrendingPools(liquid, { limit: 10, perToken: 2 });
+  assert.ok(perTokenTwo.some((pool) => pool.address === "AnakinPool222222222222222222222222222222"));
+  assert.equal(rankTrendingPools(liquid, { limit: 2 }).length, 2);
+  assert.ok(rankTrendingPools(liquid)[0].trendScore > 0);
+  // Volume dominates: 10x volume must beat a small TVL/fee edge.
+  assert.ok(
+    scoreTrendingPool({ volume: 1_000_000, tvl: 10_000 }) >
+    scoreTrendingPool({ volume: 100_000, tvl: 60_000, feeTvl: 9 }),
+  );
+  // fee/TVL is clamped: a collapsed-TVL pool with a 70,000%/day ratio cannot
+  // outrank a genuinely high-volume pool.
+  assert.ok(
+    scoreTrendingPool({ volume: 5_000_000, tvl: 2_000_000, feeTvl: 40 }) >
+    scoreTrendingPool({ volume: 600_000, tvl: 3_000, feeTvl: 70_772 }),
+  );
+});
+
+test("trending view renders numbered Quick Zap buttons for each pool", () => {
+  const entries = tokenPoolEntries(rankTrendingPools(filterTrendingPools(TRENDING_FIXTURES)));
+  const view = renderTrendingPools({ pools: entries, wallet: WALLET });
+
+  assert.match(view.text, /Top Trending<\/b> · 3 SOL pool\(s\)/);
+  assert.match(view.text, /PEACE\/SOL/);
+  assert.match(view.text, /bin step 100/);
+  assert.match(view.text, /Quick Zap/);
+
+  const flat = view.keyboard.flat();
+  const labels = flat.map((button) => button.text);
+  assert.ok(labels.includes("1. PEACE/SOL · bs100"), `unexpected labels: ${labels.join(" | ")}`);
+  assert.ok(labels.includes("2. Anakin/SOL · bs50"));
+  assert.ok(labels.includes("3. FLOAT/SOL · bs25"));
+  assert.ok(labels.includes("⬅️ Main Menu"));
+
+  const callbacks = flat.map((button) => button.callback_data);
+  for (const expected of ["lp:pool:0", "lp:pool:1", "lp:pool:2", "lp:trending:refresh", "lp:main"]) {
+    assert.ok(callbacks.includes(expected), `missing ${expected}`);
+  }
+  for (const button of flat) assert.ok(button.callback_data.length <= 64);
+});
+
+test("trending view falls back cleanly and ignores non-SOL pools", () => {
+  const empty = renderTrendingPools({ pools: [] });
+  assert.match(empty.text, /No trending pool right now/);
+  assert.deepEqual(
+    empty.keyboard.flat().map((button) => button.callback_data),
+    ["lp:trending:refresh", "lp:main"],
+  );
+
+  const nonSol = renderTrendingPools({ pools: tokenPoolEntries([TRENDING_FIXTURES[5]]) });
+  assert.match(nonSol.text, /No trending pool right now/);
+  assert.equal(nonSol.keyboard.flat().some((button) => button.callback_data === "lp:pool:0"), false);
+  assert.deepEqual(
+    buildTrendingKeyboard([]).pop().map((button) => button.callback_data),
+    ["lp:trending:refresh", "lp:main"],
+  );
 });
 
 console.log(`\n✓ ${passed} LP-menu tests passed`);

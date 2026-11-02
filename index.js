@@ -36,7 +36,7 @@ import { stageSignals } from "./signal-tracker.js";
 import { getWeightsSummary } from "./signal-weights.js";
 import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
 import { appendDecision } from "./decision-log.js";
-import { showLpMainMenu, showPoolListView, forgetLpMessageView, handleLpCallback, handleLpText } from "./services/lp-menu.js";
+import { showLpMainMenu, showNewPositionView, showPoolListView, forgetLpMessageView, handleLpCallback, handleLpText } from "./services/lp-menu.js";
 // Import only what we actually need for the new functionality
 import { evaluateEvilPandaCandidate, checkEvilPandaExitConfluence, getEvilPandaRecommendedParams, fetchPriceSeries } from "./tools/evil-panda-enhanced.js";
 import { checkAllPositionsForFlip } from "./tools/bid-ask-flipper.js";
@@ -1603,7 +1603,16 @@ async function telegramHandler(msg) {
     }
     return;
   }
-  if (text === "/zap" || text === "/newposition" || text === "/pools") {
+  if (text === "/zap" || text === "/newposition") {
+    try {
+      await showNewPositionView({ msg });
+    } catch (e) {
+      log("telegram_error", `LP new-position view failed: ${e.message}`);
+      await sendMessage(`LP menu error: ${e.message}`).catch(() => {});
+    }
+    return;
+  }
+  if (text === "/pools") {
     try {
       await showPoolListView({ msg });
     } catch (e) {

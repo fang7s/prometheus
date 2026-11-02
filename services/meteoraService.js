@@ -415,6 +415,203 @@ export function clearTokenPoolCache(tokenMint = null) {
   else _tokenPoolCache.delete(String(tokenMint).trim());
 }
 
+// ─── Top trending scanner ─────────────────────────────────────────
+/**
+ * Meteora's `/pair/all_by_groups` endpoint is retired (404), so trending pools
+ * are read from the same discovery API, sorted server-side by 24h volume, then
+ * filtered to liquid SOL-quoted pairs and ranked locally.
+ *
+ * Jupiter's token API is queried in batches (`/tokens/v2/search?query=mint,…`)
+ * for organic score / holders / market cap, so the ranking blends on-chain
+ * liquidity with Jupiter's top-token signal instead of trusting a single feed.
+ *
+ * `openDlmmPosition()` deposits SOL as token Y, so only `usable` pools (SOL is
+ * the quote side) are eligible — otherwise the Quick Zap dashboard could not
+ * open them.
+ */
+const JUPITER_TOKENS_BASE = "https://lite-api.jup.ag/tokens/v2";
+const TRENDING_PAGE_SIZE = 100;
+const TRENDING_POOL_LIMIT = 10;
+const TRENDING_CACHE_TTL_MS = 60_000;
+const TRENDING_JUPITER_BATCH = 50;
+const JUPITER_TOKEN_TTL_MS = 5 * 60_000;
+
+/** Trending filters (exported so the UI/tests can show/override thresholds). */
+export const TRENDING_MIN_TVL_USD = 2_000;
+export const TRENDING_MIN_VOLUME_24H_USD = 5_000;
+/**
+ * Ceiling for the fee/TVL term. Fresh pools whose TVL collapsed after a fee
+ * burst can report five-figure daily ratios; without a cap a $600-volume pool
+ * outranks a $5M one. 25%/day is already extreme.
+ */
+export const TRENDING_FEE_TVL_CAP_PCT = 25;
+
+const _trendingCache = { at: 0, data: null };
+const _jupiterTokenCache = new Map(); // mint -> { at, stats }
+
+/**
+ * Trending score — 24h volume dominates, then TVL, then fee/TVL efficiency
+ * (clamped), with Jupiter's organic score as a small quality nudge. Weights are
+ * relative only: they exist so a high-volume dust pool cannot outrank a deep one.
+ */
+export function scoreTrendingPool(pool) {
+  const safe = (n) => (Number.isFinite(n) ? n : 0);
+  const volume = safe(Number(pool?.volume ?? 0)); // 24h volume, USD
+  const tvl = safe(Number(pool?.tvl ?? 0)); // total value locked, USD
+  const feeTvl = Math.min(safe(Number(pool?.feeTvl ?? 0)), TRENDING_FEE_TVL_CAP_PCT);
+  const organic = safe(Number(pool?.organicScore ?? pool?.organic ?? 0)); // Jupiter 0..100
+  return (volume / 1_000) * 1 + (tvl / 10_000) * 0.5 + feeTvl * 10 * 0.3 + organic * 0.2;
+}
+
+/** Drop illiquid, non-SOL-quoted or bin-step-less pools. */
+export function filterTrendingPools(
+  pools = [],
+  { minTvl = TRENDING_MIN_TVL_USD, minVolume = TRENDING_MIN_VOLUME_24H_USD } = {},
+) {
+  return (Array.isArray(pools) ? pools : []).filter((pool) =>
+    Boolean(pool?.address) &&
+    pool?.usable === true && // SOL must be token Y — the only side this menu deposits
+    Number(pool?.binStep ?? 0) > 0 &&
+    Number(pool?.tvl ?? 0) >= minTvl &&
+    Number(pool?.volume ?? 0) >= minVolume,
+  );
+}
+
+/**
+ * Rank trending pools (best first), keeping at most `perToken` pool(s) per base
+ * mint so the list shows distinct tokens like a "trending tokens" board.
+ */
+export function rankTrendingPools(pools = [], { limit = TRENDING_POOL_LIMIT, perToken = 1 } = {}) {
+  const scored = (Array.isArray(pools) ? pools : [])
+    .map((pool) => ({ ...pool, trendScore: Number(scoreTrendingPool(pool).toFixed(4)) }))
+    .sort((a, b) => b.trendScore - a.trendScore || Number(b.volume ?? 0) - Number(a.volume ?? 0));
+
+  const maxPerToken = Math.max(1, Number(perToken) || 1);
+  const capped = Math.max(1, Number(limit) || TRENDING_POOL_LIMIT);
+  const seen = new Map();
+  const ranked = [];
+  for (const pool of scored) {
+    const key = pool?.tokenXMint || pool?.baseMint || pool?.address;
+    const count = seen.get(key) ?? 0;
+    if (count >= maxPerToken) continue;
+    seen.set(key, count + 1);
+    ranked.push(pool);
+    if (ranked.length >= capped) break;
+  }
+  return ranked;
+}
+
+/** Jupiter token stats (organic score / holders / mcap) keyed by mint. */
+export async function fetchJupiterTokenStats(mints = []) {
+  const unique = [...new Set((Array.isArray(mints) ? mints : [])
+    .map((mint) => String(mint ?? "").trim())
+    .filter((mint) => BASE58_ADDRESS_RE.test(mint)))];
+
+  const stats = new Map();
+  const pending = [];
+  for (const mint of unique) {
+    const cached = _jupiterTokenCache.get(mint);
+    if (cached && Date.now() - cached.at < JUPITER_TOKEN_TTL_MS) stats.set(mint, cached.stats);
+    else pending.push(mint);
+  }
+
+  for (let i = 0; i < pending.length; i += TRENDING_JUPITER_BATCH) {
+    const chunk = pending.slice(i, i + TRENDING_JUPITER_BATCH);
+    try {
+      const res = await fetch(`${JUPITER_TOKENS_BASE}/search?query=${encodeURIComponent(chunk.join(","))}`);
+      if (!res.ok) throw new Error(`Jupiter token search HTTP ${res.status}`);
+      const rows = await res.json();
+      for (const row of Array.isArray(rows) ? rows : []) {
+        if (!row?.id) continue;
+        const entry = {
+          symbol: row.symbol ?? null,
+          name: row.name ?? null,
+          organicScore: Number(row.organicScore ?? 0) || 0,
+          holders: Number(row.holderCount ?? 0) || 0,
+          mcap: Number(row.mcap ?? row.fdv ?? 0) || 0,
+          usdPrice: Number(row.usdPrice ?? 0) || 0,
+          launchpad: row.launchpad ?? null,
+        };
+        stats.set(row.id, entry);
+        _jupiterTokenCache.set(row.id, { at: Date.now(), stats: entry });
+      }
+    } catch (error) {
+      log("trending_warn", `Jupiter token enrichment failed: ${error.message}`);
+    }
+  }
+
+  if (_jupiterTokenCache.size > 500) _jupiterTokenCache.clear();
+  return stats;
+}
+
+/**
+ * Top liquid SOL-quoted DLMM pools, ranked by 24h volume + TVL + fee/TVL
+ * (Jupiter organic score as a tie-breaker). Cached for 60 s unless `force`.
+ *
+ * @param {{ limit?: number, force?: boolean, minTvl?: number, minVolume?: number }} [options]
+ * @returns {Promise<{
+ *   pools: object[], totalScanned: number, liquidPools: number,
+ *   jupiterTokens: number, minTvl: number, minVolume: number,
+ * }>}
+ */
+export async function getTopTrendingPools({
+  limit = TRENDING_POOL_LIMIT,
+  force = false,
+  minTvl = TRENDING_MIN_TVL_USD,
+  minVolume = TRENDING_MIN_VOLUME_24H_USD,
+} = {}) {
+  if (!force && _trendingCache.data && Date.now() - _trendingCache.at < TRENDING_CACHE_TTL_MS) {
+    return _trendingCache.data;
+  }
+
+  // Server-side sort keeps the payload small: the top 100 pools by 24h volume.
+  const url = `${POOL_DISCOVERY_BASE}/pools?sort_by=${encodeURIComponent("volume_24h:desc")}` +
+    `&page_size=${TRENDING_PAGE_SIZE}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Meteora trending fetch failed (HTTP ${res.status}).`);
+  const payload = await res.json().catch(() => null);
+  const rawPools = Array.isArray(payload?.data) ? payload.data : [];
+
+  const scanned = rawPools
+    .filter((pool) => pool?.is_blacklisted !== true)
+    .map((pool) => toTokenPoolEntry(pool));
+  const liquid = filterTrendingPools(scanned, { minTvl, minVolume });
+
+  // Jupiter enrichment: organic score / holders / mcap for the surviving tokens.
+  const jupiter = await fetchJupiterTokenStats(liquid.map((pool) => pool.tokenXMint));
+  const enriched = liquid.map((pool) => {
+    const stats = pool.tokenXMint ? jupiter.get(pool.tokenXMint) : null;
+    if (!stats) return pool;
+    return {
+      ...pool,
+      baseSymbol: stats.symbol || pool.baseSymbol,
+      organicScore: stats.organicScore,
+      organic: stats.organicScore,
+      holders: stats.holders || null,
+      mcap: stats.mcap || pool.mcap,
+      name: `${stats.symbol || pool.baseSymbol || "?"}/SOL`,
+    };
+  });
+
+  const data = {
+    pools: rankTrendingPools(enriched, { limit }),
+    totalScanned: rawPools.length,
+    liquidPools: liquid.length,
+    jupiterTokens: jupiter.size,
+    minTvl,
+    minVolume,
+  };
+  _trendingCache.at = Date.now();
+  _trendingCache.data = data;
+  return data;
+}
+
+export function clearTrendingCache() {
+  _trendingCache.at = 0;
+  _trendingCache.data = null;
+  _jupiterTokenCache.clear();
+}
+
 /**
  * Convert a price-delta range (percent) or explicit bin counts into bin IDs.
  *

@@ -3,9 +3,10 @@
  *
  * Flow:
  *   /start · /lp  →  Main Dashboard Hub (wallet + SOL/USDC/USDT balances, 7-row grid)
- *        →  💧 New LP Position / 🔥 Top Trending  →  screening list (pool buttons)
- *        →  pool dashboard (Quick Zap / Amount / Range / Strategy)
- *        →  Continue → Deploy → `services/meteoraService.js#openDlmmPosition`
+ *        →  💧 New LP Position  →  landing prompt (paste a token CA / quick picks)
+ *        →  🔥 Top Trending     →  live volume-ranked SOL pool scan
+ *        →  pool list           →  pool dashboard (Quick Zap / Amount / Range / Strategy)
+ *        →  Continue → Deploy   →  `services/meteoraService.js#openDlmmPosition`
  *
  *   /lp <token mint or pool address>  →  token search / pool dashboard
  *   paste a token CA                  →  every DLMM pair for that mint (SOL first)
@@ -37,6 +38,7 @@ import {
   getPoolSnapshot,
   getPoolMetadata,
   getPoolsByTokenMint,
+  getTopTrendingPools,
   computeBinRange,
   strategyLabel,
   normalizeStrategyKind,
@@ -220,6 +222,8 @@ export function toPoolEntry(candidate, index = 0) {
     name: candidate?.name || `${candidate?.base?.symbol || "?"}/${candidate?.quote?.symbol || "SOL"}`,
     quoteSymbol: candidate?.quote?.symbol || null,
     baseSymbol: candidate?.base?.symbol || null,
+    baseMint: candidate?.base?.mint || null,
+    quoteMint: candidate?.quote?.mint || null,
     binStep: Number(candidate?.bin_step ?? 0) || null,
     baseFee: Number(candidate?.fee_pct ?? 0) || null,
     tvl: Number(candidate?.tvl ?? candidate?.active_tvl ?? 0) || null,
@@ -279,6 +283,7 @@ export function getLpSession(msg) {
     upsidePct: 0,
     rangeLabel: "-50%",
     awaiting: null,
+    tokenQuery: null,
     deploying: false,
     updatedAt: Date.now(),
   };
@@ -413,6 +418,116 @@ export function buildMainKeyboard(pools = []) {
   }
   rows.push([btn("🔄 Refresh", "refresh"), btn("🏠 Main Menu", "main")]);
   return rows;
+}
+
+// ─── New LP Position landing view ─────────────────────────────────
+export const NEW_POSITION_PROMPT = "Paste a Solana token's contract address to see its Meteora DLMM pools, or tap 🔥 Top Trending to pick one from there instead.";
+
+/**
+ * Quick-pick tokens. `mint` values are verified mainnet mints; keep the list
+ * short — recent tokens (last token search / last screening results) are pushed
+ * in front of it by `buildQuickTokenPicks`.
+ */
+export const DEFAULT_QUICK_TOKENS = Object.freeze([
+  { mint: "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263", symbol: "BONK" },
+  { mint: "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN", symbol: "JUP" },
+  { mint: "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm", symbol: "WIF" },
+  { mint: "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr", symbol: "POPCAT" },
+]);
+
+/** Quick picks: last searched token → recent screening tokens → defaults. */
+export function buildQuickTokenPicks({ pools = [], tokenQuery = null, defaults = DEFAULT_QUICK_TOKENS, limit = 3 } = {}) {
+  const picks = [];
+  const seen = new Set();
+  const add = (mint, symbol) => {
+    const address = String(mint ?? "").trim();
+    if (!address || seen.has(address) || picks.length >= limit) return;
+    if (!isSolanaAddress(address)) return;
+    seen.add(address);
+    picks.push({
+      mint: address,
+      symbol: symbol || null,
+      label: `🪐 ${symbol ? `${symbol} · ` : ""}${truncateAddress(address)}`,
+    });
+  };
+  if (tokenQuery?.mint) add(tokenQuery.mint, tokenQuery.symbol);
+  for (const pool of Array.isArray(pools) ? pools : []) add(pool?.baseMint, pool?.baseSymbol);
+  for (const token of Array.isArray(defaults) ? defaults : []) add(token?.mint, token?.symbol);
+  return picks.slice(0, Math.max(1, Number(limit) || 3));
+}
+
+/**
+ * 💧 New LP Position — a clean prompt shown BEFORE any pool scan. The session is
+ * left awaiting a pasted token CA (mint) or pool address.
+ */
+export function renderNewPositionView({ picks = [], note = null } = {}) {
+  const quick = Array.isArray(picks) ? picks : [];
+  return {
+    text: [
+      "💧 <b>New LP Position</b>",
+      "═══════════════════════",
+      NEW_POSITION_PROMPT,
+      "",
+      "🪐 <b>Quick picks</b>",
+      quick.length ? quick.map((pick) => `• ${escapeHtml(pick.label)}`).join("\n") : "<i>no recent tokens yet</i>",
+      "",
+      "Paste a <b>token CA</b> to list every Meteora DLMM pool for it, or a <b>pool address</b> to open that pool directly.",
+      note ? `\n<i>${escapeHtml(note)}</i>` : null,
+    ].filter((line) => line != null).join("\n"),
+    keyboard: buildNewPositionKeyboard(quick),
+  };
+}
+
+export function buildNewPositionKeyboard(picks = []) {
+  const rows = (Array.isArray(picks) ? picks : []).map((pick) => [
+    btn(String(pick?.label || pick?.mint || "token").slice(0, 64), `tok:${pick.mint}`),
+  ]);
+  rows.push([btn("🔥 Top Trending", "trending"), btn("⬅️ Main Menu", "main")]);
+  return rows;
+}
+
+// ─── Top trending view ────────────────────────────────────────────
+export function buildTrendingKeyboard(pools = []) {
+  const rows = [];
+  const list = Array.isArray(pools) ? pools : [];
+  list.forEach((pool, position) => {
+    // `index` is the position in session.pools, which `lp:pool:<n>` selects.
+    const index = pool?.index ?? position;
+    const label = `${index + 1}. ${pool?.name || "unknown"}${pool?.binStep != null ? ` · bs${pool.binStep}` : ""}`;
+    rows.push([btn(String(label).slice(0, 64), `pool:${index}`)]);
+  });
+  rows.push([btn("🔄 Refresh", "trending:refresh"), btn("⬅️ Main Menu", "main")]);
+  return rows;
+}
+
+/** 🔥 Top Trending — liquid SOL pools ranked by volume / TVL / fee-TVL. */
+export function renderTrendingPools({ pools = [], wallet = null, note = null } = {}) {
+  const all = Array.isArray(pools) ? pools : [];
+  const usable = all.filter((pool) => pool?.usable !== false && pool?.address);
+  const lines = [
+    `🔥 <b>Top Trending</b> · ${usable.length} SOL pool(s)`,
+    "═══════════════════════",
+    wallet?.wallet ? `👛 <code>${escapeHtml(truncateAddress(wallet.wallet))}</code>` : null,
+    "",
+  ].filter((line) => line != null);
+
+  if (!usable.length) {
+    lines.push(
+      "🫙 <b>No trending pool right now</b>",
+      "",
+      "Meteora returned no liquid SOL-quoted DLMM pools this cycle — try 🔄 Refresh.",
+      note ? `\n<i>${escapeHtml(note)}</i>` : null,
+    );
+  } else {
+    lines.push(
+      ...usable.map((pool, position) => formatPoolLine(pool, pool.index ?? position)),
+      "",
+      note ? `<i>${escapeHtml(note)}</i>` : null,
+      "👆 Tap a pool to open the Quick Zap dashboard.",
+    );
+  }
+
+  return { text: lines.filter((line) => line != null).join("\n"), keyboard: buildTrendingKeyboard(usable) };
 }
 
 // ─── Token (mint) search results ──────────────────────────────────
@@ -1053,6 +1168,65 @@ export async function showPoolListView({ messageId = null, force = false, note =
   return newMessageId;
 }
 
+/**
+ * 💧 New LP Position — landing prompt shown before any pool scan.
+ * Puts the session in "awaiting address" mode: the next plain-text message may
+ * be a token CA (list its DLMM pools) or a pool address (open it directly).
+ */
+export async function showNewPositionView({ messageId = null, note = null, msg = null } = {}) {
+  const session = msg ? touch(getLpSession(msg)) : null;
+  if (session) {
+    session.awaiting = "address";
+    session.pool = null;
+    session.messageId = messageId ?? session.messageId;
+  }
+
+  // No network here: quick picks come from cached screening data + defaults.
+  const picks = buildQuickTokenPicks({
+    pools: _poolList.pools,
+    tokenQuery: session?.tokenQuery ?? null,
+  });
+  const view = renderNewPositionView({ picks, note });
+  const newMessageId = await presentMessage(view, messageId ?? session?.messageId ?? null);
+  if (session) session.messageId = newMessageId;
+  return newMessageId;
+}
+
+/**
+ * 🔥 Top Trending — live Meteora scan (volume/TVL/fee-TVL) enriched with
+ * Jupiter organic scores. The resulting pools become `session.pools`, so each
+ * numbered button (`lp:pool:<n>`) opens the normal Quick Zap dashboard.
+ */
+export async function showTrendingView({ messageId = null, force = false, note = null, msg = null } = {}) {
+  const session = msg ? touch(getLpSession(msg)) : null;
+  if (session) {
+    session.awaiting = null;
+    session.pool = null;
+    session.messageId = messageId ?? session.messageId;
+  }
+
+  let pools = [];
+  let scanError = null;
+  try {
+    const result = await getTopTrendingPools({ force });
+    pools = tokenPoolEntries(result?.pools);
+  } catch (error) {
+    scanError = error.message;
+    log("lp_ui_warn", `Trending scan failed: ${error.message}`);
+  }
+  if (session) session.pools = pools;
+
+  const wallet = await getWalletSnapshot();
+  const view = renderTrendingPools({
+    pools,
+    wallet,
+    note: scanError ? `Scan error: ${scanError}` : note,
+  });
+  const newMessageId = await presentMessage(view, messageId ?? session?.messageId ?? null);
+  if (session) session.messageId = newMessageId;
+  return newMessageId;
+}
+
 async function presentDashboard(msg, { note = null, messageId = null } = {}) {
   const session = touch(getLpSession(msg));
 
@@ -1541,6 +1715,21 @@ export async function handleLpText(msg) {
     return true;
   }
 
+  if (awaiting === "address") {
+    const address = extractPoolAddress(text);
+    if (!address) {
+      await sendHTML(
+        "❌ That is not a Solana address.\n" +
+        "Paste a <b>token contract address</b> (mint CA) or a <b>Meteora pool address</b> — " +
+        "or tap 🔥 Top Trending.",
+      );
+      return true;
+    }
+    active.awaiting = null;
+    await openAddressQuery(msg, address);
+    return true;
+  }
+
   // A bare address / token CA / Meteora link: pool dashboard or token pool list.
   if (isSolanaAddress(text) || /^https?:\/\/\S+$/i.test(text)) {
     const address = extractPoolAddress(text);
@@ -1593,15 +1782,22 @@ export async function handleLpCallback(msg) {
     return true;
   }
 
-  if (action === "new_position" || action === "pools") {
+  if (action === "new_position") {
+    await ack();
+    await showNewPositionView({ msg, messageId: msg.messageId });
+    return true;
+  }
+
+  // Legacy alias (older keyboards) — still opens the screening list directly.
+  if (action === "pools") {
     await ack();
     await showPoolListView({ msg, messageId: msg.messageId, force: Boolean(arg) });
     return true;
   }
 
   if (action === "trending") {
-    await ack("Ranking pools by 24h volume…");
-    await showPoolListView({ msg, messageId: msg.messageId, sort: "volume" });
+    await ack(arg === "refresh" ? "Refreshing trending…" : "Scanning Meteora + Jupiter…");
+    await showTrendingView({ msg, messageId: msg.messageId, force: arg === "refresh" });
     return true;
   }
 
