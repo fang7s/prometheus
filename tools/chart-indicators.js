@@ -224,6 +224,72 @@ async function fetchChartIndicatorsForMint(
   });
 }
 
+// ─── Supertrend 15m (exit hierarchy priority 3) ─────────────────────
+// Only timeframe the exit safety net reads. Kept local (not imported from
+// exit-rules.js) so this tool stays a pure data source.
+const SUPERTREND_EXIT_INTERVAL = "15_MINUTE";
+const SUPERTREND_CACHE_MS = 60_000;
+const _supertrendCache = new Map();
+
+/**
+ * Latest 15m Supertrend snapshot for a mint.
+ *
+ * Feeds Priority 3 of the exit hierarchy (1-candle close break). Only Supertrend
+ * fields are returned — RSI/MACD/Bollinger values in the same payload are
+ * ignored on purpose: indicators never close a position.
+ *
+ * Cached for a minute so the 3s PnL poller does not hammer the API; a 15m candle
+ * can only close once per 15 minutes, so a minute of staleness is harmless.
+ *
+ * @param {string} mint - base token mint
+ * @returns {Promise<null|{interval:string, close:number|null, previousClose:number|null,
+ *   supertrendValue:number|null, supertrendDirection:string, supertrendBreakDown:boolean,
+ *   supertrendBreakUp:boolean, fetchedAt:string}>}
+ */
+export async function fetchSupertrend15m(mint, { refresh = false, cacheSec = SUPERTREND_CACHE_MS / 1000 } = {}) {
+  if (!mint) return null;
+
+  const key = String(mint);
+  const ttl = Math.max(0, Number(cacheSec) || 0) * 1000;
+  const cached = _supertrendCache.get(key);
+  if (!refresh && cached && Date.now() - cached.at < ttl) {
+    // Failed fetches are cached too, so a dead API logs once per TTL instead of
+    // once per poll tick.
+    if (cached.error) throw cached.error;
+    return cached.signal;
+  }
+
+  try {
+    const payload = await fetchChartIndicatorsForMint(mint, {
+      interval: SUPERTREND_EXIT_INTERVAL,
+      refresh,
+    });
+    const summary = buildSignalSummary(payload);
+    const signal = {
+      interval: SUPERTREND_EXIT_INTERVAL,
+      close: summary.close,
+      previousClose: summary.previousClose,
+      supertrendValue: summary.supertrendValue,
+      supertrendDirection: summary.supertrendDirection,
+      supertrendBreakDown: summary.supertrendBreakDown,
+      supertrendBreakUp: summary.supertrendBreakUp,
+      fetchedAt: new Date().toISOString(),
+    };
+
+    _supertrendCache.set(key, { at: Date.now(), signal });
+    return signal;
+  } catch (error) {
+    _supertrendCache.set(key, { at: Date.now(), error });
+    throw error;
+  } finally {
+    if (_supertrendCache.size > 200) {
+      // Drop the oldest entry — cheap bound, this map only ever holds open pools.
+      const oldest = _supertrendCache.keys().next().value;
+      if (oldest !== undefined) _supertrendCache.delete(oldest);
+    }
+  }
+}
+
 export async function confirmIndicatorPreset({
   mint,
   side,

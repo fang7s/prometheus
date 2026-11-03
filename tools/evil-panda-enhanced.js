@@ -129,7 +129,12 @@ export function evaluateEvilPandaCandidate(poolData) {
 }
 
 /**
- * Check Evil Panda Confluence Exit Conditions
+ * Evil Panda indicator confluence (RSI(2) > 90 + BB/MACD confirmation).
+ *
+ * NOT an exit trigger any more. The exit path is the strict hierarchy in
+ * `exit-rules.js` (TP/SL → range bounds → Supertrend 15m); this function is kept
+ * only as an analysis helper so `/pool` reporting can describe momentum. Never
+ * wire it back into `detectExit()`, the poller or the management cycle.
  */
 export function checkEvilPandaExitConfluence(prices, currentPrice) {
   try {
@@ -445,6 +450,10 @@ function buildBufferSeries(poolAddress, buffer, timeframe) {
 
 /**
  * Fetch an ascending close-price series for a DLMM pool.
+ *
+ * Analysis helper only — the exit hierarchy no longer consumes price series
+ * (RSI/MACD were removed from the exit path). Kept for ad-hoc pool analysis.
+ *
  * Primary: GeckoTerminal OHLCV. Fallbacks: DexScreener spot → DLMM active bin,
  * accumulated into a 50-point in-memory buffer so the indicators can still
  * compute when OHLCV is unavailable. Cached per (pool, timeframe, limit) and

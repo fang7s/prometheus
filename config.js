@@ -165,13 +165,15 @@ export const config = {
     allowLiveRedeploy:  u.flipperAllowLiveRedeploy ?? false,
   },
 
-  // ─── Evil Panda indicator exit (RSI/BB/MACD confluence) ──
-  panda: {
-    enabled:       u.pandaExitEnabled      ?? true,
-    timeframe:     u.pandaExitTimeframe    ?? "5m",
-    candles:       Number(u.pandaExitCandles ?? 120),
-    cacheSec:      Number(u.pandaExitCacheSec ?? 60),
-    confirmTicks:  Number(u.pandaExitConfirmTicks ?? 3),
+  // ─── Exit safety net (Priority 3: Supertrend 15m candle break) ──
+  // TP/SL (priority 1) and range bounds (priority 2) are config-driven through
+  // `management`; this block only tunes the fallback Supertrend safety net.
+  // RSI/MACD are NOT exit inputs — see exit-rules.js.
+  exitSafety: {
+    // The timeframe is fixed at 15m by design (SUPERTREND_INTERVAL in exit-rules.js).
+    supertrendEnabled: u.exitSupertrendEnabled ?? true,
+    cacheSec:          Number(u.exitSupertrendCacheSec ?? 60),
+    confirmTicks:      Math.max(1, Number(u.exitSupertrendConfirmTicks ?? 2)),
   },
 
   // ─── Smart-Wallet Radar (optional wallet-convergence tracker) ──

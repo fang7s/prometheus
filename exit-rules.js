@@ -1,43 +1,88 @@
 /**
- * Deterministic exit-rule engine — 100% numeric JavaScript, NO LLM.
+ * Deterministic exit engine — strict, simplified priority hierarchy. 100% numeric
+ * JavaScript: NO LLM, no sentiment, no free-text interpretation.
  *
- * Every exit decision is derived from live position numbers (PnL %, bin range,
- * fee/TVL, age, peak) plus the persisted position state (trailing arm, OOR
- * timestamp). The engine returns a rule decision object; callers execute the
- * close through the normal close path (which never consults the LLM).
+ * The ONLY automatic close triggers, evaluated in this exact order:
  *
- * Rule ladder (stable numbering — logs and docs refer to these ids):
- *   1 Stop-Loss
- *   2 Take-Profit
- *   3 Pumped Far Above Range
- *   4 Out-of-Range
- *   5 Low Yield
- *   6 Trailing Take-Profit
- *   7 Evil Panda Confluence (indicator confluence, still numeric/rule based)
- *   8 Instruction Time Limit (deterministically parsed `/set` instruction)
- *   9 Flipper Rebalance (bid-ask flipper close-and-redeploy)
+ *   Priority 1 — Immediate TP / SL
+ *     `pnl_pct` against `config.management.takeProfitPct` / `stopLossPct`.
+ *     A trailing take-profit (armed peak → drop) belongs to the same family.
+ *   Priority 2 — Range boundaries
+ *     the active bin has moved FAR above or FAR below the position's outer bounds
+ *     (`config.management.outOfRangeBinsToClose`), securing IL / freeing SOL.
+ *   Priority 3 — Supertrend 15m candle break
+ *     the latest *closed* 15m candle closes through the Supertrend line
+ *     (1-candle break, fallback safety net). Needs a candle feed, so the caller
+ *     evaluates it via `evaluateSupertrendExit()` only when 1 and 2 did not fire.
  *
- * Priority is evaluated independently of the ids: capital protection first
- * (stop-loss), then profit taking, then range/yield decay, then instruction
- * time limits.
+ * Technical oscillators are deliberately NOT part of the exit path. RSI(2) at
+ * 90-100 and the MACD first-green-candle confluence (the old "Evil Panda" exit)
+ * closed positions on momentum spikes long before TP/SL or the range bounds were
+ * reached, so they no longer trigger automatic closes. Indicators may still be
+ * reported for context — never used to close a position.
+ *
+ * Every decision carries the priority, a stable rule id and a greppable headline
+ * (`Priority 1: TP hit (+5.00%)`) so operators can see exactly why a position closed.
  */
 
 import { log } from "./logger.js";
 import { getTrackedPosition, refreshPositionState } from "./state.js";
 
-export const EXIT_RULES = Object.freeze({
-  STOP_LOSS:          { rule: 1, name: "Stop-Loss" },
-  TAKE_PROFIT:        { rule: 2, name: "Take-Profit" },
-  PUMPED_ABOVE_RANGE: { rule: 3, name: "Pumped Far Above Range" },
-  OUT_OF_RANGE:       { rule: 4, name: "Out-of-Range" },
-  LOW_YIELD:          { rule: 5, name: "Low Yield" },
-  TRAILING_TP:        { rule: 6, name: "Trailing Take-Profit" },
-  EVIL_PANDA:         { rule: 7, name: "Evil Panda Confluence" },
-  INSTRUCTION_TIME:   { rule: 8, name: "Instruction Time Limit" },
-  FLIPPER_REBALANCE:  { rule: 9, name: "Flipper Rebalance" },
+/** The three automatic exit priorities, in strict evaluation order. */
+export const EXIT_PRIORITY = Object.freeze({
+  TP_SL: 1,
+  RANGE: 2,
+  SUPERTREND: 3,
 });
 
-const DEFAULT_MIN_AGE_BEFORE_YIELD_CHECK = 60;
+/** The Supertrend safety net only ever reads the 15m timeframe. */
+export const SUPERTREND_INTERVAL = "15_MINUTE";
+
+export const EXIT_RULES = Object.freeze({
+  STOP_LOSS: {
+    priority: EXIT_PRIORITY.TP_SL,
+    rule: 1,
+    name: "Stop-Loss",
+    headline: "Priority 1: SL hit",
+  },
+  TAKE_PROFIT: {
+    priority: EXIT_PRIORITY.TP_SL,
+    rule: 2,
+    name: "Take-Profit",
+    headline: "Priority 1: TP hit",
+  },
+  TRAILING_TP: {
+    priority: EXIT_PRIORITY.TP_SL,
+    rule: 3,
+    name: "Trailing Take-Profit",
+    headline: "Priority 1: Trailing TP hit",
+  },
+  FAR_ABOVE_RANGE: {
+    priority: EXIT_PRIORITY.RANGE,
+    rule: 4,
+    name: "Far Above Range",
+    headline: "Priority 2: Far Above Range",
+  },
+  FAR_BELOW_RANGE: {
+    priority: EXIT_PRIORITY.RANGE,
+    rule: 5,
+    name: "Far Below Range",
+    headline: "Priority 2: Far Below Range",
+  },
+  SUPERTREND_BREAK: {
+    priority: EXIT_PRIORITY.SUPERTREND,
+    rule: 6,
+    name: "Supertrend 15m Candle Break",
+    headline: "Priority 3: Supertrend 15m Candle Break",
+  },
+  // Outside the automatic hierarchy — the bid-ask flipper's close-and-redeploy.
+  FLIPPER_REBALANCE: {
+    priority: 0,
+    rule: 9,
+    name: "Flipper Rebalance",
+    headline: "Flipper Rebalance",
+  },
+});
 
 function toFiniteNumber(value) {
   if (value == null || value === "") return null;
@@ -49,12 +94,24 @@ function toFiniteNumber(value) {
  * Build a normalized rule decision.
  * @param {string} key - key into EXIT_RULES
  * @param {string} reason - human readable reason (numbers included)
- * @param {object} extra - optional extra fields (signal, needs_confirmation, ...)
+ * @param {object} extra - optional extra fields; `headline` overrides the default
+ *   priority label (e.g. `Priority 1: TP hit (+5.00%)`)
  */
 export function ruleDecision(key, reason, extra = {}) {
   const def = EXIT_RULES[key];
   if (!def) throw new Error(`Unknown exit rule: ${key}`);
-  return { action: "CLOSE", rule: def.rule, name: def.name, rule_key: key, reason, ...extra };
+  const fields = { ...extra };
+  delete fields.headline;
+  return {
+    action: "CLOSE",
+    priority: def.priority,
+    rule: def.rule,
+    name: def.name,
+    rule_key: key,
+    reason,
+    headline: extra.headline ?? def.headline ?? def.name,
+    ...fields,
+  };
 }
 
 /**
@@ -127,39 +184,48 @@ function minutesOutOfRangeOf(position, tracked, now = Date.now()) {
 }
 
 /**
- * Pure numeric rule evaluation. No I/O, no state writes, no LLM.
+ * Priorities 1 and 2 of the exit hierarchy — pure numeric evaluation. No I/O, no
+ * state writes, no LLM, no technical indicators.
+ *
+ * Priority 3 (Supertrend 15m break) lives in `evaluateSupertrendExit()` and is
+ * only consulted by the caller when this function returns null.
  *
  * @param {object} position - a getMyPositions() entry
  * @param {object} managementConfig - config.management (with instruction overrides merged)
  * @param {object} ctx - { tracked, overrides, now }
  * @returns {object|null} rule decision or null
  */
-export function evaluateNumericRules(position, managementConfig = {}, ctx = {}) {
+export function evaluateExitHierarchy(position, managementConfig = {}, ctx = {}) {
   if (!position) return null;
   const { tracked = null, overrides = {}, now = Date.now() } = ctx;
   const pnl = toFiniteNumber(position.pnl_pct);
   const suspect = isPnlSuspect(position, tracked);
   const noteSuffix = (key) => (overrides[key] != null ? " (position instruction)" : "");
 
-  // ── 1. Stop-loss ────────────────────────────────────────────────
+  // ═══ Priority 1 — immediate TP / SL (percentage PnL) ════════════
   const stopLossPct = toFiniteNumber(managementConfig.stopLossPct);
   if (!suspect && pnl != null && stopLossPct != null && pnl <= stopLossPct) {
     return ruleDecision(
       "STOP_LOSS",
-      `PnL ${pnl.toFixed(2)}% <= ${stopLossPct}%${noteSuffix("stopLossPct")}`,
+      // "stop loss" is kept verbatim: lessons.js uses it to accept an extreme
+      // loss as a real stop rather than a bad PnL tick.
+      `stop loss: PnL ${pnl.toFixed(2)}% <= ${stopLossPct}%${noteSuffix("stopLossPct")}`,
+      { headline: `Priority 1: SL hit (${pnl.toFixed(2)}%)`, pnl_pct: pnl },
     );
   }
 
-  // ── 2. Take-profit ──────────────────────────────────────────────
   const takeProfitPct = toFiniteNumber(managementConfig.takeProfitPct);
   if (!suspect && pnl != null && takeProfitPct != null && pnl >= takeProfitPct) {
     return ruleDecision(
       "TAKE_PROFIT",
-      `PnL ${pnl.toFixed(2)}% >= ${takeProfitPct}%${noteSuffix("takeProfitPct")}`,
+      `take profit: PnL ${pnl.toFixed(2)}% >= ${takeProfitPct}%${noteSuffix("takeProfitPct")}`,
+      { headline: `Priority 1: TP hit (+${pnl.toFixed(2)}%)`, pnl_pct: pnl },
     );
   }
 
-  // ── 6. Trailing take-profit (armed state lives in state.json) ───
+  // Trailing take-profit is still profit taking, so it stays in priority 1: a
+  // confirmed peak armed in state.json and the current tick gave back
+  // `trailingDropPct` of it. Armed state is maintained by state.js.
   if (managementConfig.trailingTakeProfit !== false && !suspect && pnl != null && tracked?.trailing_active) {
     const peak = toFiniteNumber(tracked.peak_pnl_pct);
     const drop = toFiniteNumber(managementConfig.trailingDropPct);
@@ -168,72 +234,116 @@ export function evaluateNumericRules(position, managementConfig = {}, ctx = {}) 
       if (dropFromPeak >= drop) {
         return ruleDecision(
           "TRAILING_TP",
-          `peak ${peak.toFixed(2)}% -> current ${pnl.toFixed(2)}% (dropped ${dropFromPeak.toFixed(2)}% >= ${drop}%)`,
-          { needs_confirmation: true, peak_pnl_pct: peak, current_pnl_pct: pnl, drop_from_peak_pct: dropFromPeak },
+          `trailing take profit: peak ${peak.toFixed(2)}% -> current ${pnl.toFixed(2)}% (dropped ${dropFromPeak.toFixed(2)}% >= ${drop}%)`,
+          {
+            headline: `Priority 1: Trailing TP hit (+${pnl.toFixed(2)}%)`,
+            peak_pnl_pct: peak,
+            current_pnl_pct: pnl,
+            drop_from_peak_pct: dropFromPeak,
+          },
         );
       }
     }
   }
 
-  // ── 3. Pumped far above range ───────────────────────────────────
+  // ═══ Priority 2 — range boundaries ══════════════════════════════
+  // "Far" is measured in bins beyond the position's own outer bounds so the
+  // threshold scales with the deployed range (`outOfRangeBinsToClose`).
   const activeBin = toFiniteNumber(position.active_bin);
   const upperBin = toFiniteNumber(position.upper_bin);
-  const binsAbove = toFiniteNumber(managementConfig.outOfRangeBinsToClose);
-  if (activeBin != null && upperBin != null && binsAbove != null && activeBin > upperBin + binsAbove) {
+  const lowerBin = toFiniteNumber(position.lower_bin);
+  const binsAway = toFiniteNumber(managementConfig.outOfRangeBinsToClose);
+
+  if (binsAway != null && activeBin != null && upperBin != null && activeBin > upperBin + binsAway) {
     return ruleDecision(
-      "PUMPED_ABOVE_RANGE",
-      `active bin ${activeBin} > upper ${upperBin} + ${binsAbove}`,
+      "FAR_ABOVE_RANGE",
+      // "out of range" is kept verbatim: pool-memory / lessons / hivemind use it
+      // to classify range exits in win-rate and cooldown bookkeeping.
+      `out of range above: active bin ${activeBin} > upper ${upperBin} + ${binsAway}`,
+      { distance_bins: activeBin - upperBin },
     );
   }
 
-  // ── 4. Out of range too long ────────────────────────────────────
-  const oorMinutes = minutesOutOfRangeOf(position, tracked, now);
-  const waitMinutes = toFiniteNumber(managementConfig.outOfRangeWaitMinutes) ?? Infinity;
+  if (binsAway != null && activeBin != null && lowerBin != null && activeBin < lowerBin - binsAway) {
+    return ruleDecision(
+      "FAR_BELOW_RANGE",
+      `out of range below: active bin ${activeBin} < lower ${lowerBin} - ${binsAway}`,
+      { distance_bins: lowerBin - activeBin },
+    );
+  }
+
+  // Data-gap backstop: some position snapshots only report `in_range` without bin
+  // geometry. Those still respect the range exit after `outOfRangeWaitMinutes`,
+  // mapped to the direction that is known (above → Far Above, otherwise Below).
   const aboveRange = activeBin != null && upperBin != null && activeBin > upperBin;
-  const flagsOutOfRange = position.in_range === false;
-  if ((aboveRange || flagsOutOfRange) && oorMinutes >= waitMinutes) {
-    return ruleDecision(
-      "OUT_OF_RANGE",
-      `out of range for ${oorMinutes}m (limit ${waitMinutes}m)`,
-    );
-  }
-
-  // ── 5. Low yield ────────────────────────────────────────────────
-  const feePerTvl = toFiniteNumber(position.fee_per_tvl_24h);
-  const minFeePerTvl = toFiniteNumber(managementConfig.minFeePerTvl24h);
-  const ageMinutes = toFiniteNumber(position.age_minutes);
-  const minAge = toFiniteNumber(managementConfig.minAgeBeforeYieldCheck) ?? DEFAULT_MIN_AGE_BEFORE_YIELD_CHECK;
-  if (
-    feePerTvl != null &&
-    minFeePerTvl != null &&
-    feePerTvl < minFeePerTvl &&
-    ageMinutes != null &&
-    ageMinutes >= minAge
-  ) {
-    return ruleDecision(
-      "LOW_YIELD",
-      `fee/TVL ${feePerTvl.toFixed(2)}% < min ${minFeePerTvl}% (age ${ageMinutes}m >= ${minAge}m)${noteSuffix("minFeePerTvl24h")}`,
-    );
-  }
-
-  // ── 8. Instruction time limit (deterministically parsed) ────────
-  const closeAfterMinutes = toFiniteNumber(managementConfig.closeAfterMinutes);
-  if (closeAfterMinutes != null && ageMinutes != null && ageMinutes >= closeAfterMinutes) {
-    return ruleDecision(
-      "INSTRUCTION_TIME",
-      `age ${ageMinutes}m >= instruction limit ${closeAfterMinutes}m`,
-    );
+  const flaggedOutOfRange = position.in_range === false;
+  if (aboveRange || flaggedOutOfRange) {
+    const oorMinutes = minutesOutOfRangeOf(position, tracked, now);
+    const waitMinutes = toFiniteNumber(managementConfig.outOfRangeWaitMinutes) ?? Infinity;
+    if (oorMinutes >= waitMinutes) {
+      return aboveRange
+        ? ruleDecision("FAR_ABOVE_RANGE", `out of range above for ${oorMinutes}m (limit ${waitMinutes}m)`)
+        : ruleDecision("FAR_BELOW_RANGE", `out of range below for ${oorMinutes}m (limit ${waitMinutes}m)`);
+    }
   }
 
   return null;
 }
 
 /**
- * Full deterministic exit evaluation for one position.
+ * Priority 3 — Supertrend 15m candle break (fallback safety net).
  *
- * 1. Reads the persisted instruction and derives numeric overrides.
+ * Break condition = the latest **closed** 15m candle:
+ *   - the API flagged `supertrendBreakDown` on that candle, or
+ *   - the candle closed strictly below the Supertrend line.
+ *
+ * A single candle close is enough by design. Only genuine Supertrend data is
+ * consulted — RSI/MACD/Bollinger values in the same payload are ignored.
+ *
+ * @param {object|null} signal - { interval, close|candleClose, supertrendValue, supertrendBreakDown }
+ * @param {object} [options] - { interval } expected timeframe (defaults to 15m)
+ * @returns {object|null} rule decision or null
+ */
+export function evaluateSupertrendExit(signal, { interval = SUPERTREND_INTERVAL } = {}) {
+  if (!signal) return null;
+
+  const expected = String(interval).trim().toUpperCase();
+  const actual = String(signal.interval ?? expected).trim().toUpperCase();
+  if (actual !== expected) return null; // never size the safety net off another timeframe
+
+  const close = toFiniteNumber(signal.candleClose ?? signal.close);
+  const line = toFiniteNumber(signal.supertrendValue ?? signal.supertrend);
+  const breakDown = signal.supertrendBreakDown === true || signal.breakDown === true;
+  const closedBelow = close != null && line != null && close < line;
+
+  if (!breakDown && !closedBelow) return null;
+
+  return ruleDecision(
+    "SUPERTREND_BREAK",
+    `supertrend break: 15m close ${close ?? "n/a"} ${closedBelow ? "<" : "broke"} Supertrend ${line ?? "n/a"}`,
+    {
+      interval: expected,
+      candle_close: close,
+      supertrend_value: line,
+    },
+  );
+}
+
+/**
+ * Backwards-compatible alias — the pure numeric evaluator keeps its old name.
+ * New code should call `evaluateExitHierarchy()`.
+ */
+export const evaluateNumericRules = evaluateExitHierarchy;
+
+/**
+ * Full deterministic exit evaluation for one position (priorities 1 and 2).
+ *
+ * 1. Reads the persisted instruction and derives numeric TP/SL overrides.
  * 2. Refreshes stateful flags (trailing arm, OOR timestamp) via state.js.
- * 3. Evaluates the numeric rule ladder.
+ * 3. Walks the strict hierarchy: Priority 1 (TP/SL) → Priority 2 (range bounds).
+ *
+ * Priority 3 (Supertrend 15m) needs a candle feed, so callers that own the market
+ * data pipe run `evaluateSupertrendExit()` when this returns null.
  *
  * @param {object} position - getMyPositions() entry
  * @param {object} managementConfig - config.management
@@ -256,15 +366,23 @@ export function detectExit(position, managementConfig = {}) {
   // State mutations only (trailing arm + OOR bookkeeping) — never an exit here.
   const tracked = refreshPositionState(position.position, position, cfg) ?? trackedBefore;
 
-  return evaluateNumericRules(position, cfg, { tracked, overrides: applied });
+  return evaluateExitHierarchy(position, cfg, { tracked, overrides: applied });
 }
 
 /**
- * Exact, greppable pre-execution log line.
- * Example: `[RULE ENGINE] Auto-closing HYPE/USDC: Rule 5 (Low Yield) — fee/TVL ...`
+ * Exact, greppable pre-execution log line for every exit event.
+ *
+ * Examples:
+ *   `[EXIT] Priority 1: TP hit (+5.00%) — HYPE/USDC`
+ *   `[EXIT] Priority 1: SL hit (-52.00%) — HYPE/USDC`
+ *   `[EXIT] Priority 2: Far Above Range — HYPE/USDC`
+ *   `[EXIT] Priority 2: Far Below Range — HYPE/USDC`
+ *   `[EXIT] Priority 3: Supertrend 15m Candle Break — HYPE/USDC`
  */
-export function formatRuleLog(pair, decision) {
+export function formatExitLog(pair, decision) {
   const label = pair || "position";
-  return `[RULE ENGINE] Auto-closing ${label}: Rule ${decision.rule} (${decision.name}) — ${decision.reason}`;
+  const headline = decision?.headline
+    || (decision?.priority ? `Priority ${decision.priority}: ${decision.name}` : decision?.name || "Exit");
+  return `[EXIT] ${headline} — ${label}`;
 }
 

@@ -1,7 +1,7 @@
 import { getMyPositions, deployPosition } from "./dlmm.js";
 import { getPoolDetail } from "./screening.js";
 import { getTrackedPosition } from "../state.js";
-import { formatRuleLog, ruleDecision } from "../exit-rules.js";
+import { formatExitLog, ruleDecision } from "../exit-rules.js";
 import { config } from "../config.js";
 import { log } from "../logger.js";
 
@@ -171,7 +171,7 @@ function isExecutionSuccess(result) {
  */
 async function closeViaExecutor(position, reason, decision = null) {
   try {
-    if (decision) log("rule_engine", formatRuleLog(position.pair, decision));
+    if (decision) log("rule_engine", formatExitLog(position.pair, decision));
     const { executeTool } = await import("./executor.js");
     return await executeTool("close_position", {
       position_address: position.position,

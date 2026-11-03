@@ -26,8 +26,8 @@ import {
   createLiveMessage,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, confirmPeak, registerExitSignal } from "./state.js";
-import { detectExit, formatRuleLog, ruleDecision, parseInstructionOverrides } from "./exit-rules.js";
+import { getLastBriefingDate, setLastBriefingDate, getTrackedPositions, setPositionInstruction, confirmPeak, registerExitSignal } from "./state.js";
+import { detectExit, evaluateSupertrendExit, formatExitLog, parseInstructionOverrides } from "./exit-rules.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
@@ -38,7 +38,8 @@ import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnable
 import { appendDecision } from "./decision-log.js";
 import { showLpMainMenu, showNewPositionView, showPoolListView, forgetLpMessageView, handleLpCallback, handleLpText } from "./services/lp-menu.js";
 // Import only what we actually need for the new functionality
-import { evaluateEvilPandaCandidate, checkEvilPandaExitConfluence, getEvilPandaRecommendedParams, fetchPriceSeries } from "./tools/evil-panda-enhanced.js";
+import { evaluateEvilPandaCandidate, getEvilPandaRecommendedParams } from "./tools/evil-panda-enhanced.js";
+import { fetchSupertrend15m } from "./tools/chart-indicators.js";
 import { checkAllPositionsForFlip } from "./tools/bid-ask-flipper.js";
 
 import { REPO_ROOT, repoPath } from "./repo-root.js";
@@ -190,15 +191,47 @@ async function executeManagementActions(actionPositions, actionMap, { liveMessag
  * directly. The LLM is never consulted and receives no position evaluation data.
  */
 async function executeRuleClose(position, decision, { liveMessage = null } = {}) {
-  log("rule_engine", formatRuleLog(position.pair, decision));
+  // Exact priority reason, e.g. `[EXIT] Priority 1: TP hit (+5.00%) — HYPE/USDC`
+  log("rule_engine", formatExitLog(position.pair, decision));
   await liveMessage?.toolStart("close_position");
   const res = await executeTool("close_position", {
     position_address: position.position,
-    reason: `Rule ${decision.rule} (${decision.name}): ${decision.reason}`,
+    reason: `${decision.headline || decision.name}: ${decision.reason}`,
   }).catch(e => ({ error: e.message }));
   const ok = res?.success !== false && !res?.error && !res?.blocked;
   await liveMessage?.toolFinish("close_position", res, ok);
-  return `${position.pair}: ${ok ? `closed — Rule ${decision.rule} (${decision.name})` : `close FAILED — ${res?.error || res?.reason || "unknown"}`}`;
+  return `${position.pair}: ${ok ? `closed — ${decision.headline || decision.name}` : `close FAILED — ${res?.error || res?.reason || "unknown"}`}`;
+}
+
+/**
+ * Priority 3 of the exit hierarchy — Supertrend 15m 1-candle break.
+ *
+ * Only consulted when Priority 1 (TP/SL) and Priority 2 (range bounds) produced
+ * nothing: it is the fallback safety net, not a signal generator. RSI/MACD are
+ * never read here (or anywhere else in the exit path).
+ */
+async function getSupertrendExit(position) {
+  if (!position?.base_mint) return null;
+  if (config.exitSafety?.supertrendEnabled === false) return null;
+  try {
+    const signal = await fetchSupertrend15m(position.base_mint, {
+      cacheSec: config.exitSafety?.cacheSec,
+    });
+    return evaluateSupertrendExit(signal);
+  } catch (error) {
+    log("exit_warn", `Supertrend 15m check failed for ${position.pair || position.pool}: ${error.message}`);
+    return null;
+  }
+}
+
+/**
+ * Strict exit evaluation: Priority 1 TP/SL → Priority 2 range bounds →
+ * Priority 3 Supertrend 15m candle break. Returns the first hit or null.
+ */
+export async function detectExitWithSupertrend(position) {
+  const decision = detectExit(position, config.management);
+  if (decision) return decision;
+  return getSupertrendExit(position);
 }
 
 export async function runManagementCycle({ silent = false } = {}) {
@@ -231,29 +264,22 @@ export async function runManagementCycle({ silent = false } = {}) {
       return { ...p, recall: recallForPool(p.pool) };
     });
 
-    // Deterministic rule engine — every exit condition is numeric JS. Management
-    // is the slow cron backstop: raise peak immediately (confirmTicks=1) and act
-    // on detected exits directly. Real-time 2-tick confirmation lives in the fast
-    // poller below. No position data is ever sent to an LLM here.
+    // Strict exit hierarchy — Priority 1 TP/SL → Priority 2 range bounds →
+    // Priority 3 Supertrend 15m candle break. Management is the slow cron
+    // backstop: raise peak immediately (confirmTicks=1) and act on detected exits
+    // directly. Real-time 2-tick confirmation lives in the fast poller below.
+    // RSI/MACD never close a position, and no position data reaches an LLM.
     const exitMap = new Map();
     for (const p of positionData) {
       confirmPeak(p.position, p.pnl_pct, 1);
-      const decision = detectExit(p, config.management);
+      const decision = await detectExitWithSupertrend(p);
       if (decision) {
         exitMap.set(p.position, decision);
-        log("rule_engine", `[RULE ENGINE] ${p.pair}: Rule ${decision.rule} (${decision.name}) matched — ${decision.reason}`);
+        log(
+          "rule_engine",
+          `${formatExitLog(p.pair, decision)} — ${decision.reason}`,
+        );
       }
-    }
-
-    // Evil Panda indicator confluence — deterministic indicator math, merged into
-    // the same exit pipeline so a confluence hit closes the position.
-    try {
-      const pandaExits = await checkEvilPandaExitConditions(positions);
-      for (const [positionAddress, decision] of pandaExits) {
-        if (!exitMap.has(positionAddress)) exitMap.set(positionAddress, decision);
-      }
-    } catch (error) {
-      log("error", `Error checking Evil Panda exit conditions: ${error.message}`);
     }
 
     // ── Deterministic action map (no LLM) ───────────────────────────
@@ -282,14 +308,14 @@ export async function runManagementCycle({ silent = false } = {}) {
       const inRange = p.in_range ? "🟢 IN" : `🔴 OOR ${p.minutes_out_of_range ?? 0}m`;
       const val = config.management.solMode ? `◎${p.total_value_usd ?? "?"}` : `$${p.total_value_usd ?? "?"}`;
       const unclaimed = config.management.solMode ? `◎${p.unclaimed_fees_usd ?? "?"}` : `$${p.unclaimed_fees_usd ?? "?"}`;
-      const statusLabel = act.action === "CLOSE" ? `CLOSE (Rule ${act.rule} ${act.name})` : act.action;
+      const statusLabel = act.action === "CLOSE" ? `CLOSE (${act.headline || act.name})` : act.action;
       let line = `**${p.pair}** | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | PnL: ${p.pnl_pct ?? "?"}% | Yield: ${p.fee_per_tvl_24h ?? "?"}% | ${inRange} | ${statusLabel}`;
       if (p.instruction) {
         const overrides = parseInstructionOverrides(p.instruction);
         const parsed = Object.entries(overrides).map(([k, v]) => `${k}=${v}`).join(", ");
         line += `\nNote: "${p.instruction}"${parsed ? ` (rules: ${parsed})` : " (informational only)"}`;
       }
-      if (act.action === "CLOSE") line += `\nRule ${act.rule} (${act.name}): ${act.reason}`;
+      if (act.action === "CLOSE") line += `\n${act.headline || act.name}: ${act.reason}`;
       if (act.action === "CLAIM") line += `\n→ Claiming fees`;
       return line;
     });
@@ -297,7 +323,7 @@ export async function runManagementCycle({ silent = false } = {}) {
     const needsAction = [...actionMap.values()].filter(a => a.action !== "STAY");
     const actionSummary = needsAction.length > 0
       ? needsAction.map(a => a.action === "CLOSE"
-        ? `CLOSE Rule ${a.rule} (${a.name})${a.reason ? ` — ${a.reason}` : ""}`
+        ? `CLOSE ${a.headline || a.name}${a.reason ? ` — ${a.reason}` : ""}`
         : a.action).join(", ")
       : "no action";
 
@@ -672,7 +698,7 @@ export async function runDeterministicHealthCheck({ silent = false } = {}) {
 
   const ruleLines = list.map((p) => {
     const decision = detectExit(p, config.management);
-    const status = decision ? `Rule ${decision.rule} (${decision.name})` : "STAY";
+    const status = decision ? decision.headline || decision.name : "STAY";
     const range = p.in_range ? "IN" : `OOR ${p.minutes_out_of_range ?? 0}m`;
     return `- ${p.pair}: ${status} | PnL ${p.pnl_pct ?? "?"}% | ${range} | fees ${cur}${p.unclaimed_fees_usd ?? "?"}`;
   });
@@ -750,11 +776,11 @@ export function startCronJobs() {
   }, { timezone: 'UTC' });
 
   // Fast PnL poller — the real-time exit path between management cycles.
-  // 100% deterministic: `detectExit()` walks the numeric rule ladder and the Evil
-  // Panda confluence (numeric indicators) supplies rule 7. Exits require
-  // `confirmTicks` consecutive confirming polls (registerExitSignal) so a single
-  // noisy tick can't close a position; a confirmed rule fires the close directly
-  // in code — no LLM is consulted and no position data is sent to a model.
+  // 100% deterministic and strictly hierarchical: Priority 1 TP/SL → Priority 2
+  // range bounds → Priority 3 Supertrend 15m candle break. RSI/MACD/BB never close
+  // a position. Exits require `confirmTicks` consecutive confirming polls
+  // (registerExitSignal) so a single noisy tick can't close a position; a confirmed
+  // rule fires the close directly in code — no LLM, no position data to a model.
   const pnlPollMs = Math.max(1, Number(config.pnl.pollIntervalSec ?? 3)) * 1000;
   const confirmTicks = Math.max(1, Number(config.pnl.confirmTicks ?? 2));
   let _pnlPollBusy = false;
@@ -768,27 +794,20 @@ export function startCronJobs() {
       for (const p of result.positions) {
         confirmPeak(p.position, p.pnl_pct, confirmTicks);
 
-        // Deterministic detection: numeric rule ladder first, then the Evil Panda
-        // indicator confluence as rule 7.
-        let decision = detectExit(p, config.management);
-        if (!decision) {
-          const panda = await getPandaExitSignal(p);
-          if (panda?.signal) {
-            decision = { ...ruleDecision("EVIL_PANDA", panda.reason), signal: panda.signal };
-          }
-        }
+        // Strict hierarchy: Priority 1 TP/SL → Priority 2 range bounds →
+        // Priority 3 Supertrend 15m candle break. RSI/MACD never close a position.
+        const decision = await detectExitWithSupertrend(p);
+        const signal = decision?.rule_key ?? null;
 
-        const signal = decision ? (decision.signal || `RULE_${decision.rule}`) : null;
-
-        // Require N consecutive confirming ticks before acting. Panda confluence is
-        // stricter, so it uses its own (higher) confirmation threshold.
-        const requiredTicks = signal === "EVIL_PANDA"
-          ? Math.max(1, Number(config.panda?.confirmTicks ?? confirmTicks))
+        // Require N consecutive confirming ticks before acting. The Supertrend
+        // safety net is the loosest signal, so it gets its own (higher) threshold.
+        const requiredTicks = signal === "SUPERTREND_BREAK"
+          ? Math.max(1, Number(config.exitSafety?.confirmTicks ?? confirmTicks))
           : confirmTicks;
         const { fire } = registerExitSignal(p.position, signal, requiredTicks);
         if (!decision || !fire) continue;
 
-        log("rule_engine", `[RULE ENGINE] ${signal} confirmed after ${requiredTicks} ticks for ${p.pair} — executing close`);
+        log("rule_engine", `${formatExitLog(p.pair, decision)} — confirmed after ${requiredTicks} ticks`);
         // Hold the management lock so the cron cycle can't double-act on this position.
         _managementBusy = true;
         try {
@@ -2274,65 +2293,10 @@ Focus on: hold duration, entry/exit timing, what win rates look like, whether sc
 }
 
 /**
- * Fetch a real price series and evaluate the Evil Panda indicator confluence.
- * Returns { signal, reason } when a confluence exit fires, otherwise null.
- * @param {Object} position - Position from getMyPositions (needs .pool)
- */
-async function getPandaExitSignal(position) {
-  if (!config.panda?.enabled || !position?.pool) return null;
-  try {
-    const series = await fetchPriceSeries({
-      pool_address: position.pool,
-      timeframe: config.panda.timeframe,
-      limit: config.panda.candles,
-      cacheSec: config.panda.cacheSec,
-    });
-    if (!series || !Array.isArray(series.prices) || series.prices.length < 35) return null;
-
-    // Signature: checkEvilPandaExitConfluence(prices[], currentPrice)
-    const result = checkEvilPandaExitConfluence(series.prices, series.currentPrice);
-    if (!result?.shouldExit) return null;
-
-    return {
-      signal: "EVIL_PANDA",
-      reason: `${result.reason} [${series.source}, ${series.prices.length} candles ${series.timeframe}]`,
-    };
-  } catch (error) {
-    log("panda_warn", `Panda exit check failed for ${position.pair || position.pool}: ${error.message}`);
-    return null;
-  }
-}
-
-/**
- * Check active positions for Evil Panda exit confluences.
- * Returns a Map(position_address -> rule decision) so the caller feeds the normal
- * deterministic exit pipeline (executeRuleClose) instead of only alerting.
- * @param {Array} positions - List of current positions
- * @returns {Promise<Map<string,object>>}
- */
-async function checkEvilPandaExitConditions(positions) {
-  const exits = new Map();
-  if (!Array.isArray(positions) || positions.length === 0) return exits;
-  if (!config.panda?.enabled) return exits;
-
-  for (const position of positions) {
-    try {
-      const tracked = getTrackedPosition(position.position);
-      if (!tracked || tracked.closed) continue;
-
-      const panda = await getPandaExitSignal(position);
-      if (panda?.signal) {
-        exits.set(position.position, { ...ruleDecision("EVIL_PANDA", panda.reason), signal: panda.signal });
-      }
-    } catch (error) {
-      log("error", `Error checking Evil Panda exit condition for position ${position.position}: ${error.message}`);
-    }
-  }
-  return exits;
-}
-
-/**
- * Enhanced pool command handler with Evil Panda analysis
+ * Enhanced pool command handler with Evil Panda analysis.
+ *
+ * Reporting only — the screening criteria and recommended DLMM parameters are
+ * informational. RSI/MACD confluence no longer closes positions (see exit-rules.js).
  * @param {Object} pool - Pool data
  */
 async function sendEvilPandaPoolAnalysis(pool) {

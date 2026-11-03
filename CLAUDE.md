@@ -81,7 +81,7 @@ Autonomous DLMM liquidity provider agent for Meteora pools on Solana.
 |---|---:|---|
 | **Entry / orchestration** | | |
 | `index.js` | ~2016 | Daemon. Cron, REPL, Telegram bot, briefing, HiveMind bootstrap, PnL poller, deterministic exit execution, single-candidate skip rule, settings menu. **All** automatic cycles start here. |
-| `exit-rules.js` | ~300 | **The only exit engine.** Pure numeric rule ladder (1 stop-loss, 2 take-profit, 3 pumped-above-range, 4 out-of-range, 5 low-yield, 6 trailing TP, 7 Evil Panda, 8 instruction time limit, 9 flipper rebalance). `detectExit(position, mgmtConfig)` → decision; `formatRuleLog()` emits `[RULE ENGINE] Auto-closing <pair>: Rule N (Name)`. No LLM imports. |
+| `exit-rules.js` | ~380 | **The only exit engine — a strict 3-step hierarchy.** Priority 1 TP/SL (1 stop-loss, 2 take-profit, 3 trailing TP), Priority 2 range bounds (4 far above, 5 far below), Priority 3 Supertrend 15m 1-candle break (6). `detectExit()` evaluates 1–2 synchronously; `evaluateSupertrendExit()` is the priority-3 safety net. `formatExitLog()` emits `[EXIT] Priority N: <reason> — <pair>`. RSI/MACD/Bollinger are **not** exit inputs. No LLM imports. |
 | `agent.js` | 416 | `agentLoop(goal, maxSteps, history, agentType, model, maxOut, opts)`. The ReAct loop. Provider fallback, JSON repair, once-per-session tool locks, no-tool retries, `onToolStart`/`onToolFinish` callbacks for live Telegram messages. |
 | `cli.js` | 676 | One-shot CLI; every tool exposed as a subcommand. Also writes a `~/.meridian/SKILL.md` at startup for agent discovery. Loads `.env`/`user-config.json` from `~/.meridian/` if present, else from cwd. |
 | `setup.js` | ~750 | Interactive first-run wizard. Three presets (degen/moderate/safe) + custom. Covers strategy, screening filters, position sizing, trailing TP, per-role models. |
@@ -97,7 +97,7 @@ Autonomous DLMM liquidity provider agent for Meteora pools on Solana.
 | `tools/token.js` | 209 | `getTokenInfo` (Jupiter datapi), `getTokenHolders` (top 100 + filter pool-tagged), `getTokenNarrative` (Jupiter ChainInsight). Cross-references smart wallets from `smart-wallets.json`. |
 | `tools/study.js` | 152 | `studyTopLPers` → Agent Meridian `/top-lp` + `/study-top-lp`. Returns ranked LPer patterns (avg hold, win rate, preferred strategy). |
 | `tools/agent-meridian.js` | 110 | `agentMeridianJson(path, opts)` with retry/backoff. Default base = `https://api.agentmeridian.xyz/api`. |
-| `tools/chart-indicators.js` | 299 | `confirmIndicatorPreset({mint, side})`. Eight presets: `supertrend_break`, `rsi_reversal`, `bollinger_reversion`, `rsi_plus_supertrend`, `supertrend_or_rsi`, `bb_plus_rsi`, `fibo_reclaim`, `fibo_reject`. Fetches from Agent Meridian `/chart-indicators/{mint}`. |
+| `tools/chart-indicators.js` | ~380 | `confirmIndicatorPreset({mint, side})` — entry gate. Eight presets: `supertrend_break`, `rsi_reversal`, `bollinger_reversion`, `rsi_plus_supertrend`, `supertrend_or_rsi`, `bb_plus_rsi`, `fibo_reclaim`, `fibo_reject`. `fetchSupertrend15m(mint)` — 15m Supertrend snapshot for exit priority 3 (60 s cache, Supertrend fields only). Fetches from Agent Meridian `/chart-indicators/{mint}`. |
 | **Persistence (all `.json` at repo root)** | | |
 | `state.js` | 513 | `trackPosition`, `markOutOfRange/InRange`, `recordClaim`, `recordClose`, `setPositionInstruction`, `updatePnlAndCheckExits` (the deterministic rules: STOP_LOSS, TRAILING_TP, OUT_OF_RANGE, LOW_YIELD), `getStateSummary`. `syncOpenPositions` reconciles local state with on-chain after 5 min grace. |
 | `pool-memory.js` | 405 | Per-pool deploy history + rolling 48-snapshot trend (5min × 4h). Computes `avg_pnl_pct`, `win_rate`, `adjusted_win_rate` (excludes OOR pumps). Cooldown logic: low yield → 4h pool cooldown, 3× OOR closes → 12h pool+token cooldown, optional repeat-deploy cooldown (configurable trigger count/hours/min fee yield/scope). `recordPositionSnapshot`, `recallForPool` for prompt injection. |
@@ -196,23 +196,25 @@ The management cycle is **mostly deterministic in JS, LLM only for the hard case
 
 1. `getMyPositions({ force: true })` → snapshot.
 2. `recordPositionSnapshot` per pool.
-3. For every position: `confirmPeak(...)` then `detectExit(position, config.management)` (`exit-rules.js`). The engine evaluates the numeric ladder in priority order:
-   - Rule 1 stop-loss, Rule 2 take-profit, Rule 6 trailing TP, Rule 3 pumped far above range,
-     Rule 4 out-of-range wait, Rule 5 low yield, Rule 8 instruction time limit.
+3. For every position: `confirmPeak(...)` then `detectExitWithSupertrend(p)` (`index.js`), which walks the strict hierarchy of `exit-rules.js`:
+   - **Priority 1 — TP/SL:** `pnl_pct` vs `takeProfitPct` / `stopLossPct` (trailing TP is the same profit-taking family).
+   - **Priority 2 — Range bounds:** active bin far above (`> upper + outOfRangeBinsToClose`) or far below (`< lower − outOfRangeBinsToClose`); a data-gap fallback keeps the `outOfRangeWaitMinutes` exit when bin geometry is missing.
+   - **Priority 3 — Supertrend 15m:** only when 1–2 returned nothing, `fetchSupertrend15m()` + `evaluateSupertrendExit()` close on a single closed 15m candle breaking the Supertrend line.
    - `refreshPositionState()` (state.js) only updates bookkeeping (trailing arm + `out_of_range_since`).
-   - Evil Panda confluence, when enabled, adds Rule 7 through the same pipeline.
+   - **RSI(2) / MACD / Bollinger never close a position** — the Evil Panda confluence was removed from the exit path.
 4. Positions needing `CLAIM` if `unclaimed_fees_usd >= minClaimAmount`.
-5. **No LLM is invoked in management.** Each rule close logs
-   `[RULE ENGINE] Auto-closing <pair>: Rule N (Name) — <numbers>` and then calls
+5. **No LLM is invoked in management.** Each close logs
+   `[EXIT] Priority N: <reason> — <pair>` (e.g. `[EXIT] Priority 1: TP hit (+5.20%) — HYPE/USDC`) and then calls
    `executeTool("close_position", …)` directly. The hourly health check is a deterministic summary.
 
 **Instruction notes** (`/set <n> <note>`) are parsed deterministically by
 `parseInstructionOverrides()`: `tp <x>%`, `sl <x>%`, `close after <n>m|h`, `min yield <x>%`,
-`hold until <x>% profit`.
-Unparsed text is informational only — it is never sent to a model.
+`hold until <x>% profit`. Only `tp` / `sl` change the exit hierarchy; the rest are
+parsed for the report and are informational only — never sent to a model.
 
-**Real-time exits** come from the 3s PnL poller: `detectExit()` + `registerExitSignal()`
-require `pnlConfirmTicks` consecutive confirming polls before the close fires.
+**Real-time exits** come from the 3s PnL poller: the same `detectExitWithSupertrend()` +
+`registerExitSignal()` require `pnlConfirmTicks` consecutive confirming polls before the
+close fires (`config.exitSafety.confirmTicks` for the Supertrend fallback).
 
 ### The screening cycle (multi-stage pipeline)
 
@@ -245,9 +247,9 @@ deployPosition()                   tools/dlmm.js
 
 manage cycle (every N min) — 100% deterministic, no LLM
    ├─ recordPositionSnapshot per pool
-   ├─ detectExit (exit-rules.js) → Rule 1..8 numeric ladder (trailing arm/OOR state refreshed)
-   ├─ Evil Panda confluence → Rule 7
-   ├─ log `[RULE ENGINE] Auto-closing <pair>: Rule N (Name)` → executeTool("close_position")
+   ├─ detectExitWithSupertrend → P1 TP/SL → P2 range bounds → P3 Supertrend 15m
+   │   (trailing arm/OOR state refreshed; RSI/MACD are NOT exit inputs)
+   ├─ log `[EXIT] Priority N: <reason> — <pair>` → executeTool("close_position")
    └─ on close: recordClose() → recordPerformance() in lessons.js
                  ├─ recordPoolDeploy (pool-memory.json)
                  ├─ derive lesson (PREFER/AVOID/WORKED/FAILED)
