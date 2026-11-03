@@ -79,6 +79,13 @@ import {
   selectAxisTicks,
 } from "../services/chartService.js";
 import { config } from "../config.js";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+import { isTimeoutError, TimeoutError, withTimeout } from "../utils/timeout.js";
+import { pollBackoffMs } from "../telegram.js";
+
+const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 let passed = 0;
 
@@ -1182,6 +1189,128 @@ await testAsync("computeBinRange keeps below-price bounds under the active bin",
 
   // A swapped pair (-20 -80) is rejected instead of producing a huge upside.
   await assert.rejects(() => computeBinRange({ snapshot, downsidePct: 20, upperPct: -80 }), /Invalid below-price range/);
+});
+
+console.log("\n=== Network timeouts & Telegram polling resilience ===");
+
+await testAsync("withTimeout releases slow work with a TimeoutError", async () => {
+  // Fast work passes through untouched.
+  assert.equal(await withTimeout(Promise.resolve(42), 250, "fast"), 42);
+
+  // Stalled work is abandoned at the deadline instead of blocking the caller.
+  const started = Date.now();
+  await assert.rejects(
+    () => withTimeout(new Promise(() => {}), 60, "stalled rpc"),
+    (error) => {
+      assert.equal(error instanceof TimeoutError, true);
+      assert.equal(error.name, "TimeoutError");
+      assert.equal(error.code, "ETIMEDOUT");
+      assert.equal(error.label, "stalled rpc");
+      assert.match(error.message, /stalled rpc timed out after 60ms/);
+      return true;
+    },
+  );
+  assert.ok(Date.now() - started < 1_000, "the deadline must fire immediately");
+
+  // Rejections and disabled guards still propagate.
+  await assert.rejects(() => withTimeout(Promise.reject(new Error("rpc down")), 250, "rpc"), /rpc down/);
+  assert.equal(await withTimeout(Promise.resolve("ok"), 0, "disabled"), "ok");
+
+  // Classification used by every caller.
+  assert.equal(isTimeoutError(new TimeoutError("x", 10)), true);
+  assert.equal(isTimeoutError(Object.assign(new Error("aborted"), { name: "AbortError" })), true);
+  assert.equal(isTimeoutError(Object.assign(new Error("boom"), { code: "ETIMEDOUT" })), true);
+  assert.equal(isTimeoutError(new Error("boom")), false);
+  assert.equal(isTimeoutError(null), false);
+});
+
+test("pollBackoffMs grows exponentially and caps at 60s", () => {
+  const fixed = { random: () => 0 };
+  assert.equal(pollBackoffMs(1, fixed), 1_000);
+  assert.equal(pollBackoffMs(2, fixed), 2_000);
+  assert.equal(pollBackoffMs(3, fixed), 4_000);
+  assert.equal(pollBackoffMs(4, fixed), 8_000);
+  assert.equal(pollBackoffMs(10, fixed), 60_000);
+  // Jitter can never push a delay past the cap.
+  assert.equal(pollBackoffMs(99, { random: () => 0.999 }), 60_000);
+  // Junk input still yields a usable delay.
+  assert.ok(pollBackoffMs(undefined) >= 1_000);
+});
+
+test("telegram polling acks callbacks first and never awaits a handler", () => {
+  const src = fs.readFileSync(path.join(ROOT, "telegram.js"), "utf8");
+
+  // Immediate acknowledgement, before any view work is dispatched.
+  const ackAt = src.indexOf("answerCallbackQuery(callback.id)");
+  const dispatchAt = src.indexOf("dispatchUpdate(onMessage, {");
+  assert.ok(ackAt > 0, "the poll loop must answer every callback query");
+  assert.ok(dispatchAt > ackAt, "the ack must happen before the handler runs");
+
+  // Non-blocking command queue: handlers are dispatched, never awaited inline.
+  assert.equal(/await onMessage\(/.test(src), false, "the poll loop must not await handlers");
+  assert.match(src, /function dispatchUpdate\(/);
+  assert.match(src, /Handler failed for/);
+
+  // Exponential backoff auto-reconnect around the polling engine.
+  assert.match(src, /export function pollBackoffMs/);
+  assert.match(src, /reconnecting in \$\{delay\}ms/);
+  assert.match(src, /Polling loop exited unexpectedly/);
+  assert.match(src, /if \(_pollLoopActive\) return;/);
+
+  // Every outbound Bot API call is abortable, and duplicate acks are suppressed.
+  assert.match(src, /function telegramFetch\(/);
+  assert.match(src, /AbortSignal\.timeout\(/);
+  assert.match(src, /claimCallbackAnswer/);
+});
+
+test("lp-menu bounds every /pool RPC, API and canvas call at 5s", () => {
+  const src = fs.readFileSync(path.join(ROOT, "services/lp-menu.js"), "utf8");
+  assert.match(src, /const NETWORK_TIMEOUT_MS = 5_000;/);
+  assert.match(src, /const TIMEOUT_NOTE = "⚠️ Network timeout, please try again";/);
+  assert.match(src, /function networkDeadline\(/);
+  assert.match(src, /await sendHTML\(TIMEOUT_NOTE\)/);
+
+  for (const label of [
+    "wallet balances",
+    "candidate scan",
+    "trending scan",
+    "pool metadata",
+    "pool snapshot",
+    "token pool search",
+    "address lookup",
+    "positions read",
+    "liquidity chart",
+    "pool refresh",
+  ]) {
+    assert.ok(src.includes(`"${label}"`), `network deadline label "${label}" missing`);
+  }
+  const guarded = (src.match(/networkDeadline\(/g) || []).length;
+  assert.ok(guarded >= 10, `expected every network call to be guarded (found ${guarded})`);
+});
+
+test("index.js threads the interactive deadline through /pool and the command queue", () => {
+  const src = fs.readFileSync(path.join(ROOT, "index.js"), "utf8");
+  assert.match(src, /const NETWORK_TIMEOUT_MS = 5_000;/);
+  assert.match(src, /const TIMEOUT_MESSAGE = "⚠️ Network timeout, please try again";/);
+  assert.match(src, /runScreeningCycle\(\{ useLLM: true, ioTimeoutMs: NETWORK_TIMEOUT_MS \}\)/);
+  assert.match(src, /ioTimeoutMs = 0 \} = \{\}\)/);
+  // Every network read inside the interactive screening cycle is bounded.
+  for (const label of [
+    "positions read",
+    "wallet read",
+    "candidate scan",
+    "smart wallet check",
+    "token narrative",
+    "token info",
+    "active bin",
+  ]) {
+    assert.ok(src.includes(`"${label}"`), `interactive screening read "${label}" is not bounded`);
+  }
+  assert.match(src, /if \(scanTimedOut\)/);
+  // Queued commands are replayed after a cycle, not only in the REPL path.
+  const drains = (src.match(/drainTelegramQueue\(\)/g) || []).length;
+  assert.ok(drains >= 3, `expected the queue to drain after each cycle (found ${drains})`);
+  assert.match(src, /Queued command failed/);
 });
 
 console.log(`\n✓ ${passed} LP-menu tests passed`);

@@ -25,6 +25,7 @@
 import { PublicKey } from "@solana/web3.js";
 import { config } from "../config.js";
 import { log } from "../logger.js";
+import { isTimeoutError, withTimeout } from "../utils/timeout.js";
 import { getWalletBalances } from "../tools/wallet.js";
 import { getTopCandidates } from "../tools/screening.js";
 import {
@@ -52,6 +53,15 @@ const POOL_LIST_LIMIT = 6;
 const POOL_LIST_TTL_MS = 60_000;
 const WALLET_TTL_MS = 30_000;
 const SESSION_TTL_MS = 30 * 60_000;
+
+/**
+ * Hard ceiling for every RPC / Meteora / Jupiter / canvas call in this menu.
+ * A stalled dependency must never leave the bot looking frozen: the view gives up
+ * after 5 s, tells the user, and the Telegram poll loop is already free to serve
+ * the next command (see telegram.js#dispatchUpdate).
+ */
+const NETWORK_TIMEOUT_MS = 5_000;
+const TIMEOUT_NOTE = "⚠️ Network timeout, please try again";
 
 // ─── Formatting helpers ───────────────────────────────────────────
 export function escapeHtml(value) {
@@ -176,10 +186,13 @@ async function getWalletSnapshot({ force = false } = {}) {
     return _walletCache.data;
   }
   try {
-    const data = await getWalletBalances();
+    const data = await networkDeadline(getWalletBalances(), "wallet balances");
     _walletCache = { at: Date.now(), data };
     return data;
   } catch (error) {
+    if (await reportTimeout("wallet balances", error)) {
+      return _walletCache.data || { wallet: null, sol: 0, sol_usd: 0, tokens: [] };
+    }
     log("lp_ui_warn", `Wallet snapshot failed: ${error.message}`);
     return _walletCache.data || { wallet: null, sol: 0, sol_usd: 0, tokens: [] };
   }
@@ -190,7 +203,8 @@ const _activeBinCache = new Map(); // address -> { at, sol, binId, binStep, base
 const ACTIVE_BIN_TTL_MS = 60_000;
 const ACTIVE_BIN_BUDGET_MS = 3_500;
 
-async function withTimeout(promise, ms) {
+/** Non-throwing deadline: resolves `null` when the budget is exceeded. */
+async function softTimeout(promise, ms) {
   let timer = null;
   try {
     return await Promise.race([
@@ -200,6 +214,25 @@ async function withTimeout(promise, ms) {
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+/**
+ * Bound a network call by {@link NETWORK_TIMEOUT_MS}. Rejects with TimeoutError,
+ * which the callers turn into {@link TIMEOUT_NOTE}.
+ */
+function networkDeadline(promise, label) {
+  return withTimeout(promise, NETWORK_TIMEOUT_MS, label);
+}
+
+/**
+ * Tell the user a dependency timed out. Returns true when `error` was a timeout
+ * so callers can pick the timeout note instead of a raw error message.
+ */
+async function reportTimeout(label, error) {
+  if (!isTimeoutError(error)) return false;
+  log("lp_ui_warn", `${label} timed out after ${NETWORK_TIMEOUT_MS}ms — releasing the UI`);
+  await sendHTML(TIMEOUT_NOTE).catch(() => {});
+  return true;
 }
 
 /**
@@ -213,7 +246,10 @@ async function enrichPoolLiquidity(pools) {
     if (cached && Date.now() - cached.at < ACTIVE_BIN_TTL_MS) {
       return { ...pool, ...cached.data };
     }
-    const snapshot = await withTimeout(getPoolSnapshot(pool.address).catch(() => null), ACTIVE_BIN_BUDGET_MS);
+    const snapshot = await softTimeout(
+      withTimeout(getPoolSnapshot(pool.address), ACTIVE_BIN_BUDGET_MS, "active bin").catch(() => null),
+      ACTIVE_BIN_BUDGET_MS,
+    );
     if (!snapshot) return pool;
     const data = {
       activeBinSol: snapshot.activeBinSol,
@@ -257,7 +293,7 @@ export async function loadMenuPools({ force = false } = {}) {
   if (!force && _poolList.pools.length > 0 && Date.now() - _poolList.at < POOL_LIST_TTL_MS) {
     return _poolList.pools;
   }
-  const top = await getTopCandidates({ limit: POOL_LIST_LIMIT });
+  const top = await networkDeadline(getTopCandidates({ limit: POOL_LIST_LIMIT }), "candidate scan");
   const all = (top?.candidates || [])
     .slice(0, POOL_LIST_LIMIT)
     .map((candidate, index) => toPoolEntry(candidate, index))
@@ -1233,8 +1269,8 @@ export async function showPoolListView({ messageId = null, force = false, note =
   try {
     pools = await loadMenuPools({ force });
   } catch (error) {
-    scanError = error.message;
-    log("lp_ui_warn", `Screening failed: ${error.message}`);
+    scanError = (await reportTimeout("screening scan", error)) ? TIMEOUT_NOTE : error.message;
+    if (scanError !== TIMEOUT_NOTE) log("lp_ui_warn", `Screening failed: ${error.message}`);
   }
   if (sort === "volume") {
     pools = [...pools].sort((a, b) => Number(b?.volume ?? 0) - Number(a?.volume ?? 0));
@@ -1299,11 +1335,11 @@ export async function showTrendingView({ messageId = null, force = false, note =
   let pools = [];
   let scanError = null;
   try {
-    const result = await getTopTrendingPools({ force });
+    const result = await networkDeadline(getTopTrendingPools({ force }), "trending scan");
     pools = tokenPoolEntries(result?.pools);
   } catch (error) {
-    scanError = error.message;
-    log("lp_ui_warn", `Trending scan failed: ${error.message}`);
+    scanError = (await reportTimeout("trending scan", error)) ? TIMEOUT_NOTE : error.message;
+    if (scanError !== TIMEOUT_NOTE) log("lp_ui_warn", `Trending scan failed: ${error.message}`);
   }
   if (session) session.pools = pools;
 
@@ -1363,15 +1399,20 @@ async function attachLiquidityChart(msg, session, view) {
 
   let buffer = null;
   try {
-    buffer = await chart.generateLiquidityDistributionChart(
-      {
-        address: pool.address,
-        baseSymbol: pool.baseSymbol ?? null,
-        quoteSymbol: pool.quoteSymbol ?? null,
-      },
-      range,
+    // Canvas + bin fetch: bounded so a slow RPC can never freeze the dashboard.
+    buffer = await networkDeadline(
+      chart.generateLiquidityDistributionChart(
+        {
+          address: pool.address,
+          baseSymbol: pool.baseSymbol ?? null,
+          quoteSymbol: pool.quoteSymbol ?? null,
+        },
+        range,
+      ),
+      "liquidity chart",
     );
   } catch (error) {
+    if (await reportTimeout("liquidity chart", error)) return null;
     log("lp_ui_warn", `Liquidity chart skipped: ${error.message}`);
     return null;
   }
@@ -1447,12 +1488,16 @@ export async function showPositionsView(msg, { force = false, messageId = null }
   try {
     // Lazy import: keeps this module light and avoids pulling the SDK wrapper in tests.
     const { getMyPositions } = await import("../tools/dlmm.js");
-    const snapshot = await getMyPositions({ force, silent: true });
+    const snapshot = await networkDeadline(getMyPositions({ force, silent: true }), "positions read");
     if (snapshot?.error) note = snapshot.error;
     positions = Array.isArray(snapshot?.positions) ? snapshot.positions : [];
   } catch (error) {
-    note = `Could not read positions: ${error.message}`;
-    log("lp_ui_warn", `Positions view failed: ${error.message}`);
+    if (await reportTimeout("positions read", error)) {
+      note = TIMEOUT_NOTE;
+    } else {
+      note = `Could not read positions: ${error.message}`;
+      log("lp_ui_warn", `Positions view failed: ${error.message}`);
+    }
   }
   const wallet = await getWalletSnapshot();
   return presentHubView(msg, renderPositions({ positions, wallet, note }), { messageId });
@@ -1722,13 +1767,22 @@ export async function openPoolByAddress(msg, address, { quiet = false } = {}) {
 
   if (!entry.name) {
     const [meta, snapshot] = await Promise.all([
-      getPoolMetadata(address).catch(() => null),
-      getPoolSnapshot(address).catch((error) => {
+      networkDeadline(getPoolMetadata(address), "pool metadata").catch((error) => {
+        if (isTimeoutError(error)) log("lp_ui_warn", `Pool metadata timed out after ${NETWORK_TIMEOUT_MS}ms`);
+        return null;
+      }),
+      networkDeadline(getPoolSnapshot(address), "pool snapshot").catch(async (error) => {
+        if (await reportTimeout("pool snapshot", error)) {
+          note = TIMEOUT_NOTE;
+          return null;
+        }
         note = `Could not read the pool on-chain: ${error.message}`;
         return null;
       }),
     ]);
     if (!snapshot && !meta) {
+      // A timeout was already reported to the user — don't chain another scan.
+      if (note === TIMEOUT_NOTE) return false;
       if (!quiet) {
         await showPoolListView({ msg, messageId: msg.messageId, note: `Pool ${address.slice(0, 8)}… is not readable.` });
       }
@@ -1788,10 +1842,14 @@ export async function openTokenByMint(msg, tokenMint, { force = false, messageId
   let result = null;
   let note = null;
   try {
-    result = await getPoolsByTokenMint(mint, { force });
+    result = await networkDeadline(getPoolsByTokenMint(mint, { force }), "token pool search");
   } catch (error) {
-    note = `Pool search failed: ${error.message}`;
-    log("lp_ui_warn", `Token pool search failed for ${mint.slice(0, 8)}: ${error.message}`);
+    note = (await reportTimeout("token pool search", error))
+      ? TIMEOUT_NOTE
+      : `Pool search failed: ${error.message}`;
+    if (note !== TIMEOUT_NOTE) {
+      log("lp_ui_warn", `Token pool search failed for ${mint.slice(0, 8)}: ${error.message}`);
+    }
     result = { tokenMint: mint, symbol: null, pools: [], totalPools: 0, solPools: 0, usablePools: 0 };
   }
 
@@ -1822,8 +1880,11 @@ export async function openAddressQuery(msg, address) {
 
   let result = null;
   try {
-    result = await getPoolsByTokenMint(cleaned);
+    result = await networkDeadline(getPoolsByTokenMint(cleaned), "address lookup");
   } catch (error) {
+    if (await reportTimeout("address lookup", error)) {
+      return { kind: "unknown", address: cleaned, timedOut: true };
+    }
     log("lp_ui_warn", `Address lookup failed for ${cleaned.slice(0, 8)}: ${error.message}`);
   }
   if (result?.pools?.length) {
@@ -1963,7 +2024,10 @@ export async function handleLpCallback(msg) {
     await ack("Refreshing…");
     if (session.pool?.address) {
       try {
-        const snapshot = await getPoolSnapshot(session.pool.address);
+        const snapshot = await networkDeadline(
+          getPoolSnapshot(session.pool.address),
+          "pool refresh",
+        );
         session.pool.activeBinId = snapshot.activeBinId;
         session.pool.activeBinSol = snapshot.activeBinSol;
         session.pool.activePrice = snapshot.activePrice;

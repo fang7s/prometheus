@@ -1,8 +1,20 @@
 import fs from "fs";
 import { log } from "./logger.js";
 import { repoPath } from "./repo-root.js";
+import { isTimeoutError } from "./utils/timeout.js";
 
 const USER_CONFIG_PATH = repoPath("user-config.json");
+
+// ─── Resiliency knobs ────────────────────────────────────────────
+/** Outbound Bot API calls (sendMessage/edit/answer) never hang longer than this. */
+const TELEGRAM_HTTP_TIMEOUT_MS = 15_000;
+/** getUpdates long-poll window. The server holds the request for 30 s. */
+const POLL_WINDOW_TIMEOUT_MS = 40_000;
+/** Exponential backoff for polling failures (fetch failed / TELEGRAM_ERROR). */
+const POLL_BACKOFF_BASE_MS = 1_000;
+const POLL_BACKOFF_MAX_MS = 60_000;
+/** A handler slower than this is reported (it no longer blocks the poll loop). */
+const SLOW_HANDLER_WARN_MS = 5_000;
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN || null;
 const BASE  = TOKEN ? `https://api.telegram.org/bot${TOKEN}` : null;
@@ -16,6 +28,8 @@ const ALLOWED_USER_IDS = new Set(
 let chatId = null;
 let _offset  = 0;
 let _polling = false;
+let _pollLoopActive = false;
+let _pollGeneration = 0;
 let _liveMessageDepth = 0;
 let _warnedMissingChatId = false;
 let _warnedMissingAllowedUsers = false;
@@ -96,10 +110,18 @@ export function isEnabled() {
   return !!TOKEN;
 }
 
+/**
+ * `fetch` with a hard deadline. `AbortSignal.timeout` aborts the socket, so a
+ * stalled Bot API connection can never wedge the caller.
+ */
+async function telegramFetch(url, { timeoutMs = TELEGRAM_HTTP_TIMEOUT_MS, ...init } = {}) {
+  return fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+}
+
 async function postTelegram(method, body) {
   if (!TOKEN || !chatId) return null;
   try {
-    const res = await fetch(`${BASE}/${method}`, {
+    const res = await telegramFetch(`${BASE}/${method}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ chat_id: chatId, ...body }),
@@ -123,7 +145,7 @@ async function postTelegram(method, body) {
 async function postTelegramRaw(method, body) {
   if (!TOKEN) return null;
   try {
-    const res = await fetch(`${BASE}/${method}`, {
+    const res = await telegramFetch(`${BASE}/${method}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -208,8 +230,30 @@ export async function editHTMLWithButtons(html, messageId, inlineKeyboard) {
   });
 }
 
+// Telegram accepts exactly ONE answer per callback query; a second one returns
+// an error. The poll loop acks immediately (silent, stops the spinner) and the
+// view handlers may ack again with a toast — the first call wins.
+const _answeredCallbacks = new Map(); // callback id -> timestamp
+const ANSWERED_CALLBACK_TTL_MS = 5 * 60_000;
+
+function claimCallbackAnswer(callbackQueryId) {
+  const id = String(callbackQueryId);
+  const now = Date.now();
+  for (const [key, at] of _answeredCallbacks) {
+    if (now - at > ANSWERED_CALLBACK_TTL_MS) _answeredCallbacks.delete(key);
+  }
+  if (_answeredCallbacks.has(id)) return false;
+  _answeredCallbacks.set(id, now);
+  return true;
+}
+
+/**
+ * Answer an inline-button callback. Safe to call multiple times per query — only
+ * the first call reaches Telegram, so handlers stay idempotent.
+ */
 export async function answerCallbackQuery(callbackQueryId, text = "") {
   if (!TOKEN || !callbackQueryId) return null;
+  if (!claimCallbackAnswer(callbackQueryId)) return null;
   return postTelegramRaw("answerCallbackQuery", {
     callback_query_id: callbackQueryId,
     ...(text ? { text: String(text).slice(0, 200) } : {}),
@@ -221,7 +265,12 @@ async function postTelegramMultipart(method, form) {
   if (!TOKEN || !chatId) return null;
   if (typeof FormData === "undefined" || typeof Blob === "undefined") return null;
   try {
-    const res = await fetch(`${BASE}/${method}`, { method: "POST", body: form });
+    const res = await telegramFetch(`${BASE}/${method}`, {
+      method: "POST",
+      body: form,
+      // Photo uploads are slower than JSON calls.
+      timeoutMs: TELEGRAM_HTTP_TIMEOUT_MS * 2,
+    });
     if (!res.ok) {
       const err = await res.text();
       if (res.status === 401) {
@@ -464,46 +513,123 @@ export async function createLiveMessage(title, intro = "Starting...") {
 
 
 // ─── Long polling ────────────────────────────────────────────────
-async function poll(onMessage) {
-  while (_polling) {
+/**
+ * Exponential backoff with jitter for polling failures.
+ * 1 s → 2 s → 4 s … capped at {@link POLL_BACKOFF_MAX_MS}.
+ */
+export function pollBackoffMs(failures, { baseMs = POLL_BACKOFF_BASE_MS, maxMs = POLL_BACKOFF_MAX_MS, random = Math.random } = {}) {
+  const attempt = Math.max(1, Math.floor(Number(failures) || 1));
+  const exp = Math.min(maxMs, baseMs * 2 ** (attempt - 1));
+  const jitter = Math.floor(random() * Math.min(750, exp * 0.25));
+  return Math.min(maxMs, exp + jitter);
+}
+
+/**
+ * Run one update handler without blocking the poll loop.
+ *
+ * This is what keeps `/start` alive while `/pool` is still scanning: the poll
+ * loop moves on to getUpdates immediately and every command runs concurrently.
+ * A handler rejection is logged and swallowed — it can never stop polling.
+ */
+function dispatchUpdate(onMessage, payload) {
+  const label = String(payload?.callbackData ?? payload?.text ?? "").slice(0, 40) || "update";
+  const startedAt = Date.now();
+  Promise.resolve()
+    .then(() => onMessage(payload))
+    .catch((error) => {
+      log("telegram_error", `Handler failed for "${label}": ${error?.message || error}`);
+    })
+    .finally(() => {
+      const elapsed = Date.now() - startedAt;
+      if (elapsed > SLOW_HANDLER_WARN_MS) {
+        log("telegram_warn", `Handler "${label}" took ${elapsed}ms`);
+      }
+    });
+}
+
+/** Route one update: immediate callback ack, then non-blocking dispatch. */
+function handleUpdate(update, onMessage) {
+  const callback = update?.callback_query;
+  if (callback?.data && callback?.message) {
+    const callbackMsg = {
+      chat: callback.message.chat,
+      from: callback.from,
+      text: callback.data,
+    };
+    if (!isAuthorizedIncomingMessage(callbackMsg)) return;
+    // ACK FIRST — the button spinner stops before any network work starts, so the
+    // UI stays responsive even when the view handler has to hit RPC/APIs.
+    answerCallbackQuery(callback.id).catch(() => null);
+    dispatchUpdate(onMessage, {
+      ...callbackMsg,
+      isCallback: true,
+      callbackQueryId: callback.id,
+      callbackData: callback.data,
+      messageId: callback.message.message_id,
+    });
+    return;
+  }
+
+  const msg = update?.message;
+  if (!msg?.text) return;
+  if (!isAuthorizedIncomingMessage(msg)) return;
+  dispatchUpdate(onMessage, msg);
+}
+
+/**
+ * Long-poll loop with auto-reconnect.
+ *
+ * - Every update is dispatched without awaiting it (commands never queue behind
+ *   a slow `/pool`).
+ * - `fetch failed` / TELEGRAM_ERROR are retried with exponential backoff + jitter.
+ * - The loop only exits when `stopPolling()` is called; `startPolling` restarts it
+ *   automatically if it ever throws.
+ */
+async function poll(onMessage, generation) {
+  let failures = 0;
+
+  while (_polling && generation === _pollGeneration) {
     try {
-      const res = await fetch(
+      const res = await telegramFetch(
         `${BASE}/getUpdates?offset=${_offset}&timeout=30`,
-        { signal: AbortSignal.timeout(35_000) }
+        { timeoutMs: POLL_WINDOW_TIMEOUT_MS },
       );
-      if (!res.ok) { await sleep(5000); continue; }
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        throw new Error(`getUpdates HTTP ${res.status}${body ? ` — ${String(body).slice(0, 160)}` : ""}`);
+      }
       const data = await res.json();
-      for (const update of data.result || []) {
+      if (failures > 0) {
+        log("telegram", `Polling recovered after ${failures} failed attempt(s)`);
+        failures = 0;
+      }
+      for (const update of Array.isArray(data?.result) ? data.result : []) {
         _offset = update.update_id + 1;
-        const callback = update.callback_query;
-        if (callback?.data && callback?.message) {
-          const callbackMsg = {
-            chat: callback.message.chat,
-            from: callback.from,
-            text: callback.data,
-          };
-          if (!isAuthorizedIncomingMessage(callbackMsg)) continue;
-          await onMessage({
-            ...callbackMsg,
-            isCallback: true,
-            callbackQueryId: callback.id,
-            callbackData: callback.data,
-            messageId: callback.message.message_id,
-          });
-          continue;
+        try {
+          handleUpdate(update, onMessage);
+        } catch (error) {
+          // A bad update must never break the loop or the next commands.
+          log("telegram_error", `Bad update ${update?.update_id}: ${error?.message || error}`);
         }
-        const msg = update.message;
-        if (!msg?.text) continue;
-        if (!isAuthorizedIncomingMessage(msg)) continue;
-        await onMessage(msg);
       }
-    } catch (e) {
-      if (!e.message?.includes("aborted")) {
-        log("telegram_error", `Poll error: ${e.message}`);
-      }
-      await sleep(5000);
+    } catch (error) {
+      if (!_polling) break;
+
+      failures += 1;
+      const delay = pollBackoffMs(failures);
+      // A stalled socket shows up as a timeout; `fetch failed` is a plain outage.
+      const reason = isTimeoutError(error)
+        ? `long-poll timeout after ${POLL_WINDOW_TIMEOUT_MS}ms`
+        : (error?.message || String(error));
+      log(
+        "telegram_error",
+        `Poll error (attempt ${failures}): ${reason} — reconnecting in ${delay}ms`,
+      );
+      await sleep(delay);
     }
   }
+
+  log("telegram", "Telegram polling stopped");
 }
 
 const BOT_COMMANDS = [
@@ -533,7 +659,7 @@ const BOT_COMMANDS = [
 async function registerCommands() {
   if (!BASE) return;
   try {
-    await fetch(`${BASE}/setMyCommands`, {
+    await telegramFetch(`${BASE}/setMyCommands`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ commands: BOT_COMMANDS }),
@@ -550,14 +676,37 @@ export function startPolling(onMessage) {
   if (!chatId) {
     log("telegram_warn", "TELEGRAM_CHAT_ID not set in .env or user-config.telegramChatId — outbound notifications and inbound control disabled until configured.");
   }
+
   _polling = true;
-  poll(onMessage); // fire-and-forget
-  registerCommands();
+  if (_pollLoopActive) return; // already running — never start a second loop
+  _pollLoopActive = true;
+  const generation = _pollGeneration + 1;
+  _pollGeneration = generation;
+
+  poll(onMessage, generation)
+    .catch((error) => {
+      log("telegram_error", `Polling loop crashed: ${error?.message || error}`);
+    })
+    .finally(() => {
+      _pollLoopActive = false;
+      if (!_polling) return;
+      // Auto-restart: the bot must come back on its own after any crash.
+      const restartMs = pollBackoffMs(1);
+      log("telegram_warn", `Polling loop exited unexpectedly — restarting in ${restartMs}ms`);
+      const timer = setTimeout(() => startPolling(onMessage), restartMs);
+      timer?.unref?.();
+    });
+
+  registerCommands().catch(() => {});
   log("telegram", "Bot polling started");
 }
 
 export function stopPolling() {
   _polling = false;
+  _pollLoopActive = false;
+  // Invalidate the running loop so a later startPolling() can never end up with
+  // two concurrent getUpdates loops.
+  _pollGeneration += 1;
 }
 
 // ─── Notification helpers ────────────────────────────────────────

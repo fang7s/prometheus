@@ -446,8 +446,8 @@ test("management cycle body contains no LLM call", () => {
 
 test("LLM screening is opt-in via /pool only; automatic cycles are deterministic", () => {
   const src = fs.readFileSync(path.join(ROOT, "index.js"), "utf8");
-  assert.match(src, /runScreeningCycle\(\{ silent = false, useLLM = false \} = \{\}\)/);
-  assert.match(src, /runScreeningCycle\(\{ useLLM: true \}\)/);
+  assert.match(src, /runScreeningCycle\(\{ silent = false, useLLM = false, ioTimeoutMs = 0 \} = \{\}\)/);
+  assert.match(src, /runScreeningCycle\(\{ useLLM: true, ioTimeoutMs: NETWORK_TIMEOUT_MS \}\)/);
   assert.match(src, /selectCandidateDeterministically\(/);
   const healthStart = src.indexOf("export async function runDeterministicHealthCheck");
   const healthEnd = src.indexOf("export function startCronJobs");

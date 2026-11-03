@@ -28,6 +28,9 @@ import {
 import { generateBriefing } from "./briefing.js";
 import { getLastBriefingDate, setLastBriefingDate, getTrackedPositions, setPositionInstruction, confirmPeak, registerExitSignal } from "./state.js";
 import { detectExit, evaluateSupertrendExit, formatExitLog, parseInstructionOverrides } from "./exit-rules.js";
+// `withDeadline` rejects with TimeoutError; the local `withTimeout` below is the
+// non-throwing shutdown helper and keeps its existing contract.
+import { isTimeoutError, withTimeout as withDeadline } from "./utils/timeout.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
@@ -96,6 +99,12 @@ function buildPrompt() {
 //  CRON DEFINITIONS
 // ═══════════════════════════════════════════
 let _cronTasks = [];
+// ─── Interactive network guards ──────────────────────────────────
+// Telegram commands must never wait on a stalled RPC/API call. Every interactive
+// read is bounded by this deadline (autonomous cycles keep their own budgets).
+const NETWORK_TIMEOUT_MS = 5_000;
+const TIMEOUT_MESSAGE = "⚠️ Network timeout, please try again";
+
 let _managementBusy = false; // prevents overlapping management cycles
 let _screeningBusy = false;  // prevents overlapping screening cycles
 let _flipperBusy = false;    // prevents overlapping bid-ask flipper cycles
@@ -368,11 +377,22 @@ export async function runManagementCycle({ silent = false } = {}) {
         }
       }
     }
+    // Busy flags are clear again — replay commands the user sent mid-cycle so
+    // /start and friends are never stranded in the queue.
+    drainTelegramQueue().catch(() => {});
   }
   return mgmtReport;
 }
 
-export async function runScreeningCycle({ silent = false, useLLM = false } = {}) {
+/**
+ * @param {object} [options]
+ * @param {boolean} [options.silent]
+ * @param {boolean} [options.useLLM]
+ * @param {number} [options.ioTimeoutMs] - hard deadline for each network read.
+ *   The interactive `/pool` command passes {@link NETWORK_TIMEOUT_MS} so a stalled
+ *   RPC/API can never keep the user waiting; autonomous cycles pass 0 (unbounded).
+ */
+export async function runScreeningCycle({ silent = false, useLLM = false, ioTimeoutMs = 0 } = {}) {
   if (_screeningBusy) {
     log("cron", "Screening skipped — previous cycle still running");
     return null;
@@ -380,12 +400,25 @@ export async function runScreeningCycle({ silent = false, useLLM = false } = {})
   _screeningBusy = true; // set immediately — prevents TOCTOU race with concurrent callers
   _screeningLastTriggered = Date.now();
 
+  /** Apply the interactive deadline (when configured) to one network read. */
+  const io = (promise, label) => (ioTimeoutMs > 0 ? withDeadline(promise, ioTimeoutMs, label) : promise);
+
+  /** Clear the busy flag and let queued user commands through before returning. */
+  const finish = (report) => {
+    _screeningBusy = false;
+    drainTelegramQueue().catch(() => {});
+    return report;
+  };
+
   // Hard guards — don't even run the agent if preconditions aren't met
   let prePositions, preBalance;
   let liveMessage = null;
   let screenReport = null;
   try {
-    [prePositions, preBalance] = await Promise.all([getMyPositions({ force: true }), getWalletBalances()]);
+    [prePositions, preBalance] = await Promise.all([
+      io(getMyPositions({ force: true }), "positions read"),
+      io(getWalletBalances(), "wallet read"),
+    ]);
     if (prePositions.total_positions >= config.risk.maxPositions) {
       log("cron", `Screening skipped — max positions reached (${prePositions.total_positions}/${config.risk.maxPositions})`);
       screenReport = `Screening skipped — max positions reached (${prePositions.total_positions}/${config.risk.maxPositions}).`;
@@ -395,8 +428,7 @@ export async function runScreeningCycle({ silent = false, useLLM = false } = {})
         summary: "Screening skipped",
         reason: `Max positions reached (${prePositions.total_positions}/${config.risk.maxPositions})`,
       });
-      _screeningBusy = false;
-      return screenReport;
+      return finish(screenReport);
     }
     const minRequired = config.management.deployAmountSol + config.management.gasReserve;
     const isDryRun = process.env.DRY_RUN === "true";
@@ -409,14 +441,16 @@ export async function runScreeningCycle({ silent = false, useLLM = false } = {})
         summary: "Screening skipped",
         reason: `Insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired})`,
       });
-      _screeningBusy = false;
-      return screenReport;
+      return finish(screenReport);
     }
   } catch (e) {
-    log("cron_error", `Screening pre-check failed: ${e.message}`);
-    screenReport = `Screening pre-check failed: ${e.message}`;
-    _screeningBusy = false;
-    return screenReport;
+    const timedOut = isTimeoutError(e);
+    log(timedOut ? "cron_warn" : "cron_error",
+      timedOut
+        ? `Screening pre-check timed out after ${ioTimeoutMs}ms — releasing the command`
+        : `Screening pre-check failed: ${e.message}`);
+    screenReport = timedOut ? TIMEOUT_MESSAGE : `Screening pre-check failed: ${e.message}`;
+    return finish(screenReport);
   }
   if (!silent && telegramEnabled()) {
     liveMessage = await createLiveMessage("🔍 Screening Cycle", "Scanning candidates...");
@@ -436,7 +470,22 @@ export async function runScreeningCycle({ silent = false, useLLM = false } = {})
       + (activeStrategy ? `\nSTRATEGY CONTEXT: ${activeStrategy.name} — entry: ${activeStrategy.entry?.condition || "n/a"} | exit: ${activeStrategy.exit?.notes || "n/a"} | best for: ${activeStrategy.best_for}` : "");
 
     // Fetch top candidates, then recon each sequentially with a small delay to avoid 429s
-    const topCandidates = await getTopCandidates({ limit: 10 }).catch(() => null);
+    let scanTimedOut = false;
+    const topCandidates = await io(getTopCandidates({ limit: 10 }), "candidate scan").catch((error) => {
+      if (isTimeoutError(error)) scanTimedOut = true;
+      return null;
+    });
+    if (scanTimedOut) {
+      // Interactive /pool: give up cleanly instead of leaving the user waiting.
+      screenReport = TIMEOUT_MESSAGE;
+      appendDecision({
+        type: "no_deploy",
+        actor: "SCREENER",
+        summary: "Candidate scan timed out",
+        reason: `No response from the screening API within ${ioTimeoutMs}ms`,
+      });
+      return screenReport;
+    }
     const candidates = (topCandidates?.candidates || topCandidates?.pools || []).slice(0, 10);
     const earlyFilteredExamples = topCandidates?.filtered_examples || [];
 
@@ -444,9 +493,9 @@ export async function runScreeningCycle({ silent = false, useLLM = false } = {})
     for (const pool of candidates) {
       const mint = pool.base?.mint;
       const [smartWallets, narrative, tokenInfo] = await Promise.allSettled([
-        checkSmartWalletsOnPool({ pool_address: pool.pool }),
-        mint ? getTokenNarrative({ mint }) : Promise.resolve(null),
-        mint ? getTokenInfo({ query: mint }) : Promise.resolve(null),
+        io(checkSmartWalletsOnPool({ pool_address: pool.pool }), "smart wallet check"),
+        mint ? io(getTokenNarrative({ mint }), "token narrative") : Promise.resolve(null),
+        mint ? io(getTokenInfo({ query: mint }), "token info") : Promise.resolve(null),
       ]);
       allCandidates.push({
         pool,
@@ -530,9 +579,9 @@ export async function runScreeningCycle({ silent = false, useLLM = false } = {})
       }
     }
 
-    // Pre-fetch active_bin for all passing candidates in parallel
+    // Pre-fetch active_bin for all passing candidates in parallel (bounded in /pool)
     const activeBinResults = await Promise.allSettled(
-      passing.map(({ pool }) => getActiveBin({ pool_address: pool.pool }))
+      passing.map(({ pool }) => io(getActiveBin({ pool_address: pool.pool }), "active bin"))
     );
 
     // Build compact candidate blocks
@@ -676,6 +725,8 @@ the transaction are NOT yours to decide. Never invent tool output.
         else sendMessage(`🔍 Screening Cycle\n\n${stripThink(screenReport)}`).catch(() => { });
       }
     }
+    // Queued user commands (/start, /status, …) must not be stranded after a cycle.
+    drainTelegramQueue().catch(() => {});
   }
   return screenReport;
 }
@@ -1570,10 +1621,19 @@ function refreshPrompt() {
   _ttyInterface.prompt(true);
 }
 
+/**
+ * Replay commands that arrived while a cycle was running.
+ * Each item is isolated: one failing command can never block the rest of the
+ * queue (and the queue is always bounded by `telegramHandler`).
+ */
 async function drainTelegramQueue() {
   while (_telegramQueue.length > 0 && !_managementBusy && !_screeningBusy && !busy) {
     const queued = _telegramQueue.shift();
-    await telegramHandler(queued);
+    try {
+      await telegramHandler(queued);
+    } catch (error) {
+      log("telegram_error", `Queued command failed: ${error.message}`);
+    }
   }
 }
 
@@ -1704,9 +1764,13 @@ async function telegramHandler(msg) {
   if (text === "/pool" || text.toLowerCase() === "/pool screen") {
     try {
       await sendMessage("🔍 Screening started — LLM selects a candidate, code executes the entry.").catch(() => {});
-      await runScreeningCycle({ useLLM: true });
+      // Interactive run: every RPC/API read inside the cycle is capped at 5 s.
+      // A timeout comes back as the cycle report, which the live message already
+      // delivers to the user — no duplicate message here.
+      await runScreeningCycle({ useLLM: true, ioTimeoutMs: NETWORK_TIMEOUT_MS });
     } catch (e) {
-      await sendMessage(`Error: ${e.message}`).catch(() => {});
+      const timedOut = isTimeoutError(e);
+      await sendMessage(timedOut ? TIMEOUT_MESSAGE : `Error: ${e.message}`).catch(() => {});
     }
     return;
   }
@@ -1715,7 +1779,11 @@ async function telegramHandler(msg) {
   if (poolMatch) {
     try {
       const idx = parseInt(poolMatch[1]) - 1;
-      const { positions } = await getMyPositions({ force: true });
+      const { positions } = await withDeadline(
+        getMyPositions({ force: true }),
+        NETWORK_TIMEOUT_MS,
+        "positions read",
+      );
       if (idx < 0 || idx >= positions.length) { await sendMessage("Invalid number. Use /positions first."); return; }
       const pos = positions[idx];
       await sendMessage([
@@ -1729,7 +1797,7 @@ async function telegramHandler(msg) {
         pos.instruction ? `Note: ${pos.instruction}` : null,
       ].filter(Boolean).join("\n"));
     } catch (e) {
-      await sendMessage(`Error: ${e.message}`).catch(() => {});
+      await sendMessage(isTimeoutError(e) ? TIMEOUT_MESSAGE : `Error: ${e.message}`).catch(() => {});
     }
     return;
   }
