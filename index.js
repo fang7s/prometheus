@@ -54,7 +54,7 @@ import {
   formatRangeStatus,
   renderRangeBar,
 } from "./services/lp-menu.js";
-import { recordPriceSample, sendClosedPositionPnlCard } from "./services/pnlCardGenerator.js";
+import { recordPriceSample, queueClosedPositionPnlCard } from "./services/pnlCardGenerator.js";
 import { monitorPosition } from "./services/positionMonitor.js";
 import {
   POOL_TIMEOUT_MESSAGE,
@@ -223,6 +223,27 @@ async function executeManagementActions(actionPositions, actionMap, { liveMessag
   }
 
   return lines.join("\n");
+}
+
+/**
+ * Detached closed-position PnL card dispatch.
+ *
+ * The text-only closing summary has already been sent by the caller; this helper
+ * only *schedules* the Zenith card. Rendering + photo upload happen on a later
+ * event-loop turn (`setImmediate` inside the generator) under a hard 5 s
+ * deadline, so neither the Telegram poll loop nor the position-monitoring tick
+ * ever waits for the canvas — `/start`, `/positions` and the next command stay
+ * responsive even if the render or Telegram upload stalls.
+ */
+function dispatchClosedPositionPnlCard(pos, result) {
+  try {
+    queueClosedPositionPnlCard(
+      { ...result, pair: pos.pair },
+      { tracked: getTrackedPosition(pos.position) },
+    );
+  } catch (error) {
+    log("pnl_card_warn", `Closed PnL card dispatch failed: ${error?.message || error}`);
+  }
 }
 
 /**
@@ -2047,10 +2068,9 @@ async function telegramHandler(msg) {
         const claimNote = result.claim_txs?.length ? `\nClaim txs: ${result.claim_txs.join(", ")}` : "";
         await sendMessage(`✅ Closed ${pos.pair}\nPnL: ${config.management.solMode ? "◎" : "$"}${result.pnl_usd ?? "?"} | close txs: ${closeTxs?.join(", ") || "n/a"}${claimNote}`);
         // Closed positions get the Zenith-style PnL card (open ones stay text-only).
-        await sendClosedPositionPnlCard(
-          { ...result, pair: pos.pair },
-          { tracked: getTrackedPosition(pos.position) },
-        ).catch(() => {});
+        // Detached: the summary above is already on the wire, the PNG renders and
+        // uploads in the background under a 5 s deadline.
+        dispatchClosedPositionPnlCard(pos, result);
       } else {
         await sendMessage(`❌ Close failed: ${JSON.stringify(result)}`);
       }
@@ -2069,10 +2089,8 @@ async function telegramHandler(msg) {
           const result = await closePosition({ position_address: pos.position });
           results.push(`${pos.pair}: ${result.success ? "closed" : `failed (${result.error || "unknown"})`}`);
           if (result.success) {
-            await sendClosedPositionPnlCard(
-              { ...result, pair: pos.pair },
-              { tracked: getTrackedPosition(pos.position) },
-            ).catch(() => {});
+            // Per-position card, detached — the loop never waits for the canvas.
+            dispatchClosedPositionPnlCard(pos, result);
           }
         } catch (error) {
           results.push(`${pos.pair}: failed (${error.message})`);

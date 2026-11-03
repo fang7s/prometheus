@@ -5,17 +5,25 @@
  * `/closeall`, rule-engine exits: TP/SL, range-out, 15m Supertrend break) and for
  * PnL history. Open positions always stay text-only (see `lp-menu.js`).
  *
+ * Rendering is **100 % code** — pure Node.js canvas drawing with the rust-backed
+ * `@napi-rs/canvas` renderer. There is not a single external image, icon, logo or
+ * font file in the card: every panel, badge, dashed guide, gradient and glyph is
+ * painted by `fillRect` / `roundRect` / `arc` / `fillText`.
+ *
  * Layers:
  *   1. Pure helpers — `priceAtBin`, `formatHoldDuration`, `normalizePnlCardData`,
  *      `buildPricePath`, `buildClosedPositionCaption`. No canvas, no network.
  *   2. `drawPnlCard` — paints the card onto an injected canvas factory
- *      (`@napi-rs/canvas`, falling back to `canvas` through `chartService`), so
- *      unit tests render a real PNG without touching Telegram.
+ *      (`@napi-rs/canvas`), so unit tests render a real PNG without Telegram.
  *   3. `generatePnlCard` / `sendClosedPositionPnlCard` — async wrappers used by
  *      the close paths. Sending is best-effort: a canvas or Telegram failure can
  *      never break a close.
+ *   4. `queueClosedPositionPnlCard` — **detached** dispatch: the render + upload
+ *      run on a later event-loop turn under a hard {@link PNL_CARD_TIMEOUT_MS}
+ *      deadline, so no close path (Telegram poll loop, PnL tick, management
+ *      cycle) ever waits for the canvas.
  *
- * Header: `PROMETHEUS LP` + `CLOSED • Meteora DLMM x.xx%` + hold duration.
+ * Header: `PROMETHEUS LP` + `CLOSED • Meteora DLMM x.xx%` badge + hold duration.
  * Main: large signed USD PnL (green/red) with the percentage.
  * Side panel: TOP / BOTTOM / ENTRY / CLOSE price lines + the price path curve.
  * Grid: OPENED, CLOSED, DEPOSITED, RETURNED, FEES EARNED (+ the bin range).
@@ -23,12 +31,19 @@
 
 import { log } from "../logger.js";
 import { sendPhotoWithCaption } from "../telegram.js";
-import { buildPhotoCaption, loadCanvas } from "./chartService.js";
+import { isTimeoutError, withTimeout } from "../utils/timeout.js";
+import { buildPhotoCaption } from "./chartService.js";
 
 export const PNL_CARD_DEFAULT_WIDTH = 900;
 export const PNL_CARD_DEFAULT_HEIGHT = 540;
 /** Telegram rejects photo captions longer than this. */
 export const PNL_CARD_CAPTION_LIMIT = 1024;
+/**
+ * Hard deadline for one background render + Telegram photo upload. When it is
+ * missed the detached task is abandoned (gracefully, warning only) so a slow
+ * canvas or a stalled socket can never leak into the next command.
+ */
+export const PNL_CARD_TIMEOUT_MS = 5_000;
 
 /** In-memory price-path samples (bin id → price), one per position. */
 const MAX_PRICE_SAMPLES = 240;
@@ -50,6 +65,38 @@ const COLORS = {
   band: "rgba(34, 197, 94, 0.10)",
   bandLoss: "rgba(239, 68, 68, 0.10)",
 };
+
+// ─── Canvas engine (rust-backed, lazy, no assets) ─────────────────
+let _canvasModule = null;
+let _canvasFailure = null;
+
+/**
+ * Resolve the rust-backed `@napi-rs/canvas` renderer once and cache it.
+ *
+ * The module is imported lazily so a host without the native build only loses
+ * the card (the close path itself keeps working). No image/font assets are ever
+ * read from disk — the card is drawn with vector calls only.
+ *
+ * @returns {Promise<{createCanvas: Function}>}
+ */
+export async function loadPnlCardCanvas() {
+  if (_canvasModule) return _canvasModule;
+  if (_canvasFailure) throw _canvasFailure;
+  try {
+    const mod = await import("@napi-rs/canvas");
+    const resolved = mod?.createCanvas ? mod : mod?.default ?? null;
+    if (typeof resolved?.createCanvas !== "function") {
+      throw new Error("@napi-rs/canvas did not expose createCanvas");
+    }
+    _canvasModule = resolved;
+    return _canvasModule;
+  } catch (error) {
+    _canvasFailure = new Error(
+      `PnL card renderer unavailable (@napi-rs/canvas: ${error?.message || "not installed"})`,
+    );
+    throw _canvasFailure;
+  }
+}
 
 // ─── Formatting helpers (pure) ────────────────────────────────────
 function toNumber(value, fallback = 0) {
@@ -339,6 +386,37 @@ function fitText(ctx, text, maxWidth) {
   return `${trimmed}…`;
 }
 
+/**
+ * Filled + outlined status pill (pure canvas — no icon assets). Returns the pill
+ * bounds so callers can stack content underneath it.
+ */
+function drawBadge(ctx, {
+  x,
+  y,
+  text,
+  color = COLORS.range,
+  align = "left",
+  font = "bold 13px sans-serif",
+  height = 22,
+  padX = 10,
+  fill = "rgba(15, 23, 42, 0.92)",
+}) {
+  ctx.font = font;
+  const label = String(text ?? "");
+  const w = Math.ceil(ctx.measureText(label).width) + padX * 2;
+  const bx = align === "right" ? x - w : x;
+  roundedRect(ctx, bx, y, w, height, height / 2);
+  ctx.fillStyle = fill;
+  ctx.fill();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  ctx.fillStyle = color;
+  ctx.textAlign = "left";
+  ctx.fillText(label, bx + padX, y + Math.round(height * 0.69));
+  return { x: bx, y, w, h: height };
+}
+
 function drawMetricCell(ctx, { x, y, w, h, label, value, accent = null }) {
   drawPanel(ctx, { x, y, w, h, radius: 10 });
   ctx.fillStyle = COLORS.muted;
@@ -549,8 +627,13 @@ export function drawPnlCard(input = {}, {
   const chartW = width - pad - chartX;
   const chartH = contentBottom - panelY;
 
-  // Background + accent strip (green on profit, red on loss).
-  ctx.fillStyle = COLORS.background;
+  // Background + accent strip (green on profit, red on loss). The panel fill is a
+  // rust-rendered linear gradient — no background image asset anywhere.
+  const background = ctx.createLinearGradient(0, 0, width, height);
+  background.addColorStop(0, COLORS.background);
+  background.addColorStop(0.55, COLORS.panel);
+  background.addColorStop(1, "#0a1526");
+  ctx.fillStyle = background;
   ctx.fillRect(0, 0, width, height);
   ctx.fillStyle = pnlColor;
   ctx.fillRect(0, 0, width, 4);
@@ -561,18 +644,27 @@ export function drawPnlCard(input = {}, {
   ctx.font = `bold ${Math.round(width * 0.029)}px sans-serif`;
   ctx.fillText("PROMETHEUS LP", pad, Math.round(height * 0.085));
 
-  ctx.font = "13px sans-serif";
-  ctx.fillStyle = COLORS.muted;
-  const subtitle = card.closeReason ? `${card.pair} · ${card.closeReason}` : card.pair;
-  ctx.fillText(fitText(ctx, subtitle, Math.round(width * 0.5)), pad, Math.round(height * 0.132));
-
+  // Status badge (code-drawn pill): CLOSED • Meteora DLMM x.xx%.
   const feeLabel = card.baseFeePct != null
     ? `CLOSED • Meteora DLMM ${card.baseFeePct.toFixed(2)}%`
     : "CLOSED • Meteora DLMM";
+  const badge = drawBadge(ctx, {
+    x: width - pad,
+    y: Math.round(height * 0.037),
+    text: feeLabel,
+    color: pnlColor,
+    align: "right",
+    height: Math.round(height * 0.048),
+  });
+
+  ctx.textAlign = "left";
+  ctx.font = "13px sans-serif";
+  ctx.fillStyle = COLORS.muted;
+  const subtitle = card.closeReason ? `${card.pair} · ${card.closeReason}` : card.pair;
+  // Clip against the badge so a long pair/reason can never run underneath it.
+  ctx.fillText(fitText(ctx, subtitle, Math.max(140, badge.x - pad - 16)), pad, Math.round(height * 0.132));
+
   ctx.textAlign = "right";
-  ctx.fillStyle = pnlColor;
-  ctx.font = "bold 14px sans-serif";
-  ctx.fillText(feeLabel, width - pad, Math.round(height * 0.068));
   ctx.fillStyle = COLORS.muted;
   ctx.font = "13px sans-serif";
   ctx.fillText(`${card.holdLabel} held`, width - pad, Math.round(height * 0.112));
@@ -650,13 +742,18 @@ export function drawPnlCard(input = {}, {
 }
 
 /**
- * Generate the PNG (loads the native canvas lazily). Throws only when the
- * renderer is unavailable — callers that must not fail use
- * `sendClosedPositionPnlCard`.
+ * Generate the PNG. Renders exclusively with the rust-backed `@napi-rs/canvas`
+ * (loaded lazily) and yields to the event loop first, so even a synchronous
+ * render never runs inline with the caller that dispatched it. Throws only when
+ * the renderer is unavailable — callers that must not fail use
+ * `sendClosedPositionPnlCard` / `queueClosedPositionPnlCard`.
  */
 export async function generatePnlCard(input = {}, { createCanvas = null, width, height } = {}) {
   try {
-    const canvasFactory = createCanvas || (await loadCanvas()).createCanvas;
+    const canvasFactory = createCanvas || (await loadPnlCardCanvas()).createCanvas;
+    // Give the caller's own continuation (text reply, swap, next command) the
+    // event loop turn before the CPU-bound canvas rasterisation starts.
+    await new Promise((resolve) => setImmediate(resolve));
     return drawPnlCard(input, { createCanvas: canvasFactory, width, height });
   } catch (error) {
     log("pnl_card_warn", `PnL card render failed: ${error.message}`);
@@ -686,23 +783,114 @@ export function buildClosedPositionCardPayload(closeResult = {}, tracked = null)
 
 /**
  * Render + send the closed-position card. Best-effort: never throws, so a close
- * path can always await it without risking the transaction flow.
+ * path could await it safely — although no close path does (they use
+ * {@link queueClosedPositionPnlCard}).
+ *
+ * @param {object} closeResult close tool result / history record
+ * @param {{tracked?: object|null, caption?: string|null, keyboard?: any, createCanvas?: Function|null, send?: Function|null}} [options]
+ *   `send` is injectable so the dispatcher can be exercised without Telegram.
  * @returns {Promise<number|null>} Telegram message id, or null
  */
 export async function sendClosedPositionPnlCard(
   closeResult = {},
-  { tracked = null, caption = null, keyboard = null, createCanvas = null } = {},
+  { tracked = null, caption = null, keyboard = null, createCanvas = null, send = null } = {},
 ) {
   const payload = buildClosedPositionCardPayload(closeResult, tracked);
   const positionAddress = payload.position ? String(payload.position) : null;
   try {
     const png = await generatePnlCard(payload, { createCanvas });
     const html = caption || buildClosedPositionCaption(payload);
-    const messageId = await sendPhotoWithCaption(buildPhotoCaption(html, PNL_CARD_CAPTION_LIMIT), png, keyboard);
-    if (positionAddress) clearPriceSamples(positionAddress);
+    const upload = typeof send === "function" ? send : sendPhotoWithCaption;
+    const messageId = await upload(buildPhotoCaption(html, PNL_CARD_CAPTION_LIMIT), png, keyboard);
     return messageId ?? null;
   } catch (error) {
     log("pnl_card_warn", `Closed PnL card skipped: ${error.message}`);
     return null;
+  } finally {
+    // The payload already carries a copy of the price path — release the samples
+    // whatever happened (success, failure or an abandoned upload).
+    if (positionAddress) clearPriceSamples(positionAddress);
   }
+}
+
+/** Positions whose card is currently rendering/uploading in the background. */
+const _cardsInFlight = new Set();
+
+/**
+ * **Detached** closed-position card dispatch — the only entry point used by the
+ * close paths (`tools/executor.js`, `index.js` `/close` + `/closeall`).
+ *
+ * - Returns synchronously (0 ms). The render + photo upload start on the next
+ *   event-loop turn via `setImmediate`, so the Telegram poll loop, the PnL tick
+ *   and the management cycle are never held hostage by the canvas.
+ * - The whole background job is raced against a hard {@link PNL_CARD_TIMEOUT_MS}
+ *   deadline (`withTimeout`). Missing it abandons the job with a warning; it can
+ *   never crash the process, leak an unhandled rejection or block later commands.
+ * - A duplicate dispatch for the same position (e.g. TP/SL followed by a manual
+ *   `/close`) is skipped instead of rendering twice.
+ *
+ * @param {object} closeResult close tool result (see `buildCloseSummaryFields`)
+ * @param {{
+ *   tracked?: object|null, caption?: string|null, keyboard?: any,
+ *   createCanvas?: Function|null, timeoutMs?: number,
+ *   send?: Function|null, onSettled?: ((error: Error|null, messageId: number|null) => void)|null,
+ * }} [options]
+ * @returns {boolean} true when the background job was scheduled
+ */
+export function queueClosedPositionPnlCard(closeResult = {}, options = {}) {
+  const {
+    timeoutMs = PNL_CARD_TIMEOUT_MS,
+    send = null,
+    onSettled = null,
+    ...sendOptions
+  } = options || {};
+
+  const result = closeResult && typeof closeResult === "object" ? closeResult : {};
+  const positionAddress = result.position ? String(result.position) : null;
+  const deadlineMs = Math.max(1, Number(timeoutMs) || PNL_CARD_TIMEOUT_MS);
+
+  if (positionAddress) {
+    if (_cardsInFlight.has(positionAddress)) {
+      log("pnl_card_warn", `Closed PnL card already in flight for ${positionAddress.slice(0, 8)} — skipping duplicate`);
+      return false;
+    }
+    _cardsInFlight.add(positionAddress);
+  }
+
+  const settle = (error, messageId) => {
+    if (positionAddress) _cardsInFlight.delete(positionAddress);
+    if (typeof onSettled !== "function") return;
+    try {
+      onSettled(error, messageId ?? null);
+    } catch (callbackError) {
+      log("pnl_card_warn", `Closed PnL card onSettled handler failed: ${callbackError?.message || callbackError}`);
+    }
+  };
+
+  // Detached from here on: nothing below is awaited by the caller.
+  setImmediate(() => {
+    let work;
+    try {
+      work = sendClosedPositionPnlCard(result, { ...sendOptions, send });
+    } catch (error) {
+      log("pnl_card_warn", `Closed PnL card skipped: ${error?.message || error}`);
+      settle(error, null);
+      return;
+    }
+    withTimeout(work, deadlineMs, "closed position PnL card")
+      .then((messageId) => settle(null, messageId))
+      .catch((error) => {
+        if (isTimeoutError(error)) {
+          log(
+            "pnl_card_warn",
+            `Closed PnL card skipped: ${deadlineMs}ms deadline missed — background render/upload abandoned`,
+          );
+        } else {
+          log("pnl_card_warn", `Closed PnL card skipped: ${error?.message || error}`);
+        }
+        settle(error, null);
+      });
+  });
+
+  return true;
 }

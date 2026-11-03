@@ -65,6 +65,7 @@ import {
   PNL_CARD_CAPTION_LIMIT,
   PNL_CARD_DEFAULT_HEIGHT,
   PNL_CARD_DEFAULT_WIDTH,
+  PNL_CARD_TIMEOUT_MS,
   buildClosedPositionCaption,
   buildPricePath,
   clearPriceSamples,
@@ -74,6 +75,7 @@ import {
   getPriceSamples,
   normalizePnlCardData,
   priceAtBin,
+  queueClosedPositionPnlCard,
   recordPriceSample,
 } from "../services/pnlCardGenerator.js";
 import {
@@ -1375,15 +1377,78 @@ await testAsync("pnl card renders a valid PNG buffer", async () => {
   assert.ok(bare.length > 2_000);
 });
 
+await testAsync("closed-position cards render in code and are dispatched detached", async () => {
+  const pnlSrc = fs.readFileSync(path.join(ROOT, "services/pnlCardGenerator.js"), "utf8");
+  const executorSrc = fs.readFileSync(path.join(ROOT, "tools/executor.js"), "utf8");
+  const indexSrc = fs.readFileSync(path.join(ROOT, "index.js"), "utf8");
+
+  // ── Pure code-based renderer: rust canvas, zero external assets ──
+  assert.match(pnlSrc, /@napi-rs\/canvas/);
+  assert.doesNotMatch(pnlSrc, /loadImage|drawImage|registerFont|readFileSync/, "no image/font assets may be loaded");
+  assert.match(pnlSrc, /createLinearGradient\(/, "background panels are drawn in code");
+  assert.match(pnlSrc, /setLineDash\(\[/, "price-path guides are code-drawn dashes");
+  assert.equal(PNL_CARD_TIMEOUT_MS, 5_000);
+
+  // ── Detached dispatch: setImmediate + hard deadline, never awaited ──
+  assert.match(pnlSrc, /export function queueClosedPositionPnlCard\(/);
+  assert.match(pnlSrc, /setImmediate\(/);
+  assert.match(pnlSrc, /withTimeout\(work, deadlineMs/);
+  for (const [label, src] of [["executor", executorSrc], ["index", indexSrc]]) {
+    assert.doesNotMatch(src, /await\s+sendClosedPositionPnlCard\(/, `${label} must not await the card`);
+  }
+  assert.match(executorSrc, /queueClosedPositionPnlCard\(result/);
+
+  // The Telegram poll loop / exit tick returns before the canvas even starts.
+  let startedAt = 0;
+  let settleCard = null;
+  const stalled = new Promise((resolve) => { settleCard = resolve; });
+  const dispatchedAt = Date.now();
+  const scheduled = queueClosedPositionPnlCard(
+    { pair: "X/SOL", pnl_usd: 1, pnl_pct: 1 },
+    {
+      timeoutMs: 60,
+      send: () => { startedAt = Date.now(); return new Promise(() => {}); },
+      onSettled: (error, messageId) => settleCard({ error, messageId }),
+    },
+  );
+  assert.equal(scheduled, true);
+  assert.ok(Date.now() - dispatchedAt < 100, "dispatch must return synchronously");
+  assert.equal(startedAt, 0, "the renderer must not run inline with the close path");
+
+  const timeout = await stalled;
+  assert.equal(isTimeoutError(timeout.error), true, "a stalled upload is abandoned at the deadline");
+  assert.equal(timeout.messageId, null);
+  assert.ok(startedAt >= dispatchedAt, "the background job ran on a later event-loop turn");
+
+  // A fast upload passes the message id through (real canvas, no Telegram).
+  const fastCard = await new Promise((resolve) => {
+    queueClosedPositionPnlCard(
+      { position: "DetachedFastCard", pair: "X/SOL", pnl_usd: 2.5, pnl_pct: 1.5 },
+      { timeoutMs: 4_000, send: async () => 4242, onSettled: (error, messageId) => resolve({ error, messageId }) },
+    );
+  });
+  assert.equal(fastCard.error, null);
+  assert.equal(fastCard.messageId, 4242);
+
+  // A duplicate dispatch for a position already rendering is skipped.
+  const slowSend = () => new Promise((resolve) => setTimeout(() => resolve(7), 20));
+  assert.equal(queueClosedPositionPnlCard({ position: "DupCard" }, { timeoutMs: 1_000, send: slowSend }), true);
+  assert.equal(queueClosedPositionPnlCard({ position: "DupCard" }, { timeoutMs: 1_000, send: slowSend }), false);
+  await new Promise((resolve) => setTimeout(resolve, 60));
+});
+
 test("every close path triggers the closed-position PnL card", () => {
   const indexSrc = fs.readFileSync(path.join(ROOT, "index.js"), "utf8");
   const executorSrc = fs.readFileSync(path.join(ROOT, "tools/executor.js"), "utf8");
   const dlmmSrc = fs.readFileSync(path.join(ROOT, "tools/dlmm.js"), "utf8");
   // Automatic exits (TP/SL, range-out, Supertrend) close through the executor.
-  assert.match(executorSrc, /sendClosedPositionPnlCard\(result/);
-  // Manual /close and /closeall close directly and send the card themselves.
-  const manualCalls = indexSrc.match(/sendClosedPositionPnlCard\(/g) || [];
+  assert.match(executorSrc, /queueClosedPositionPnlCard\(result/);
+  // Manual /close and /closeall close directly and dispatch the card themselves.
+  const manualCalls = indexSrc.match(/dispatchClosedPositionPnlCard\(pos, result\)/g) || [];
   assert.ok(manualCalls.length >= 2, `expected /close and /closeall cards, found ${manualCalls.length}`);
+  // Both close paths funnel through the detached dispatcher.
+  assert.match(indexSrc, /function dispatchClosedPositionPnlCard\(pos, result\)/);
+  assert.match(indexSrc, /queueClosedPositionPnlCard\(/);
   // The price path is sampled while the position is open.
   assert.match(indexSrc, /recordPriceSample\(/);
   // Close results carry everything the card needs.

@@ -41,7 +41,7 @@ const TIMEFRAME_MINUTES = {
 };
 import { log, logAction } from "../logger.js";
 import { notifyDeploy, notifyClose, notifySwap } from "../telegram.js";
-import { sendClosedPositionPnlCard } from "../services/pnlCardGenerator.js";
+import { queueClosedPositionPnlCard } from "../services/pnlCardGenerator.js";
 
 function numberOrNull(value) {
   const n = Number(value);
@@ -682,12 +682,15 @@ export async function executeTool(name, args) {
       } else if (name === "deploy_position") {
         notifyDeploy({ pair: result.pool_name || args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, position: result.position, tx: result.txs?.[0] ?? result.tx, priceRange: result.price_range, rangeCoverage: result.range_coverage, binStep: result.bin_step, baseFee: result.base_fee }).catch(() => {});
       } else if (name === "close_position") {
+        // 1. Text-only closing summary goes out immediately (0 ms — not awaited).
         notifyClose({ pair: result.pool_name || args.position_address?.slice(0, 8), pnlUsd: result.pnl_usd ?? 0, pnlPct: result.pnl_pct ?? 0 }).catch(() => {});
-        // Closed positions (manual, TP/SL, range-out, Supertrend) get the PnL card.
-        // Best-effort: a canvas/Telegram failure never affects the close result.
-        await sendClosedPositionPnlCard(result, {
+        // 2. The Zenith PnL card is dispatched DETACHED (setImmediate + 5 s hard
+        //    deadline inside the generator). This tick never waits for the canvas
+        //    render or the photo upload: TP/SL, range-out, Supertrend and manual
+        //    closes all return to the caller instantly.
+        queueClosedPositionPnlCard(result, {
           tracked: result.position ? getTrackedPosition(result.position) : null,
-        }).catch(() => {});
+        });
         // Note low-yield closes in pool memory so screener avoids redeploying
         if (args.reason && args.reason.toLowerCase().includes("yield")) {
           const poolAddr = result.pool || args.pool_address;
