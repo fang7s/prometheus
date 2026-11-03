@@ -554,8 +554,12 @@ export function rankTrendingPools(pools = [], { limit = TRENDING_POOL_LIMIT, per
   return ranked;
 }
 
-/** Jupiter token stats (organic score / holders / mcap) keyed by mint. */
-export async function fetchJupiterTokenStats(mints = []) {
+/**
+ * Jupiter token stats (organic score / holders / mcap) keyed by mint.
+ * `force` bypasses the 5-minute cache — used by the open-position views so the
+ * `🧢 MC` line reflects the current market cap on every refresh.
+ */
+export async function fetchJupiterTokenStats(mints = [], { force = false } = {}) {
   const unique = [...new Set((Array.isArray(mints) ? mints : [])
     .map((mint) => String(mint ?? "").trim())
     .filter((mint) => BASE58_ADDRESS_RE.test(mint)))];
@@ -564,7 +568,7 @@ export async function fetchJupiterTokenStats(mints = []) {
   const pending = [];
   for (const mint of unique) {
     const cached = _jupiterTokenCache.get(mint);
-    if (cached && Date.now() - cached.at < JUPITER_TOKEN_TTL_MS) stats.set(mint, cached.stats);
+    if (!force && cached && Date.now() - cached.at < JUPITER_TOKEN_TTL_MS) stats.set(mint, cached.stats);
     else pending.push(mint);
   }
 

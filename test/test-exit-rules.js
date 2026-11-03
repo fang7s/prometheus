@@ -4,7 +4,9 @@
  *
  * Verifies the strict priority hierarchy:
  *   1. TP / SL (percentage PnL)
- *   2. Range boundaries (far above / far below the configured outer bounds)
+ *   2. Range boundaries (far above / far below the configured outer bounds),
+ *      guarded by `hasEnteredRange` so a below-price limit order is never closed
+ *      before it has filled at least once
  *   3. Supertrend 15m 1-candle close break
  * and that RSI(2) / MACD / Bollinger signals can never close a position.
  */
@@ -21,10 +23,18 @@ import {
   evaluateNumericRules,
   evaluateSupertrendExit,
   formatExitLog,
+  hasEnteredRangeOf,
   isPnlSuspect,
   parseInstructionOverrides,
   ruleDecision,
 } from "../exit-rules.js";
+import {
+  evaluateRangeEntry,
+  getHasEnteredRange,
+  isActiveBinInRange,
+  monitorPosition,
+  resolveBinRange,
+} from "../services/positionMonitor.js";
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 let passed = 0;
@@ -207,6 +217,179 @@ test("Priority 2 — data-gap fallback keeps the out-of-range wait", () => {
     evaluateExitHierarchy(position({ active_bin: 125, in_range: false, minutes_out_of_range: 5 }), MGMT),
     null,
   );
+});
+
+test("Priority 2 — hasEnteredRange=false bypasses the range exit (limit order pending)", () => {
+  // Far above the range, but the position never traded inside it → no close.
+  assert.equal(
+    evaluateExitHierarchy(position({ active_bin: 131, in_range: false, hasEnteredRange: false }), MGMT),
+    null,
+  );
+  // Same tick once the monitor armed the position → FAR_ABOVE_RANGE closes.
+  assert.equal(
+    evaluateExitHierarchy(position({ active_bin: 131, in_range: false, hasEnteredRange: true }), MGMT).rule_key,
+    "FAR_ABOVE_RANGE",
+  );
+
+  // Far below behaves identically, from the payload flag and from state.json.
+  assert.equal(
+    evaluateExitHierarchy(position({ active_bin: 69, in_range: false, hasEnteredRange: false }), MGMT),
+    null,
+  );
+  assert.equal(
+    evaluateExitHierarchy(position({ active_bin: 69, in_range: false, hasEnteredRange: true }), MGMT).rule_key,
+    "FAR_BELOW_RANGE",
+  );
+  assert.equal(
+    evaluateExitHierarchy(position({ active_bin: 69, in_range: false }), MGMT, {
+      tracked: { has_entered_range: false },
+    }),
+    null,
+  );
+  assert.equal(
+    evaluateExitHierarchy(position({ active_bin: 69, in_range: false }), MGMT, {
+      tracked: { has_entered_range: true },
+    }).rule_key,
+    "FAR_BELOW_RANGE",
+  );
+  // camelCase state records work too.
+  assert.equal(
+    evaluateExitHierarchy(position({ active_bin: 69, in_range: false }), MGMT, {
+      tracked: { hasEnteredRange: false },
+    }),
+    null,
+  );
+
+  // The data-gap backstop belongs to Priority 2 and is guarded as well.
+  assert.equal(
+    evaluateExitHierarchy(
+      position({ active_bin: 125, in_range: false, minutes_out_of_range: 999, hasEnteredRange: false }),
+      MGMT,
+    ),
+    null,
+  );
+
+  // Priority 1 is never gated by the range flag.
+  assert.equal(
+    evaluateExitHierarchy(
+      position({ pnl_pct: -60, active_bin: 5, in_range: false, hasEnteredRange: false }),
+      MGMT,
+    ).rule_key,
+    "STOP_LOSS",
+  );
+  assert.equal(
+    evaluateExitHierarchy(
+      position({ pnl_pct: 9, active_bin: 400, in_range: false, hasEnteredRange: false }),
+      MGMT,
+    ).rule_key,
+    "TAKE_PROFIT",
+  );
+
+  // Flag resolution: the payload wins over state, only an explicit false blocks,
+  // legacy records without the field keep the previous behaviour.
+  assert.equal(hasEnteredRangeOf({ hasEnteredRange: true }, { has_entered_range: false }), true);
+  assert.equal(hasEnteredRangeOf({}, { has_entered_range: false }), false);
+  assert.equal(hasEnteredRangeOf({}, {}), true);
+  assert.equal(hasEnteredRangeOf(null, null), true);
+});
+
+test("a below-price limit order is never range-closed before it fills", () => {
+  // -80 % → -20 % limit order under the active price: active bin 0, range -805…-112.
+  const limit = position({
+    lower_bin: -805,
+    upper_bin: -112,
+    active_bin: 0,
+    in_range: false,
+    minutes_out_of_range: 1_000,
+    hasEnteredRange: false,
+  });
+  // Price is FAR ABOVE the range while the order waits → Priority 2 stays silent,
+  // even after the out-of-range wait has long expired.
+  assert.equal(evaluateExitHierarchy(limit, MGMT), null);
+
+  // Price drops into the range → monitor arms the flag; nothing closes while inside.
+  const filled = {
+    ...limit,
+    active_bin: -400,
+    in_range: true,
+    minutes_out_of_range: 0,
+    hasEnteredRange: true,
+  };
+  assert.equal(evaluateExitHierarchy(filled, MGMT), null);
+
+  // Price later dumps through the bottom → the range exit finally fires.
+  const dumped = { ...limit, active_bin: -900, hasEnteredRange: true };
+  const d = evaluateExitHierarchy(dumped, MGMT);
+  assert.equal(d.priority, 2);
+  assert.equal(d.rule_key, "FAR_BELOW_RANGE");
+  assert.equal(d.distance_bins, 95);
+});
+
+test("position monitor flips hasEnteredRange only inside the bin range", () => {
+  const pending = { position: "pos-limit", lower_bin: -805, upper_bin: -112, active_bin: 0, in_range: false };
+  assert.equal(isActiveBinInRange(pending), false);
+  assert.equal(getHasEnteredRange(pending), false);
+  assert.deepEqual(evaluateRangeEntry(pending), { inRange: false, hasEnteredRange: false, flipped: false });
+
+  const inside = { ...pending, active_bin: -400 };
+  assert.equal(isActiveBinInRange(inside), true);
+  assert.deepEqual(evaluateRangeEntry(inside), { inRange: true, hasEnteredRange: true, flipped: true });
+
+  // One-way transition: leaving the range keeps the flag.
+  assert.deepEqual(evaluateRangeEntry({ ...pending, hasEnteredRange: true }), {
+    inRange: false,
+    hasEnteredRange: true,
+    flipped: false,
+  });
+
+  // Bounds are inclusive; reversed bounds are normalised.
+  assert.equal(isActiveBinInRange({ lower_bin: 100, upper_bin: 140, active_bin: 100 }), true);
+  assert.equal(isActiveBinInRange({ lower_bin: 100, upper_bin: 140, active_bin: 140 }), true);
+  assert.equal(isActiveBinInRange({ lower_bin: 100, upper_bin: 140, active_bin: 141 }), false);
+  assert.equal(isActiveBinInRange({ lower_bin: 140, upper_bin: 100, active_bin: 120 }), true);
+
+  // Data-gap snapshots fall back to `in_range`.
+  assert.equal(isActiveBinInRange({ in_range: true }), true);
+  assert.equal(isActiveBinInRange({ in_range: false }), false);
+  assert.equal(isActiveBinInRange({}), null);
+
+  // Tracked state supplies the geometry when the snapshot has none.
+  assert.deepEqual(resolveBinRange({}, { bin_range: { min: 80, max: 120, active: 100 } }), {
+    lowerBinId: 80,
+    upperBinId: 120,
+    activeBinId: 100,
+  });
+  assert.equal(isActiveBinInRange({}, { bin_range: { min: 80, max: 120, active: 100 } }), true);
+
+  // Unknown positions evaluate but never write state (this suite has no state writes).
+  const tick = monitorPosition({
+    position: "__test_position_monitor_unknown__",
+    lower_bin: 80,
+    upper_bin: 120,
+    active_bin: 100,
+  });
+  assert.equal(tick.flipped, true);
+  assert.equal(tick.persisted, false);
+});
+
+test("deploy starts hasEnteredRange=false and both exit loops run the monitor tick", () => {
+  const stateSrc = fs.readFileSync(path.join(ROOT, "state.js"), "utf8");
+  assert.match(stateSrc, /has_entered_range:\s*false/, "deploy must default hasEnteredRange to false");
+  assert.match(stateSrc, /export function markRangeEntered\(/);
+
+  const indexSrc = fs.readFileSync(path.join(ROOT, "index.js"), "utf8");
+  const management = indexSrc.slice(
+    indexSrc.indexOf("export async function runManagementCycle"),
+    indexSrc.indexOf("export async function runScreeningCycle"),
+  );
+  assert.match(management, /monitorPosition\(/, "management tick must update hasEnteredRange");
+  const pollStart = indexSrc.indexOf("const pnlPollInterval = setInterval");
+  assert.ok(pollStart > 0, "fast PnL poller must exist");
+  assert.match(indexSrc.slice(pollStart, pollStart + 8_000), /monitorPosition\(/, "poll tick must update hasEnteredRange");
+
+  const exitSrc = fs.readFileSync(path.join(ROOT, "exit-rules.js"), "utf8");
+  assert.match(exitSrc, /hasEnteredRangeOf\(position, tracked\)/);
+  assert.match(exitSrc, /monitorPosition\(position, \{ tracked: trackedBefore \}\)/);
 });
 
 console.log("\n--- Priority 3: Supertrend 15m candle break ---");

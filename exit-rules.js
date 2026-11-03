@@ -10,6 +10,11 @@
  *   Priority 2 — Range boundaries
  *     the active bin has moved FAR above or FAR below the position's outer bounds
  *     (`config.management.outOfRangeBinsToClose`), securing IL / freeing SOL.
+ *     Guarded by `hasEnteredRange`: a position that has never traded inside its
+ *     bounds (e.g. a below-price limit order still waiting to fill) is skipped so
+ *     it can never be range-closed before it fills. The flag is maintained by
+ *     `services/positionMonitor.js` (`false` on deploy → `true` on first in-range
+ *     tick) and persisted in state.json as `has_entered_range`.
  *   Priority 3 — Supertrend 15m candle break
  *     the latest *closed* 15m candle closes through the Supertrend line
  *     (1-candle break, fallback safety net). Needs a candle feed, so the caller
@@ -27,6 +32,7 @@
 
 import { log } from "./logger.js";
 import { getTrackedPosition, refreshPositionState } from "./state.js";
+import { monitorPosition } from "./services/positionMonitor.js";
 
 /** The three automatic exit priorities, in strict evaluation order. */
 export const EXIT_PRIORITY = Object.freeze({
@@ -184,6 +190,28 @@ function minutesOutOfRangeOf(position, tracked, now = Date.now()) {
 }
 
 /**
+ * `hasEnteredRange` guard for Priority 2 (pure — reads the payload + tracked
+ * state, never writes anything).
+ *
+ * A limit order deployed below the price starts fully out of range. Range exits
+ * must stay disabled until the position has traded inside its bounds at least
+ * once, otherwise the very first tick would cancel the order before it filled.
+ *
+ * Only an explicit `false` blocks the range exit: legacy state records written
+ * before this flag existed carry `undefined` and keep the previous behaviour.
+ *
+ * @param {object} position - getMyPositions() entry (may carry the flag itself)
+ * @param {object|null} tracked - persisted state.json record
+ * @returns {boolean} true when Priority 2 may evaluate range exits
+ */
+export function hasEnteredRangeOf(position = {}, tracked = null) {
+  const direct = position?.hasEnteredRange ?? position?.has_entered_range;
+  const persisted = tracked?.hasEnteredRange ?? tracked?.has_entered_range;
+  const flag = direct ?? persisted;
+  return flag !== false;
+}
+
+/**
  * Priorities 1 and 2 of the exit hierarchy — pure numeric evaluation. No I/O, no
  * state writes, no LLM, no technical indicators.
  *
@@ -247,6 +275,18 @@ export function evaluateExitHierarchy(position, managementConfig = {}, ctx = {})
   }
 
   // ═══ Priority 2 — range boundaries ══════════════════════════════
+  // Range-entry guard: a position deployed as a below-price limit order starts
+  // fully out of range and must not be closed by Priority 2 before it has traded
+  // inside its bounds at least once. The flag is maintained (one-way false → true)
+  // by services/positionMonitor.js on every monitoring tick.
+  if (!hasEnteredRangeOf(position, tracked)) {
+    log(
+      "rule_engine",
+      `Priority 2 skipped for ${position.pair || position.position || "position"}: hasEnteredRange=false — limit order has not entered its range yet`,
+    );
+    return null;
+  }
+
   // "Far" is measured in bins beyond the position's own outer bounds so the
   // threshold scales with the deployed range (`outOfRangeBinsToClose`).
   const activeBin = toFiniteNumber(position.active_bin);
@@ -362,6 +402,10 @@ export function detectExit(position, managementConfig = {}) {
     cfg[key] = value;
     applied[key] = value;
   }
+
+  // Range-entry tick: flips + persists `hasEnteredRange` the first time the
+  // price trades inside the position's bounds (one-way, idempotent per tick).
+  monitorPosition(position, { tracked: trackedBefore });
 
   // State mutations only (trailing arm + OOR bookkeeping) — never an exit here.
   const tracked = refreshPositionState(position.position, position, cfg) ?? trackedBefore;

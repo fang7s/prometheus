@@ -55,6 +55,7 @@ import {
   renderRangeBar,
 } from "./services/lp-menu.js";
 import { recordPriceSample, sendClosedPositionPnlCard } from "./services/pnlCardGenerator.js";
+import { monitorPosition } from "./services/positionMonitor.js";
 import {
   POOL_TIMEOUT_MESSAGE,
   POOL_TIMEOUT_MS,
@@ -305,11 +306,14 @@ export async function runManagementCycle({ silent = false } = {}) {
     }
 
     // Snapshot + load pool memory
-    const binStepByPosition = new Map(getTrackedPositions(true).map((t) => [t.position, t.bin_step]));
+    const trackedByPosition = new Map(getTrackedPositions(true).map((t) => [t.position, t]));
     const positionData = positions.map((p) => {
       recordPositionSnapshot(p.pool, p);
+      const tracked = trackedByPosition.get(p.position) ?? null;
       // Feed the closed-position PnL card with the real bin → price path.
-      recordPriceSample(p.position, p.active_bin, binStepByPosition.get(p.position));
+      recordPriceSample(p.position, p.active_bin, tracked?.bin_step);
+      // Monitoring tick: arm Priority 2 (hasEnteredRange) once price is in range.
+      monitorPosition(p, { tracked });
       return { ...p, recall: recallForPool(p.pool) };
     });
 
@@ -973,7 +977,7 @@ export function startCronJobs() {
     if (_managementBusy || _screeningBusy || _pnlPollBusy) return;
     const trackedOpen = getTrackedPositions(true);
     if (trackedOpen.length === 0) return;
-    const binStepByPosition = new Map(trackedOpen.map((t) => [t.position, t.bin_step]));
+    const trackedByPosition = new Map(trackedOpen.map((t) => [t.position, t]));
     _pnlPollBusy = true;
     try {
       // Bounded read: if the RPC (pump.helius) and the Meteora API both fail — or
@@ -993,8 +997,11 @@ export function startCronJobs() {
       if (!result?.positions?.length) return;
       for (const p of result.positions) {
         confirmPeak(p.position, p.pnl_pct, confirmTicks);
+        const tracked = trackedByPosition.get(p.position) ?? null;
         // Sample the bin → price path for the closed-position PnL card.
-        recordPriceSample(p.position, p.active_bin, binStepByPosition.get(p.position));
+        recordPriceSample(p.position, p.active_bin, tracked?.bin_step);
+        // Monitoring tick: a position only earns Priority 2 once it traded in range.
+        monitorPosition(p, { tracked });
 
         // Strict hierarchy: Priority 1 TP/SL → Priority 2 range bounds →
         // Priority 3 Supertrend 15m candle break. RSI/MACD never close a position.

@@ -1,6 +1,7 @@
 import { Connection, PublicKey } from "@solana/web3.js";
 import { config } from "../config.js";
 import { log } from "../logger.js";
+import { withTimeout } from "../utils/timeout.js";
 import {
   getTrackedPosition,
   markOutOfRange,
@@ -18,6 +19,15 @@ import {
 
 const JUP_SEARCH = "https://datapi.jup.ag/v1/assets/search";
 const METEORA_PNL = "https://dlmm.datapi.meteora.ag/positions";
+
+/** Deadline for a single RPC/HTTP read in this module (ms). */
+const PNL_RPC_TIMEOUT_MS = Math.max(1_000, Number(config.pnl?.rpcTimeoutMs ?? 8_000));
+/** Deadline for the Meteora / Jupiter HTTP calls (ms). */
+const PNL_HTTP_TIMEOUT_MS = Math.max(1_000, Number(config.pnl?.httpTimeoutMs ?? 6_000));
+
+function httpSignal(ms = PNL_HTTP_TIMEOUT_MS) {
+  return AbortSignal.timeout(ms);
+}
 
 // Lazy SDK load — mirrors tools/dlmm.js (CJS dir-imports break in ESM at import time).
 let _DLMM = null;
@@ -62,7 +72,7 @@ function unique(arr) {
 export async function fetchDlmmPnlForPool(poolAddress, walletAddress) {
   const url = `${METEORA_PNL}/${poolAddress}/pnl?user=${walletAddress}&status=open&pageSize=100&page=1`;
   try {
-    const res = await fetch(url);
+    const res = await fetch(url, { signal: httpSignal() });
     if (!res.ok) {
       const body = await res.text().catch(() => "");
       log("pnl_api", `HTTP ${res.status} for pool ${poolAddress.slice(0, 8)}: ${body.slice(0, 120)}`);
@@ -87,7 +97,10 @@ async function getJupiterPrices(mints) {
   const list = unique(mints.map((m) => String(m).trim()));
   if (!list.length) return {};
   try {
-    const res = await fetch(`${JUP_SEARCH}?query=${list.join(",")}`, { headers: { accept: "application/json" } });
+    const res = await fetch(`${JUP_SEARCH}?query=${list.join(",")}`, {
+      headers: { accept: "application/json" },
+      signal: httpSignal(),
+    });
     if (!res.ok) throw new Error(`Jupiter ${res.status}`);
     const assets = await res.json();
     const out = {};
@@ -247,7 +260,20 @@ export async function computePositions(walletAddress) {
   const conn = getPnlConnection();
   const DLMM = await loadDlmmSdk();
 
-  const map = await DLMM.getAllLbPairPositionsByUser(conn, new PublicKey(walletAddress));
+  // The public RPC (pump.helius-rpc.com) is the most fragile dependency in the
+  // poll loop: `fetch failed` / a black-holed socket must surface as a clean,
+  // fast rejection so `getMyPositions()` can fall back to the Meteora API.
+  let map;
+  try {
+    map = await withTimeout(
+      DLMM.getAllLbPairPositionsByUser(conn, new PublicKey(walletAddress)),
+      PNL_RPC_TIMEOUT_MS,
+      "positions rpc",
+    );
+  } catch (error) {
+    log("rpc_warn", `Positions RPC failed (${config.pnl.rpcUrl}): ${error.message}`);
+    throw new Error(`RPC positions unavailable: ${error.message}`);
+  }
   _pollCount++;
   if (_pollCount % 20 === 1) {
     const n = [...mapEntries(map)].reduce((s, [, i]) => s + (i?.lbPairPositionsData?.length ?? 0), 0);

@@ -97,6 +97,11 @@ export function trackPosition({
     signal_snapshot: signal_snapshot || null,
     deployed_at: new Date().toISOString(),
     out_of_range_since: null,
+    // Range-entry guard for Priority 2 exits: a fresh position starts "not yet
+    // entered" so a below-price limit order can never be range-closed before it
+    // has traded inside the range at least once (see services/positionMonitor.js).
+    has_entered_range: false,
+    range_entered_at: null,
     last_claim_at: null,
     total_fees_claimed_usd: 0,
     rebalance_count: 0,
@@ -143,6 +148,35 @@ export function markInRange(position_address) {
     save(state);
     log("state", `Position ${position_address} back in range`);
   }
+}
+
+/**
+ * One-way range-entry transition: the position traded inside its bounds at least
+ * once, so Priority 2 range exits are allowed from now on.
+ *
+ * Returns true when the flag was written by this call (false when the position
+ * is unknown/closed or had already entered its range).
+ */
+export function markRangeEntered(position_address, at = Date.now()) {
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos || pos.closed) return false;
+  if (pos.has_entered_range === true) return false;
+  pos.has_entered_range = true;
+  const stamp = new Date(Number.isFinite(Number(at)) ? Number(at) : Date.now()).toISOString();
+  pos.range_entered_at = stamp;
+  pushEvent(state, { action: "enter_range", position: position_address, pool_name: pos.pool_name || pos.pool });
+  save(state);
+  log("state", `Position ${position_address} entered range at ${stamp}`);
+  return true;
+}
+
+/**
+ * Current persisted range-entry flag (`false` when unknown/not yet entered).
+ */
+export function hasEnteredRange(position_address) {
+  const state = load();
+  return state.positions[position_address]?.has_entered_range === true;
 }
 
 /**
@@ -337,6 +371,7 @@ export function getStateSummary() {
       strategy: p.strategy,
       deployed_at: p.deployed_at,
       out_of_range_since: p.out_of_range_since,
+      has_entered_range: p.has_entered_range === true,
       minutes_out_of_range: minutesOutOfRange(p.position),
       total_fees_claimed_usd: p.total_fees_claimed_usd,
       initial_fee_tvl_24h: p.initial_fee_tvl_24h,
