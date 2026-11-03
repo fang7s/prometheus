@@ -56,6 +56,7 @@ import {
 } from "../services/lp-menu.js";
 import {
   filterTrendingPools,
+  getConfiguredMaxTvl,
   normalizeStrategyKind,
   rankPoolsForToken,
   rankTrendingPools,
@@ -77,6 +78,7 @@ import {
   normalizeUserRange,
   selectAxisTicks,
 } from "../services/chartService.js";
+import { config } from "../config.js";
 
 let passed = 0;
 
@@ -712,6 +714,56 @@ test("filterTrendingPools drops illiquid and non-SOL-quoted pools", () => {
   const loose = filterTrendingPools(TRENDING_FIXTURES, { minTvl: 0, minVolume: 0 });
   assert.equal(loose.length, 5);
   assert.equal(loose.some((pool) => pool.usable === false), false);
+});
+
+test("filterTrendingPools drops pools above the configured TVL cap", () => {
+  // The ceiling is read from the loaded config (user-config.json → maxTvl).
+  const cap = Number(config.screening.maxTvl);
+  assert.ok(Number.isFinite(cap) && cap > 0, "user-config.json must define a positive maxTvl");
+  assert.equal(getConfiguredMaxTvl(), cap);
+
+  // A hugely attractive pool — highest volume in the set — that breaches the cap.
+  const aboveCap = {
+    address: "WhalePool1111111111111111111111111111111",
+    name: "WHALE/SOL",
+    tokenXMint: "WhaleMint1111111111111111111111111111111",
+    binStep: 100,
+    tvl: cap + 1,
+    volume: 9_000_000,
+    feeTvl: 4,
+    usable: true,
+  };
+  // Exactly at the cap: still eligible (the cap is an upper bound, not exclusive).
+  const atCap = {
+    ...aboveCap,
+    address: "AtCapPool1111111111111111111111111111111",
+    tokenXMint: "AtCapMint11111111111111111111111111111111",
+    tvl: cap,
+  };
+
+  const kept = filterTrendingPools([...TRENDING_FIXTURES, aboveCap, atCap]);
+  assert.equal(kept.some((pool) => pool.address === aboveCap.address), false, "pool above maxTvl must be dropped");
+  assert.ok(kept.some((pool) => pool.address === atCap.address), "pool at exactly maxTvl stays eligible");
+  // Ranking must not resurrect it either (it has the highest volume of the set).
+  assert.equal(
+    rankTrendingPools(kept, { limit: 10 }).some((pool) => pool.address === aboveCap.address),
+    false,
+  );
+
+  // `tvlUsd` (raw discovery shape) is honoured the same way as `tvl`.
+  const rawShape = { ...aboveCap, tvl: undefined, tvlUsd: cap + 1 };
+  assert.equal(filterTrendingPools([rawShape]).length, 0);
+  assert.equal(filterTrendingPools([{ ...rawShape, tvlUsd: cap - 1 }]).length, 1);
+
+  // Explicit override wins over the config value (UI / tests can retune it)…
+  assert.deepEqual(
+    filterTrendingPools(TRENDING_FIXTURES, { maxTvl: 50_000 }).map((pool) => pool.address),
+    ["FloatPool1111111111111111111111111111111"],
+  );
+  // …and `0` / `null` disable the ceiling, keeping the lower-bound behaviour.
+  const lowerBoundOnly = filterTrendingPools(TRENDING_FIXTURES);
+  assert.deepEqual(filterTrendingPools(TRENDING_FIXTURES, { maxTvl: 0 }), lowerBoundOnly);
+  assert.deepEqual(filterTrendingPools(TRENDING_FIXTURES, { maxTvl: null }), lowerBoundOnly);
 });
 
 test("rankTrendingPools ranks by volume/TVL/fee and keeps one pool per token", () => {

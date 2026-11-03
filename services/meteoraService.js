@@ -464,18 +464,70 @@ export function scoreTrendingPool(pool) {
   return (volume / 1_000) * 1 + (tvl / 10_000) * 0.5 + feeTvl * 10 * 0.3 + organic * 0.2;
 }
 
-/** Drop illiquid, non-SOL-quoted or bin-step-less pools. */
+/**
+ * TVL ceiling from the loaded configuration (`user-config.json` → `maxTvl`).
+ *
+ * Read lazily (not captured at import time) so `reloadScreeningThresholds()`
+ * changes are honoured without a restart. Mirrors the screener convention in
+ * `tools/screening.js#passesScreeningFilters`: `null` / `0` / non-numeric
+ * values disable the cap.
+ */
+export function getConfiguredMaxTvl() {
+  const raw = config?.screening?.maxTvl;
+  if (raw == null || raw === "") return null;
+  const cap = Number(raw);
+  return Number.isFinite(cap) && cap > 0 ? cap : null;
+}
+
+/**
+ * Pool TVL in USD. Discovery payloads use `tvlUsd`, `toTokenPoolEntry()` uses
+ * `tvl`; accept either (and `null` when the pool carries no usable number).
+ */
+function poolTvlUsd(pool) {
+  for (const key of ["tvlUsd", "tvl"]) {
+    const raw = pool?.[key];
+    if (raw == null || raw === "") continue;
+    const value = Number(raw);
+    if (Number.isFinite(value)) return value;
+  }
+  return null;
+}
+
+/** Normalise a TVL cap override: anything non-positive/non-numeric disables it. */
+function normalizeTvlCap(value) {
+  if (value == null || value === "") return null;
+  const cap = Number(value);
+  return Number.isFinite(cap) && cap > 0 ? cap : null;
+}
+
+/**
+ * Drop illiquid, non-SOL-quoted or bin-step-less pools, plus any pool whose TVL
+ * is above the configured ceiling (`maxTvl` in `user-config.json`) so oversized
+ * pools cannot crowd out the smaller, higher-yield ranges this agent targets.
+ */
 export function filterTrendingPools(
   pools = [],
-  { minTvl = TRENDING_MIN_TVL_USD, minVolume = TRENDING_MIN_VOLUME_24H_USD } = {},
+  {
+    minTvl = TRENDING_MIN_TVL_USD,
+    minVolume = TRENDING_MIN_VOLUME_24H_USD,
+    maxTvl = getConfiguredMaxTvl(),
+  } = {},
 ) {
-  return (Array.isArray(pools) ? pools : []).filter((pool) =>
-    Boolean(pool?.address) &&
-    pool?.usable === true && // SOL must be token Y — the only side this menu deposits
-    Number(pool?.binStep ?? 0) > 0 &&
-    Number(pool?.tvl ?? 0) >= minTvl &&
-    Number(pool?.volume ?? 0) >= minVolume,
-  );
+  const floorTvl = Number(minTvl ?? 0);
+  const floorVolume = Number(minVolume ?? 0);
+  const capTvl = normalizeTvlCap(maxTvl);
+
+  return (Array.isArray(pools) ? pools : []).filter((pool) => {
+    if (!pool?.address) return false;
+    if (pool?.usable !== true) return false; // SOL must be token Y — the only side this menu deposits
+    if (!(Number(pool?.binStep ?? 0) > 0)) return false;
+
+    const tvl = poolTvlUsd(pool) ?? 0; // unknown TVL behaves like 0 (old lower-bound semantics)
+    if (tvl < floorTvl) return false;
+    if (capTvl != null && tvl > capTvl) return false; // configured TVL ceiling
+
+    return Number(pool?.volume ?? 0) >= floorVolume;
+  });
 }
 
 /**
@@ -549,10 +601,10 @@ export async function fetchJupiterTokenStats(mints = []) {
  * Top liquid SOL-quoted DLMM pools, ranked by 24h volume + TVL + fee/TVL
  * (Jupiter organic score as a tie-breaker). Cached for 60 s unless `force`.
  *
- * @param {{ limit?: number, force?: boolean, minTvl?: number, minVolume?: number }} [options]
+ * @param {{ limit?: number, force?: boolean, minTvl?: number, minVolume?: number, maxTvl?: number|null }} [options]
  * @returns {Promise<{
  *   pools: object[], totalScanned: number, liquidPools: number,
- *   jupiterTokens: number, minTvl: number, minVolume: number,
+ *   jupiterTokens: number, minTvl: number, minVolume: number, maxTvl: number|null,
  * }>}
  */
 export async function getTopTrendingPools({
@@ -560,6 +612,7 @@ export async function getTopTrendingPools({
   force = false,
   minTvl = TRENDING_MIN_TVL_USD,
   minVolume = TRENDING_MIN_VOLUME_24H_USD,
+  maxTvl = getConfiguredMaxTvl(), // user-config.json → maxTvl (TVL ceiling)
 } = {}) {
   if (!force && _trendingCache.data && Date.now() - _trendingCache.at < TRENDING_CACHE_TTL_MS) {
     return _trendingCache.data;
@@ -576,7 +629,7 @@ export async function getTopTrendingPools({
   const scanned = rawPools
     .filter((pool) => pool?.is_blacklisted !== true)
     .map((pool) => toTokenPoolEntry(pool));
-  const liquid = filterTrendingPools(scanned, { minTvl, minVolume });
+  const liquid = filterTrendingPools(scanned, { minTvl, minVolume, maxTvl });
 
   // Jupiter enrichment: organic score / holders / mcap for the surviving tokens.
   const jupiter = await fetchJupiterTokenStats(liquid.map((pool) => pool.tokenXMint));
@@ -601,6 +654,7 @@ export async function getTopTrendingPools({
     jupiterTokens: jupiter.size,
     minTvl,
     minVolume,
+    maxTvl: normalizeTvlCap(maxTvl),
   };
   _trendingCache.at = Date.now();
   _trendingCache.data = data;
