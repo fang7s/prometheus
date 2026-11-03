@@ -23,8 +23,14 @@ import {
   estimateBinArrayRentSol,
   extractPoolAddress,
   findTokenBalance,
+  computeRangePositionPct,
+  formatCompactUsd,
   formatDeployResult,
+  formatMarketCapLine,
   formatMoney,
+  formatPositionLine,
+  formatRangePositionLine,
+  formatRangeStatus,
   formatSolAmount,
   formatUsd,
   getLpSession,
@@ -46,6 +52,7 @@ import {
   renderNewPositionView,
   renderPositions,
   renderProfitCalendar,
+  renderRangeBar,
   renderReferralsView,
   renderTokenPools,
   renderTrendingPools,
@@ -54,6 +61,21 @@ import {
   toPoolEntry,
   truncateAddress,
 } from "../services/lp-menu.js";
+import {
+  PNL_CARD_CAPTION_LIMIT,
+  PNL_CARD_DEFAULT_HEIGHT,
+  PNL_CARD_DEFAULT_WIDTH,
+  buildClosedPositionCaption,
+  buildPricePath,
+  clearPriceSamples,
+  drawPnlCard,
+  formatHoldDuration,
+  generatePnlCard,
+  getPriceSamples,
+  normalizePnlCardData,
+  priceAtBin,
+  recordPriceSample,
+} from "../services/pnlCardGenerator.js";
 import {
   filterTrendingPools,
   getConfiguredMaxTvl,
@@ -84,6 +106,18 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { isTimeoutError, TimeoutError, withTimeout } from "../utils/timeout.js";
 import { pollBackoffMs } from "../telegram.js";
+import {
+  POOL_TIMEOUT_MESSAGE,
+  POOL_TIMEOUT_MS,
+  createAbortToken,
+  formatBasicPoolMetrics,
+  runIsolatedTask,
+} from "../services/poolScreening.js";
+import {
+  clampIntervalMin,
+  cronExprForInterval,
+  shouldAcceptScreeningTrigger,
+} from "../utils/schedule.js";
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -578,6 +612,94 @@ test("positions view falls back to the empty state", () => {
   const callbacks = view.keyboard.flat().map((button) => button.callback_data);
   assert.ok(callbacks.includes("lp:positions:refresh"));
   assert.ok(callbacks.includes("lp:main"));
+});
+
+console.log("\n=== Active position text metrics ===");
+
+test("range position percentage tracks the active bin inside min/max bins", () => {
+  assert.equal(computeRangePositionPct({ lowerBinId: 100, upperBinId: 140, activeBinId: 126 }), 65);
+  assert.equal(computeRangePositionPct({ lowerBinId: 100, upperBinId: 140, activeBinId: 100 }), 0);
+  assert.equal(computeRangePositionPct({ lowerBinId: 100, upperBinId: 140, activeBinId: 140 }), 100);
+  // Out of range clamps instead of overflowing the bar.
+  assert.equal(computeRangePositionPct({ lowerBinId: 100, upperBinId: 140, activeBinId: 162 }), 100);
+  assert.equal(computeRangePositionPct({ lowerBinId: 100, upperBinId: 140, activeBinId: 81 }), 0);
+  // Reversed bounds are normalised.
+  assert.equal(computeRangePositionPct({ lowerBinId: 140, upperBinId: 100, activeBinId: 120 }), 50);
+  // Unknown bins render nothing instead of a fake bar.
+  assert.equal(computeRangePositionPct({ lowerBinId: null, upperBinId: 140, activeBinId: 120 }), null);
+  assert.equal(computeRangePositionPct({ lowerBinId: 100, upperBinId: 140 }), null);
+  assert.equal(computeRangePositionPct(), null);
+});
+
+test("range position percentage handles single-sided SOL limit ranges", () => {
+  // -80 % → -20 % preset below the active price (active bin 0): the price is
+  // above the whole range, so the position is filled to the top.
+  assert.equal(computeRangePositionPct({ lowerBinId: -805, upperBinId: -112, activeBinId: 0 }), 100);
+  // Price still above the range.
+  assert.equal(computeRangePositionPct({ lowerBinId: -805, upperBinId: -112, activeBinId: -20 }), 100);
+  // Price dropped into the range: the percentage is measured inside the range.
+  const middle = computeRangePositionPct({ lowerBinId: -805, upperBinId: -112, activeBinId: -458 });
+  assert.ok(middle >= 49 && middle <= 51, `expected ~50%, got ${middle}`);
+  // Price below the range.
+  assert.equal(computeRangePositionPct({ lowerBinId: -805, upperBinId: -112, activeBinId: -900 }), 0);
+  // Single-bin ranges.
+  assert.equal(computeRangePositionPct({ lowerBinId: 10, upperBinId: 10, activeBinId: 10 }), 100);
+  assert.equal(computeRangePositionPct({ lowerBinId: 10, upperBinId: 10, activeBinId: 9 }), 0);
+});
+
+test("range bar renders the exact concentration", () => {
+  assert.equal(renderRangeBar(65), "[██████░░░░]");
+  assert.equal(renderRangeBar(0), "[░░░░░░░░░░]");
+  assert.equal(renderRangeBar(100), "[██████████]");
+  assert.equal(renderRangeBar(99.9), "[█████████░]");
+  assert.equal(renderRangeBar(null), "[░░░░░░░░░░]");
+  assert.equal(renderRangeBar(50, 4), "[██░░]");
+});
+
+test("active position lines show bold status, range position and market cap", () => {
+  assert.equal(formatRangeStatus(true), "🟢 <b>IN RANGE</b>");
+  assert.equal(formatRangeStatus(false), "🔴 <b>OUT OF RANGE</b>");
+  assert.equal(formatRangeStatus(null), "⚪ <b>RANGE UNKNOWN</b>");
+
+  assert.equal(formatCompactUsd(1_250_000), "$1.25M");
+  assert.equal(formatCompactUsd(940_000), "$940.0K");
+  assert.equal(formatCompactUsd(2_400_000_000), "$2.40B");
+  assert.equal(formatCompactUsd(12.5), "$12.50");
+  assert.equal(formatCompactUsd(null), null);
+  assert.equal(formatCompactUsd(0), null);
+  assert.equal(formatMarketCapLine(1_250_000), "🧢 MC: <b>$1.25M</b>");
+  assert.equal(formatMarketCapLine(0), null);
+
+  assert.equal(
+    formatRangePositionLine({ lower_bin: 100, upper_bin: 140, active_bin: 126 }),
+    "📍 Range Position: <b>65%</b> [██████░░░░]",
+  );
+  assert.equal(formatRangePositionLine({}), null);
+
+  const text = formatPositionLine({
+    position: "AbCdEfGhIjKlMnOpQrStUvWxYz1234567890abcd",
+    pair: "Anakin/SOL",
+    in_range: false,
+    total_value_usd: 52.4,
+    pnl_usd: -4.2,
+    pnl_pct: -8.1,
+    unclaimed_fees_usd: 1.15,
+    lower_bin: -805,
+    upper_bin: -112,
+    active_bin: 0,
+    age_minutes: 42,
+    mcap: 1_250_000,
+  }, 0);
+  assert.match(text, /Anakin\/SOL<\/b> 🔴 <b>OUT OF RANGE<\/b>/);
+  assert.match(text, /PnL -\$4\.20 \(-8\.10%\)/);
+  assert.match(text, /📍 Range Position: <b>100%<\/b> \[██████████\]/);
+  assert.match(text, /🧢 MC: <b>\$1\.25M<\/b>/);
+});
+
+test("open positions stay text-only (no PnL card generator in lp-menu)", () => {
+  const src = fs.readFileSync(path.join(ROOT, "services/lp-menu.js"), "utf8");
+  assert.doesNotMatch(src, /pnlCardGenerator/);
+  assert.match(src, /formatRangeStatus\(position\?\.in_range\)/);
 });
 
 test("balance view lists SOL/USDC/USDT and SPL tokens", () => {
@@ -1083,6 +1205,191 @@ await testAsync("chart generator returns a valid PNG buffer", async () => {
   assert.equal(small.readUInt32BE(20), 320);
 });
 
+console.log("\n=== Closed-position PnL card ===");
+
+const PNL_CARD_FIXTURE = {
+  position: "PnlCardPos111111111111111111111111111111111",
+  pool: "PnlCardPool11111111111111111111111111111111",
+  pool_name: "Anakin/SOL",
+  pnl_usd: -12.34,
+  pnl_pct: -8.1,
+  initial_value_usd: 150,
+  final_value_usd: 135.9,
+  fees_earned_usd: 1.76,
+  minutes_held: 315,
+  opened_at: "2026-03-01T07:00:00.000Z",
+  closed_at: "2026-03-01T12:15:00.000Z",
+  bin_step: 20,
+  bin_range: { min: 1180, max: 1234, active: 1200 },
+  entry_bin_id: 1200,
+  close_bin_id: 1170,
+  base_fee_pct: 0.2,
+  close_reason: "stop loss",
+  price_path: [
+    { at: 1_700_000_000_000, price: 11.2 },
+    { at: 1_700_000_600_000, price: 11.6 },
+    { at: 1_700_001_200_000, price: 11.1 },
+    { at: 1_700_001_800_000, price: 10.6 },
+  ],
+};
+
+test("pnl card helpers format hold time and bin prices", () => {
+  assert.equal(formatHoldDuration(315), "5h 15m");
+  assert.equal(formatHoldDuration(42), "42m");
+  assert.equal(formatHoldDuration(1500), "1d 1h");
+  assert.equal(formatHoldDuration(-5), "0m");
+  assert.equal(formatHoldDuration(Number.NaN), "0m");
+
+  assert.equal(priceAtBin(0, 20), 1);
+  assert.ok(Math.abs(priceAtBin(100, 20) - Math.pow(1.002, 100)) < 1e-12);
+  assert.equal(priceAtBin(10, 0), null);
+  assert.equal(priceAtBin("nope", 20), null);
+});
+
+test("pnl card payload derives price lines from bins (incl. below-price ranges)", () => {
+  const card = normalizePnlCardData(PNL_CARD_FIXTURE);
+  assert.equal(card.pair, "Anakin/SOL");
+  assert.equal(card.holdLabel, "5h 15m");
+  assert.equal(card.profit, false);
+  assert.equal(card.depositedUsd, 150);
+  assert.equal(card.returnedUsd, 135.9);
+  assert.equal(card.feesUsd, 1.76);
+  assert.ok(Math.abs(card.prices.top - priceAtBin(1234, 20)) < 1e-12);
+  assert.ok(Math.abs(card.prices.bottom - priceAtBin(1180, 20)) < 1e-12);
+  assert.ok(card.prices.top > card.prices.bottom);
+  assert.equal(card.pricePath.length, 4);
+  assert.equal(card.pricePath[0].t, 0);
+  assert.equal(card.pricePath[card.pricePath.length - 1].t, 1);
+
+  // Single-sided SOL limit range entirely below the active price.
+  const belowPrice = normalizePnlCardData({
+    pool_name: "Peace/SOL",
+    pnl_usd: 4.2,
+    pnl_pct: 6.5,
+    bin_step: 20,
+    bin_range: { min: -805, max: -112 },
+    entry_bin_id: 0,
+    close_bin_id: -400,
+  });
+  assert.ok(belowPrice.prices.top > belowPrice.prices.bottom);
+  assert.ok(belowPrice.prices.top < belowPrice.prices.entry, "below-price TOP sits under the entry price");
+  assert.ok(belowPrice.prices.close < belowPrice.prices.top, "close moved into the range");
+  // No recorded path → entry → close segment (never a fabricated curve).
+  assert.deepEqual(belowPrice.pricePath.map((point) => point.price), [
+    belowPrice.prices.entry,
+    belowPrice.prices.close,
+  ]);
+
+  // Missing bins degrade to em dashes instead of throwing.
+  const bare = normalizePnlCardData({ pair: "X/SOL", pnl_usd: 1, pnl_pct: 1 });
+  assert.equal(bare.prices.top, null);
+  assert.deepEqual(bare.pricePath, []);
+  assert.equal(bare.feesUsd, 0);
+
+  // PnL-history records (lessons.js) feed the same payload shape.
+  const history = normalizePnlCardData({
+    pool_name: "Peace/SOL",
+    pnl_usd: 1.5,
+    pnl_pct: 3,
+    fees_earned_usd: 0.5,
+    minutes_held: 30,
+    recorded_at: "2026-03-02T10:00:00.000Z",
+    close_reason: "take-profit",
+  });
+  assert.equal(history.closedAt, "2026-03-02T10:00:00.000Z");
+  assert.equal(history.holdLabel, "30m");
+  assert.equal(history.closeReason, "take-profit");
+});
+
+test("closed-position caption summarises the trade for Telegram", () => {
+  const caption = buildClosedPositionCaption(PNL_CARD_FIXTURE);
+  assert.match(caption, /🔒 <b>Closed<\/b> Anakin\/SOL/);
+  assert.match(caption, /PnL: <b>-\$12\.34<\/b> \(-8\.10%\)/);
+  assert.match(caption, /Deposited \$150\.00 → Returned \$135\.90/);
+  assert.match(caption, /Fees \$1\.76/);
+  assert.match(caption, /5h 15m held/);
+  assert.match(caption, /stop loss/);
+  assert.ok(caption.length <= PNL_CARD_CAPTION_LIMIT);
+
+  const win = buildClosedPositionCaption({ pool_name: "A/B", pnl_usd: 12.34, pnl_pct: 8.1 });
+  assert.match(win, /PnL: <b>\+\$12\.34<\/b> \(\+8\.10%\)/);
+
+  const long = buildClosedPositionCaption({ pool_name: `<b>${"X".repeat(2000)}</b>`, pnl_usd: 1, pnl_pct: 1 });
+  assert.ok(long.length <= PNL_CARD_CAPTION_LIMIT);
+  assert.doesNotMatch(long, /<b>XXXX/); // pool names are escaped
+});
+
+test("price samples feed the card path and stay throttled", () => {
+  clearPriceSamples();
+  const t0 = 1_700_000_000_000;
+  assert.equal(recordPriceSample("PosA", 100, 20, t0), true);
+  assert.equal(recordPriceSample("PosA", 110, 20, t0 + 1_000), false); // inside the 15 s throttle
+  assert.equal(recordPriceSample("PosA", 120, 20, t0 + 20_000), true);
+  assert.equal(recordPriceSample("PosA", 130, 0, t0 + 40_000), false); // invalid bin step
+  assert.equal(recordPriceSample("", 100, 20, t0), false); // no position address
+
+  const samples = getPriceSamples("PosA");
+  assert.equal(samples.length, 2);
+  const path = buildPricePath(samples);
+  assert.equal(path.length, 2);
+  assert.equal(path[0].t, 0);
+  assert.equal(path[1].t, 1);
+  assert.ok(path[1].price > path[0].price);
+
+  clearPriceSamples("PosA");
+  assert.equal(getPriceSamples("PosA").length, 0);
+  assert.deepEqual(buildPricePath(null), []);
+  assert.equal(buildPricePath(null, { entryPrice: 2, closePrice: 3 }).length, 2);
+});
+
+test("pnl card renderer requires an injected canvas factory", () => {
+  assert.throws(() => drawPnlCard({ pair: "X/SOL" }), /canvas factory is required/);
+});
+
+await testAsync("pnl card renders a valid PNG buffer", async () => {
+  const png = await generatePnlCard(PNL_CARD_FIXTURE);
+  assert.ok(Buffer.isBuffer(png), "expected a Buffer");
+  assert.ok(png.length > 5_000, `suspiciously small PNG: ${png.length} bytes`);
+  assert.equal(png.subarray(0, 8).toString("hex"), "89504e470d0a1a0a"); // PNG magic
+  assert.equal(png.readUInt32BE(16), PNL_CARD_DEFAULT_WIDTH);
+  assert.equal(png.readUInt32BE(20), PNL_CARD_DEFAULT_HEIGHT);
+
+  const small = await generatePnlCard(PNL_CARD_FIXTURE, { width: 640, height: 400 });
+  assert.equal(small.readUInt32BE(16), 640);
+  assert.equal(small.readUInt32BE(20), 400);
+
+  // Profitable card, a below-price range and an almost-empty payload all render.
+  const win = await generatePnlCard({ ...PNL_CARD_FIXTURE, pnl_usd: 22.5, pnl_pct: 15 });
+  assert.ok(win.length > 5_000);
+  const belowPrice = await generatePnlCard({
+    pool_name: "Peace/SOL",
+    pnl_usd: 4.2,
+    pnl_pct: 6.5,
+    bin_step: 20,
+    bin_range: { min: -805, max: -112 },
+    entry_bin_id: 0,
+    close_bin_id: -400,
+  });
+  assert.ok(belowPrice.length > 5_000);
+  const bare = await generatePnlCard({ pair: "X/SOL" });
+  assert.ok(bare.length > 2_000);
+});
+
+test("every close path triggers the closed-position PnL card", () => {
+  const indexSrc = fs.readFileSync(path.join(ROOT, "index.js"), "utf8");
+  const executorSrc = fs.readFileSync(path.join(ROOT, "tools/executor.js"), "utf8");
+  const dlmmSrc = fs.readFileSync(path.join(ROOT, "tools/dlmm.js"), "utf8");
+  // Automatic exits (TP/SL, range-out, Supertrend) close through the executor.
+  assert.match(executorSrc, /sendClosedPositionPnlCard\(result/);
+  // Manual /close and /closeall close directly and send the card themselves.
+  const manualCalls = indexSrc.match(/sendClosedPositionPnlCard\(/g) || [];
+  assert.ok(manualCalls.length >= 2, `expected /close and /closeall cards, found ${manualCalls.length}`);
+  // The price path is sampled while the position is open.
+  assert.match(indexSrc, /recordPriceSample\(/);
+  // Close results carry everything the card needs.
+  assert.match(dlmmSrc, /buildCloseSummaryFields\(\{/);
+});
+
 console.log("\n=== Below-the-price range presets ===");
 
 test("below-price presets set both bounds under the active price", () => {
@@ -1292,8 +1599,8 @@ test("index.js threads the interactive deadline through /pool and the command qu
   const src = fs.readFileSync(path.join(ROOT, "index.js"), "utf8");
   assert.match(src, /const NETWORK_TIMEOUT_MS = 5_000;/);
   assert.match(src, /const TIMEOUT_MESSAGE = "⚠️ Network timeout, please try again";/);
-  assert.match(src, /runScreeningCycle\(\{ useLLM: true, ioTimeoutMs: NETWORK_TIMEOUT_MS \}\)/);
-  assert.match(src, /ioTimeoutMs = 0 \} = \{\}\)/);
+  assert.match(src, /useLLM: true,\s*silent: true,\s*ioTimeoutMs: NETWORK_TIMEOUT_MS,\s*abortToken,/);
+  assert.match(src, /ioTimeoutMs = 0,/);
   // Every network read inside the interactive screening cycle is bounded.
   for (const label of [
     "positions read",
@@ -1311,6 +1618,168 @@ test("index.js threads the interactive deadline through /pool and the command qu
   const drains = (src.match(/drainTelegramQueue\(\)/g) || []).length;
   assert.ok(drains >= 3, `expected the queue to drain after each cycle (found ${drains})`);
   assert.match(src, /Queued command failed/);
+});
+
+console.log("\n=== /pool 8s isolation, cron dedupe & RPC fallback ===");
+
+await testAsync("a slow LLM /pool handler times out at the deadline and returns the fallback UI", async () => {
+  // The production budget is 8 s (asserted below); the behaviour is exercised with
+  // a scaled-down deadline so the suite stays fast.
+  assert.equal(POOL_TIMEOUT_MS, 8_000);
+  assert.equal(
+    POOL_TIMEOUT_MESSAGE,
+    "⚠️ Screening timed out (RPC/LLM slow). Showing basic pool metrics instead.",
+  );
+
+  // A hung LLM call never settles — the isolated runner must still return.
+  const started = Date.now();
+  const outcome = await runIsolatedTask(
+    () => new Promise(() => {}),
+    { timeoutMs: 120, label: "pool screening" },
+  );
+  assert.equal(outcome.ok, false);
+  assert.equal(outcome.timedOut, true);
+  assert.equal(outcome.label, "pool screening");
+  assert.ok(Date.now() - started < 2_000, "the handler must be released at the deadline");
+
+  // Fast work passes straight through.
+  const fast = await runIsolatedTask(async () => "Screening Cycle report", { timeoutMs: 500 });
+  assert.equal(fast.ok, true);
+  assert.equal(fast.value, "Screening Cycle report");
+
+  // A failing LLM call is captured, never thrown at the caller.
+  const failing = await runIsolatedTask(async () => { throw new Error("llm exploded"); }, { timeoutMs: 500 });
+  assert.equal(failing.ok, false);
+  assert.match(failing.error.message, /llm exploded/);
+
+  // Fallback UI: cached metrics only, no network.
+  const fallback = formatBasicPoolMetrics(
+    [{ name: "BONK/SOL", fee_active_tvl_ratio: 12.5, volume_window: 48000, tvl: 92000, active_pct: 71, organic_score: 74 }],
+    { reason: "LLM/RPC slow" },
+  );
+  assert.match(fallback, /Basic pool metrics \(LLM\/RPC slow\)/);
+  assert.match(fallback, /1\. BONK\/SOL \| fee\/aTVL 12\.5% \| vol \$48000 \| TVL \$92000 \| in-range 71% \| organic 74/);
+  assert.match(formatBasicPoolMetrics([]), /No cached pool metrics yet/);
+});
+
+await testAsync("a detached task can never leak an unhandled rejection", async () => {
+  let unhandled = 0;
+  const onUnhandled = () => { unhandled += 1; };
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    const outcome = await runIsolatedTask(
+      () => new Promise((_, reject) => setTimeout(() => reject(new Error("late boom")), 120)),
+      { timeoutMs: 30 },
+    );
+    assert.equal(outcome.timedOut, true);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  } finally {
+    process.removeListener("unhandledRejection", onUnhandled);
+  }
+  assert.equal(unhandled, 0, "late failures of an abandoned task must stay contained");
+});
+
+await testAsync("a timed-out /pool run is cancelled before it can deploy", async () => {
+  const token = createAbortToken();
+  assert.equal(token.aborted, false);
+  token.throwIfAborted("pool"); // inside the deadline → no throw
+  token.abort();
+  assert.equal(token.aborted, true);
+  assert.throws(() => token.throwIfAborted("pool"), /pool aborted after the deadline/);
+
+  // The deadline is what flips the token.
+  let fired = false;
+  const outcome = await runIsolatedTask(
+    () => new Promise(() => {}),
+    { timeoutMs: 40, label: "pool screening", onDeadline: () => { fired = true; token.abort(); } },
+  );
+  assert.equal(outcome.timedOut, true);
+  assert.equal(fired, true);
+
+  // index.js checks the token at every checkpoint that could act.
+  const src = fs.readFileSync(path.join(ROOT, "index.js"), "utf8");
+  for (const phase of ["before discovery", "before LLM selection", "before deploy"]) {
+    assert.ok(src.includes(`abortIfCancelled("${phase}")`), `missing abort checkpoint: ${phase}`);
+  }
+});
+
+test("cron expressions are minute-granular and can never fire sub-minute", () => {
+  assert.equal(cronExprForInterval(10), "*/10 * * * *");
+  assert.equal(cronExprForInterval(30), "*/30 * * * *");
+  assert.equal(cronExprForInterval(0), "*/1 * * * *");      // invalid → 1 min
+  assert.equal(cronExprForInterval(0.2), "*/1 * * * *");    // sub-minute → clamped
+  assert.equal(cronExprForInterval("11s"), "*/1 * * * *");  // junk → 1 min
+  assert.equal(cronExprForInterval(500), "*/59 * * * *");   // capped
+  // Always 5 fields — a 6-field expression would make node-cron read *seconds*.
+  for (const minutes of [1, 7, 11, 30, 59]) {
+    assert.equal(cronExprForInterval(minutes).split(" ").length, 5);
+  }
+  assert.equal(clampIntervalMin(0.25), 1);
+  assert.equal(clampIntervalMin(15), 15);
+});
+
+test("screening triggers are single-flight and de-duplicated", () => {
+  const now = 1_000_000;
+  const window = 30_000;
+
+  const running = shouldAcceptScreeningTrigger({ isRunning: true, lastAcceptedAt: 0, now, dedupeMs: window });
+  assert.equal(running.accept, false);
+  assert.match(running.reason, /already running/);
+
+  // The "fires again 11 s later" symptom: dropped by the dedupe window.
+  const duplicate = shouldAcceptScreeningTrigger({ isRunning: false, lastAcceptedAt: now - 11_000, now, dedupeMs: window });
+  assert.equal(duplicate.accept, false);
+  assert.match(duplicate.reason, /duplicate trigger 11s/);
+
+  assert.equal(
+    shouldAcceptScreeningTrigger({ isRunning: false, lastAcceptedAt: now - window - 1, now, dedupeMs: window }).accept,
+    true,
+  );
+  // Startup / explicit runs pass dedupeMs = 0.
+  assert.equal(shouldAcceptScreeningTrigger({ isRunning: false, lastAcceptedAt: now - 1, now, dedupeMs: 0 }).accept, true);
+});
+
+test("index.js routes cron through the screening guards and isolates /pool", () => {
+  const src = fs.readFileSync(path.join(ROOT, "index.js"), "utf8");
+
+  // Single-flight guard + dedupe entry point.
+  assert.match(src, /export function isScreeningRunning\(\)/);
+  assert.match(src, /export async function requestScreeningCycle\(/);
+  assert.match(src, /requestScreeningCycle\(\{ reason: "cron" \}\)/);
+  assert.match(src, /shouldAcceptScreeningTrigger\(/);
+  assert.match(src, /cronExprForInterval\(config\.schedule\.screeningIntervalMin, 30\)/);
+  // No raw `*/${...}` interpolation left in the scheduler.
+  assert.equal(/\*\/\$\{/.test(src), false, "cron expressions must go through cronExprForInterval");
+  assert.match(src, /_cronStarted/);
+
+  // /pool is deadline-isolated and has a metrics fallback.
+  assert.match(src, /runIsolatedTask\(/);
+  assert.match(src, /POOL_TIMEOUT_MS/);
+  assert.match(src, /async function sendPoolTimeoutFallback\(/);
+  assert.match(src, /POOL_TIMEOUT_MESSAGE/);
+  assert.match(src, /const poolAddressMatch = text\.match\(/);
+
+  // The cron screening callback is guarded before the cycle is spawned.
+  const cronBlock = src.slice(src.indexOf("const screenTask = cron.schedule"), src.indexOf("const healthTask"));
+  assert.match(cronBlock, /requestScreeningCycle\(\{ reason: "cron" \}\)/);
+});
+
+test("RPC position reads degrade to empty positions instead of stalling", () => {
+  const pnl = fs.readFileSync(path.join(ROOT, "tools/pnl.js"), "utf8");
+  assert.match(pnl, /rpc_warn/);
+  assert.match(pnl, /RPC positions unavailable/);
+  assert.match(pnl, /withTimeout\(/);
+  assert.match(pnl, /AbortSignal\.timeout/);
+
+  const dlmm = fs.readFileSync(path.join(ROOT, "tools/dlmm.js"), "utf8");
+  assert.match(dlmm, /POSITIONS_RPC_TIMEOUT_MS/);
+  assert.match(dlmm, /Portfolio API unavailable/);
+  assert.match(dlmm, /positions: \[\], error:/);
+
+  const index = fs.readFileSync(path.join(ROOT, "index.js"), "utf8");
+  assert.match(index, /POSITIONS_READ_TIMEOUT_MS/);
+  assert.match(index, /pnl_poll_warn/);
+  assert.match(index, /if \(result\?\.error\)/);
 });
 
 console.log(`\n✓ ${passed} LP-menu tests passed`);

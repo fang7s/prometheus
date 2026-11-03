@@ -42,6 +42,7 @@ import {
   getPoolMetadata,
   getPoolsByTokenMint,
   getTopTrendingPools,
+  fetchJupiterTokenStats,
   computeBinRange,
   strategyLabel,
   normalizeStrategyKind,
@@ -935,23 +936,127 @@ export function formatMoney(value, mode = "USD") {
   return mode === "SOL" ? `${formatSolAmount(n)} SOL` : formatUsd(n);
 }
 
+// ─── Active-position text metrics (no images) ─────────────────────
+/**
+ * Bold range badge for OPEN positions. PnL cards are reserved for closed
+ * positions / PnL history — open positions stay text-only.
+ */
+export function formatRangeStatus(inRange) {
+  if (inRange === true) return "🟢 <b>IN RANGE</b>";
+  if (inRange === false) return "🔴 <b>OUT OF RANGE</b>";
+  return "⚪ <b>RANGE UNKNOWN</b>";
+}
+
+/**
+ * Relative position (0-100 %) of the active bin inside the user's min/max bins.
+ * 0 % = active bin sits on the lower bound, 100 % = on/above the upper bound.
+ *
+ * Single-sided SOL limit ranges (both bounds BELOW the active price) correctly
+ * read 100 %: the price is above the whole range, so the position is filled to
+ * the top. Ranges entirely above the active price read 0 %.
+ */
+export function computeRangePositionPct({ lowerBinId = null, upperBinId = null, activeBinId = null } = {}) {
+  // `Number(null)` is 0 — guard missing bins explicitly so an unknown range can
+  // never masquerade as "active bin at the bottom of the range".
+  const toBin = (value) => {
+    if (value == null || value === "") return null;
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
+  };
+  const lower = toBin(lowerBinId);
+  const upper = toBin(upperBinId);
+  const active = toBin(activeBinId);
+  if (lower == null || upper == null || active == null) return null;
+  const min = Math.min(lower, upper);
+  const max = Math.max(lower, upper);
+  // Single-bin range: 100 % only once the price reached that bin.
+  if (max === min) return active >= max ? 100 : 0;
+  const pct = ((active - min) / (max - min)) * 100;
+  return Math.max(0, Math.min(100, Math.round(pct)));
+}
+
+/** `[██████░░░░]` — 10 slots, floored so 65 % fills 6 blocks. */
+export function renderRangeBar(pct, slots = 10) {
+  const total = Math.max(1, Math.round(Number(slots) || 10));
+  const value = Number(pct);
+  const ratio = Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : 0;
+  const filled = Math.max(0, Math.min(total, Math.floor((ratio / 100) * total)));
+  return `[${"█".repeat(filled)}${"░".repeat(total - filled)}]`;
+}
+
+/** `📍 Range Position: 65% [██████░░░░]` (null when the bins are unknown). */
+export function formatRangePositionLine(position) {
+  const pct = computeRangePositionPct({
+    lowerBinId: position?.lower_bin,
+    upperBinId: position?.upper_bin,
+    activeBinId: position?.active_bin,
+  });
+  if (pct == null) return null;
+  return `📍 Range Position: <b>${pct}%</b> ${renderRangeBar(pct)}`;
+}
+
+/** `$1.25M` / `$940.0K` / `$12.30` (null for missing/zero values). */
+export function formatCompactUsd(value) {
+  const n = Number(value);
+  if (value == null || !Number.isFinite(n) || n <= 0) return null;
+  if (n >= 1e12) return `$${(n / 1e12).toFixed(2)}T`;
+  if (n >= 1e9) return `$${(n / 1e9).toFixed(2)}B`;
+  if (n >= 1e6) return `$${(n / 1e6).toFixed(2)}M`;
+  if (n >= 1e3) return `$${(n / 1e3).toFixed(1)}K`;
+  return `$${n.toFixed(2)}`;
+}
+
+/** `🧢 MC: $1.25M` (null when the market cap is unknown). */
+export function formatMarketCapLine(mcap) {
+  const compact = formatCompactUsd(mcap);
+  return compact ? `🧢 MC: <b>${compact}</b>` : null;
+}
+
+/**
+ * Attach the live token market cap to open positions. Jupiter's token search is
+ * the same source the screening view uses, so a `/positions` refresh costs at
+ * most one bounded HTTP call — and never throws.
+ */
+export async function enrichPositionsWithMarketCap(positions = [], { force = true } = {}) {
+  const list = Array.isArray(positions) ? positions : [];
+  const mints = [...new Set(list.map((position) => position?.base_mint).filter(Boolean))];
+  if (!mints.length) return list;
+  try {
+    const stats = await networkDeadline(fetchJupiterTokenStats(mints, { force }), "market cap");
+    return list.map((position) => {
+      const mcap = position?.base_mint ? Number(stats.get(position.base_mint)?.mcap ?? 0) : 0;
+      return mcap > 0 ? { ...position, mcap } : position;
+    });
+  } catch (error) {
+    log("lp_ui_warn", `Market cap enrichment skipped: ${error.message}`);
+    return list;
+  }
+}
+
 export function formatPositionLine(position, index, mode = "USD") {
-  const state = position?.in_range === true ? "🟢" : position?.in_range === false ? "🔴 out of range" : "⚪";
   const pnlPct = Number(position?.pnl_pct);
   const pnlValue = Number(position?.pnl_usd);
   const pnlSign = pnlValue > 0 ? "+" : "";
+  // `-$4.20` / `+$4.20` (never `$-4.20`).
+  const pnlLabel = Number.isFinite(pnlValue) && pnlValue < 0
+    ? `-${formatMoney(Math.abs(pnlValue), mode)}`
+    : `${pnlSign}${formatMoney(pnlValue, mode)}`;
   const bins = position?.lower_bin != null && position?.upper_bin != null
     ? `🗂 ${position.lower_bin}→${position.upper_bin}${position.active_bin != null ? ` (active ${position.active_bin})` : ""}`
     : null;
   const age = Number(position?.age_minutes);
+  const metrics = [formatRangePositionLine(position), formatMarketCapLine(position?.mcap)]
+    .filter(Boolean)
+    .join(" · ");
 
   return [
-    `${index + 1}. <b>${escapeHtml(position?.pair || "unknown pool")}</b> ${state}`,
-    `   💵 ${formatMoney(position?.total_value_usd, mode)} · 📈 PnL ${pnlSign}${formatMoney(position?.pnl_usd, mode)}` +
+    `${index + 1}. <b>${escapeHtml(position?.pair || "unknown pool")}</b> ${formatRangeStatus(position?.in_range)}`,
+    `   💵 ${formatMoney(position?.total_value_usd, mode)} · 📈 PnL ${pnlLabel}` +
       `${Number.isFinite(pnlPct) ? ` (${pnlSign}${pnlPct.toFixed(2)}%)` : ""}`,
     `   🎁 Unclaimed ${formatMoney(position?.unclaimed_fees_usd, mode)}${bins ? ` · ${bins}` : ""}`,
+    metrics ? `   ${metrics}` : null,
     `   ⏱ ${Number.isFinite(age) ? `${age}m` : "?"} · 🆔 <code>${escapeHtml(String(position?.position || "?").slice(0, 12))}…</code>`,
-  ].join("\n");
+  ].filter((line) => line != null).join("\n");
 }
 
 export function renderPositions({ positions = [], wallet = null, note = null, mode = null } = {}) {
@@ -1491,6 +1596,8 @@ export async function showPositionsView(msg, { force = false, messageId = null }
     const snapshot = await networkDeadline(getMyPositions({ force, silent: true }), "positions read");
     if (snapshot?.error) note = snapshot.error;
     positions = Array.isArray(snapshot?.positions) ? snapshot.positions : [];
+    // Live market cap for the `🧢 MC` line — bounded, cached and non-fatal.
+    positions = await enrichPositionsWithMarketCap(positions, { force });
   } catch (error) {
     if (await reportTimeout("positions read", error)) {
       note = TIMEOUT_NOTE;

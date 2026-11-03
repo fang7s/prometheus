@@ -26,7 +26,7 @@ import {
   createLiveMessage,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, getTrackedPositions, setPositionInstruction, confirmPeak, registerExitSignal } from "./state.js";
+import { getLastBriefingDate, setLastBriefingDate, getTrackedPositions, getTrackedPosition, setPositionInstruction, confirmPeak, registerExitSignal } from "./state.js";
 import { detectExit, evaluateSupertrendExit, formatExitLog, parseInstructionOverrides } from "./exit-rules.js";
 // `withDeadline` rejects with TimeoutError; the local `withTimeout` below is the
 // non-throwing shutdown helper and keeps its existing contract.
@@ -39,7 +39,30 @@ import { stageSignals } from "./signal-tracker.js";
 import { getWeightsSummary } from "./signal-weights.js";
 import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
 import { appendDecision } from "./decision-log.js";
-import { showLpMainMenu, showNewPositionView, showPoolListView, forgetLpMessageView, handleLpCallback, handleLpText } from "./services/lp-menu.js";
+import {
+  showLpMainMenu,
+  showNewPositionView,
+  showPoolListView,
+  forgetLpMessageView,
+  handleLpCallback,
+  handleLpText,
+  openAddressQuery as openLpAddressQuery,
+  computeRangePositionPct,
+  enrichPositionsWithMarketCap,
+  escapeHtml,
+  formatCompactUsd,
+  formatRangeStatus,
+  renderRangeBar,
+} from "./services/lp-menu.js";
+import { recordPriceSample, sendClosedPositionPnlCard } from "./services/pnlCardGenerator.js";
+import {
+  POOL_TIMEOUT_MESSAGE,
+  POOL_TIMEOUT_MS,
+  createAbortToken,
+  formatBasicPoolMetrics,
+  runIsolatedTask,
+} from "./services/poolScreening.js";
+import { SCREENING_TRIGGER_DEDUPE_MS, clampIntervalMin, cronExprForInterval, shouldAcceptScreeningTrigger } from "./utils/schedule.js";
 // Import only what we actually need for the new functionality
 import { evaluateEvilPandaCandidate, getEvilPandaRecommendedParams } from "./tools/evil-panda-enhanced.js";
 import { fetchSupertrend15m } from "./tools/chart-indicators.js";
@@ -104,9 +127,14 @@ let _cronTasks = [];
 // read is bounded by this deadline (autonomous cycles keep their own budgets).
 const NETWORK_TIMEOUT_MS = 5_000;
 const TIMEOUT_MESSAGE = "⚠️ Network timeout, please try again";
+// Position reads hit Solana RPC (pump.helius) + the Meteora API. Bounded so a
+// dead endpoint can never pin the PnL poller (`_pnlPollBusy` stuck) or a cycle.
+const POSITIONS_READ_TIMEOUT_MS = 8_000;
 
 let _managementBusy = false; // prevents overlapping management cycles
 let _screeningBusy = false;  // prevents overlapping screening cycles
+let _screeningLastAcceptedAt = 0; // epoch ms — dedupe window for screening triggers
+let _cronStarted = false;    // idempotent-ish scheduler guard (no duplicate timer sets)
 let _flipperBusy = false;    // prevents overlapping bid-ask flipper cycles
 let _screeningLastTriggered = 0; // epoch ms — prevents management from spamming screening
 // Exit/peak confirmation is now done by consecutive-tick counting in state.js
@@ -166,6 +194,7 @@ function stopCronJobs() {
   if (_cronTasks._pnlPollInterval) clearInterval(_cronTasks._pnlPollInterval);
   if (_cronTasks._opportunityPollInterval) clearInterval(_cronTasks._opportunityPollInterval);
   _cronTasks = [];
+  _cronStarted = false;
 }
 
 /**
@@ -257,19 +286,30 @@ export async function runManagementCycle({ silent = false } = {}) {
     if (!silent && telegramEnabled()) {
       liveMessage = await createLiveMessage("🔄 Management Cycle", "Evaluating positions...");
     }
-    const livePositions = await getMyPositions({ force: true }).catch(() => null);
+    const livePositions = await withDeadline(
+      getMyPositions({ force: true }),
+      POSITIONS_READ_TIMEOUT_MS,
+      "management positions",
+    ).catch((error) => {
+      log("cron_warn", `Management position read failed (${error.message}) — skipping this cycle`);
+      return null;
+    });
     positions = livePositions?.positions || [];
 
     if (positions.length === 0) {
       log("cron", "No open positions — triggering screening cycle");
       mgmtReport = "No open positions. Triggering screening cycle.";
-      runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
+      requestScreeningCycle({ reason: "no-positions", dedupeMs: screeningCooldownMs })
+        .catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
       return mgmtReport;
     }
 
     // Snapshot + load pool memory
+    const binStepByPosition = new Map(getTrackedPositions(true).map((t) => [t.position, t.bin_step]));
     const positionData = positions.map((p) => {
       recordPositionSnapshot(p.pool, p);
+      // Feed the closed-position PnL card with the real bin → price path.
+      recordPriceSample(p.position, p.active_bin, binStepByPosition.get(p.position));
       return { ...p, recall: recallForPool(p.pool) };
     });
 
@@ -314,11 +354,17 @@ export async function runManagementCycle({ silent = false } = {}) {
 
     const reportLines = positionData.map((p) => {
       const act = actionMap.get(p.position);
-      const inRange = p.in_range ? "🟢 IN" : `🔴 OOR ${p.minutes_out_of_range ?? 0}m`;
+      const inRange = p.in_range ? "🟢 IN RANGE" : `🔴 OUT OF RANGE ${p.minutes_out_of_range ?? 0}m`;
       const val = config.management.solMode ? `◎${p.total_value_usd ?? "?"}` : `$${p.total_value_usd ?? "?"}`;
       const unclaimed = config.management.solMode ? `◎${p.unclaimed_fees_usd ?? "?"}` : `$${p.unclaimed_fees_usd ?? "?"}`;
       const statusLabel = act.action === "CLOSE" ? `CLOSE (${act.headline || act.name})` : act.action;
-      let line = `**${p.pair}** | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | PnL: ${p.pnl_pct ?? "?"}% | Yield: ${p.fee_per_tvl_24h ?? "?"}% | ${inRange} | ${statusLabel}`;
+      const rangePct = computeRangePositionPct({
+        lowerBinId: p.lower_bin,
+        upperBinId: p.upper_bin,
+        activeBinId: p.active_bin,
+      });
+      const rangeLabel = rangePct != null ? ` | 📍 ${rangePct}% ${renderRangeBar(rangePct)}` : "";
+      let line = `**${p.pair}** | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | PnL: ${p.pnl_pct ?? "?"}% | Yield: ${p.fee_per_tvl_24h ?? "?"}% | ${inRange}${rangeLabel} | ${statusLabel}`;
       if (p.instruction) {
         const overrides = parseInstructionOverrides(p.instruction);
         const parsed = Object.entries(overrides).map(([k, v]) => `${k}=${v}`).join(", ");
@@ -359,7 +405,8 @@ export async function runManagementCycle({ silent = false } = {}) {
     const afterCount = afterPositions?.positions?.length ?? 0;
     if (afterCount < config.risk.maxPositions && Date.now() - _screeningLastTriggered > screeningCooldownMs) {
       log("cron", `Post-management: ${afterCount}/${config.risk.maxPositions} positions — triggering screening`);
-      runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
+      requestScreeningCycle({ reason: "post-management", dedupeMs: screeningCooldownMs })
+        .catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
     }
   } catch (error) {
     log("cron_error", `Management cycle failed: ${error.message}`);
@@ -385,14 +432,66 @@ export async function runManagementCycle({ silent = false } = {}) {
 }
 
 /**
+ * True while a screening cycle (or an accepted trigger that is about to start
+ * one) is active. Cron ticks, the opportunity poller, management hand-off and
+ * `/pool` all consult this so a cycle can never be spawned twice.
+ */
+export function isScreeningRunning() {
+  return _screeningBusy;
+}
+
+/**
+ * Single entry point for *automatic* screening triggers.
+ *
+ * Applies the two scheduler guards before touching `runScreeningCycle`:
+ *   1. `isScreeningRunning()` — never spawn a second cycle, and
+ *   2. a dedupe window — overlapping triggers (cron tick + opportunity poll +
+ *      management hand-off) collapse into one cycle instead of queueing up.
+ *
+ * @param {object} [options]
+ * @param {string} [options.reason] - trigger name for logs (`cron`, `opportunity`, …)
+ * @param {number} [options.dedupeMs] - override the dedupe window
+ * @returns {Promise<string|null>} the cycle report, or null when skipped
+ */
+export async function requestScreeningCycle({
+  reason = "trigger",
+  silent = false,
+  useLLM = false,
+  ioTimeoutMs = 0,
+  dedupeMs = SCREENING_TRIGGER_DEDUPE_MS,
+} = {}) {
+  const verdict = shouldAcceptScreeningTrigger({
+    isRunning: isScreeningRunning(),
+    lastAcceptedAt: _screeningLastAcceptedAt,
+    dedupeMs,
+  });
+  if (!verdict.accept) {
+    log("cron", `Screening trigger (${reason}) skipped — ${verdict.reason}`);
+    return null;
+  }
+  // Stamp before awaiting so concurrent triggers see it immediately.
+  _screeningLastAcceptedAt = Date.now();
+  return runScreeningCycle({ silent, useLLM, ioTimeoutMs });
+}
+
+/**
  * @param {object} [options]
  * @param {boolean} [options.silent]
  * @param {boolean} [options.useLLM]
  * @param {number} [options.ioTimeoutMs] - hard deadline for each network read.
  *   The interactive `/pool` command passes {@link NETWORK_TIMEOUT_MS} so a stalled
  *   RPC/API can never keep the user waiting; autonomous cycles pass 0 (unbounded).
+ * @param {{aborted: boolean, throwIfAborted: (label?: string) => void}|null} [options.abortToken]
+ *   Cooperative cancellation. Checked before the discovery call, before the LLM
+ *   and immediately before the deploy, so a `/pool` run that blew its deadline
+ *   can never place a position afterwards.
  */
-export async function runScreeningCycle({ silent = false, useLLM = false, ioTimeoutMs = 0 } = {}) {
+export async function runScreeningCycle({
+  silent = false,
+  useLLM = false,
+  ioTimeoutMs = 0,
+  abortToken = null,
+} = {}) {
   if (_screeningBusy) {
     log("cron", "Screening skipped — previous cycle still running");
     return null;
@@ -408,6 +507,19 @@ export async function runScreeningCycle({ silent = false, useLLM = false, ioTime
     _screeningBusy = false;
     drainTelegramQueue().catch(() => {});
     return report;
+  };
+
+  /**
+   * Cooperative cancellation for the interactive `/pool` run: once its 8 s
+   * deadline fires the token flips and the cycle stops at the next checkpoint
+   * (discovery → LLM → deploy), so it can never act after the user was told it
+   * timed out.
+   */
+  const abortIfCancelled = (phase) => {
+    if (!abortToken?.aborted) return false;
+    screenReport = `Screening aborted (${phase}) — exceeded the interactive deadline.`;
+    log("cron_warn", screenReport);
+    return true;
   };
 
   // Hard guards — don't even run the agent if preconditions aren't met
@@ -468,6 +580,8 @@ export async function runScreeningCycle({ silent = false, useLLM = false, ioTime
     const deployStrategy = config.strategy.strategy;
     const strategyBlock = `DEPLOY STRATEGY: ${deployStrategy} (from config) | bins_above: 0 (FIXED — never change) | deposit: SOL only (amount_y, amount_x=0)`
       + (activeStrategy ? `\nSTRATEGY CONTEXT: ${activeStrategy.name} — entry: ${activeStrategy.entry?.condition || "n/a"} | exit: ${activeStrategy.exit?.notes || "n/a"} | best for: ${activeStrategy.best_for}` : "");
+
+    if (abortIfCancelled("before discovery")) return screenReport;
 
     // Fetch top candidates, then recon each sequentially with a small delay to avoid 429s
     let scanTimedOut = false;
@@ -636,6 +750,7 @@ export async function runScreeningCycle({ silent = false, useLLM = false, ioTime
     // In both cases the entry itself is executed 100% in code by deployCandidate().
     let selection;
     if (useLLM) {
+      if (abortIfCancelled("before LLM selection")) return screenReport;
       const weightsSummary = config.darwin?.enabled ? getWeightsSummary() : null;
       const candidateMenu = passing
         .map((_, i) => `#${i + 1}\n${candidateBlocks[i]}`)
@@ -694,6 +809,9 @@ the transaction are NOT yours to decide. Never invent tool output.
         rejected: passing.slice(0, 5).map(({ pool }) => pool.name),
       });
     } else {
+      // Last checkpoint: never place a position for a run the user already saw
+      // time out (the token is flipped by the isolated task's deadline).
+      if (abortIfCancelled("before deploy")) return screenReport;
       const candidate = passing[selection.index].pool;
       await liveMessage?.toolStart("deploy_position");
       try {
@@ -769,9 +887,19 @@ export async function runDeterministicHealthCheck({ silent = false } = {}) {
 }
 
 export function startCronJobs() {
+  // Idempotent: always tear down the previous timer set first. Combined with the
+  // `_cronStarted` flag this guarantees that repeated calls (config reloads,
+  // /resume, TTY + non-TTY boot paths) cannot leave several schedules running
+  // in parallel — which is what made cycles appear to fire every few seconds.
+  if (_cronStarted) log("cron", "Cron already running — restarting with the current schedule");
   stopCronJobs(); // stop any running tasks before (re)starting
 
-  const mgmtTask = cron.schedule(`*/${Math.max(1, config.schedule.managementIntervalMin)} * * * *`, async () => {
+  // Interval expressions are clamped to >= 1 minute and always 5-field, so a bad
+  // config value can never produce a sub-minute (seconds) timer.
+  const mgmtExpr = cronExprForInterval(config.schedule.managementIntervalMin, 10);
+  const screenExpr = cronExprForInterval(config.schedule.screeningIntervalMin, 30);
+
+  const mgmtTask = cron.schedule(mgmtExpr, async () => {
     if (_managementBusy) return;
     timers.managementLastRun = Date.now();
     await runManagementCycle();
@@ -781,8 +909,8 @@ export function startCronJobs() {
   // Holds the management lock so a flip can't overlap a management/poller close.
   let flipperTask = null;
   if (config.flipper?.enabled) {
-    const flipIntervalMin = Math.min(59, Math.max(1, Math.round(Number(config.flipper.intervalMin ?? 10))));
-    flipperTask = cron.schedule(`*/${flipIntervalMin} * * * *`, async () => {
+    const flipIntervalMin = clampIntervalMin(config.flipper.intervalMin ?? 10, 10);
+    flipperTask = cron.schedule(cronExprForInterval(flipIntervalMin, 10), async () => {
       if (_flipperBusy || _managementBusy) return;
       _flipperBusy = true;
       _managementBusy = true;
@@ -801,7 +929,13 @@ export function startCronJobs() {
     });
   }
 
-  const screenTask = cron.schedule(`*/${Math.max(1, config.schedule.screeningIntervalMin)} * * * *`, runScreeningCycle);
+  // Screening cron — guarded by `isScreeningRunning()` + the dedupe window inside
+  // `requestScreeningCycle`, so a tick that lands while a cycle is still active is
+  // dropped instead of spawning a duplicate run.
+  const screenTask = cron.schedule(screenExpr, () => {
+    requestScreeningCycle({ reason: "cron" })
+      .catch((error) => log("cron_error", `Cron screening failed: ${error.message}`));
+  });
 
   const healthTask = cron.schedule(`0 * * * *`, async () => {
     if (_managementBusy) return;
@@ -837,13 +971,30 @@ export function startCronJobs() {
   let _pnlPollBusy = false;
   const pnlPollInterval = setInterval(async () => {
     if (_managementBusy || _screeningBusy || _pnlPollBusy) return;
-    if (getTrackedPositions(true).length === 0) return;
+    const trackedOpen = getTrackedPositions(true);
+    if (trackedOpen.length === 0) return;
+    const binStepByPosition = new Map(trackedOpen.map((t) => [t.position, t.bin_step]));
     _pnlPollBusy = true;
     try {
-      const result = await getMyPositions({ force: true, silent: true }).catch(() => null);
+      // Bounded read: if the RPC (pump.helius) and the Meteora API both fail — or
+      // simply hang — the tick returns empty-handed instead of stalling the loop.
+      const result = await withDeadline(
+        getMyPositions({ force: true, silent: true }),
+        POSITIONS_READ_TIMEOUT_MS,
+        "pnl poll positions",
+      ).catch((error) => {
+        log("pnl_poll_warn", `Positions read failed (${error.message}) — keeping the loop alive`);
+        return null;
+      });
+      if (result?.error) {
+        log("pnl_poll_warn", `Positions unavailable: ${result.error}`);
+        return;
+      }
       if (!result?.positions?.length) return;
       for (const p of result.positions) {
         confirmPeak(p.position, p.pnl_pct, confirmTicks);
+        // Sample the bin → price path for the closed-position PnL card.
+        recordPriceSample(p.position, p.active_bin, binStepByPosition.get(p.position));
 
         // Strict hierarchy: Priority 1 TP/SL → Priority 2 range bounds →
         // Priority 3 Supertrend 15m candle break. RSI/MACD never close a position.
@@ -925,7 +1076,9 @@ export function startCronJobs() {
           ? ` + smart wallet [${trigger.smart.map((w) => w.name || w.address?.slice(0, 4)).join(", ")}] (bar lowered ${minScore}→${floor})`
           : "";
         log("cron", `[Opportunity] ${trigger.c.name} degen ${trigger.s.toFixed(1)} >= ${trigger.smart.length ? floor : minScore}${smartTag} — triggering screening deploy decision`);
-        runScreeningCycle({ silent: true }).catch((e) => log("cron_error", `Opportunity-triggered screening failed: ${e.message}`));
+        // Single-flight + dedupe: never stacks on top of a cron/management cycle.
+        requestScreeningCycle({ reason: "opportunity", silent: true, dedupeMs: oppCooldownMs })
+          .catch((e) => log("cron_error", `Opportunity-triggered screening failed: ${e.message}`));
       } catch (e) {
         log("cron_error", `Opportunity poll failed: ${e.message}`);
       } finally {
@@ -938,7 +1091,8 @@ export function startCronJobs() {
   // Store interval refs so stopCronJobs can clear them
   _cronTasks._pnlPollInterval = pnlPollInterval;
   _cronTasks._opportunityPollInterval = opportunityPollInterval;
-  log("cron", `Cycles started — management every ${config.schedule.managementIntervalMin}m, screening every ${config.schedule.screeningIntervalMin}m${config.opportunity.enabled ? `, opportunity poll every ${config.opportunity.pollIntervalSec}s` : ""}`);
+  _cronStarted = true;
+  log("cron", `Cycles started — management "${mgmtExpr}", screening "${screenExpr}"${config.opportunity.enabled ? `, opportunity poll every ${config.opportunity.pollIntervalSec}s` : ""}`);
 }
 
 // ═══════════════════════════════════════════
@@ -1046,6 +1200,18 @@ function describeLatestCandidates(limit = 5) {
   });
   const age = _latestCandidatesAt ? new Date(_latestCandidatesAt).toLocaleString("en-US", { hour12: false }) : "unknown";
   return `Latest candidates (${_latestCandidates.length}) — updated ${age}\n\n${lines.join("\n")}`;
+}
+
+/**
+ * `/pool` timeout fallback: the exact timeout notice plus a cheap metrics block
+ * built from the last screening snapshot (no network calls, so it is always
+ * available immediately after the deadline fires).
+ */
+async function sendPoolTimeoutFallback(reason = null) {
+  await sendMessage(POOL_TIMEOUT_MESSAGE).catch(() => {});
+  const { candidates, updatedAt } = getLatestCandidatesMeta();
+  const fallback = formatBasicPoolMetrics(candidates, { updatedAt, reason });
+  await sendMessage(fallback).catch(() => {});
 }
 
 function formatWalletStatus(wallet, positions) {
@@ -1747,30 +1913,88 @@ async function telegramHandler(msg) {
     try {
       const { positions, total_positions } = await getMyPositions({ force: true });
       if (total_positions === 0) { await sendMessage("No open positions."); return; }
+      // Live market cap is a display-only enrichment — failures leave it off.
+      const enriched = await enrichPositionsWithMarketCap(positions);
       const cur = config.management.solMode ? "◎" : "$";
-      const lines = positions.map((p, i) => {
+      const lines = enriched.map((p, i) => {
         const pnl = p.pnl_usd >= 0 ? `+${cur}${p.pnl_usd}` : `-${cur}${Math.abs(p.pnl_usd)}`;
         const age = p.age_minutes != null ? `${p.age_minutes}m` : "?";
-        const oor = !p.in_range ? " ⚠️OOR" : "";
-        return `${i + 1}. ${p.pair} | ${cur}${p.total_value_usd} | PnL: ${pnl} | fees: ${cur}${p.unclaimed_fees_usd} | ${age}${oor}`;
+        const parts = [
+          `${i + 1}. <b>${escapeHtml(p.pair)}</b> ${formatRangeStatus(p.in_range)}`,
+          `   ${cur}${p.total_value_usd} · PnL ${pnl} · fees ${cur}${p.unclaimed_fees_usd} · ⏱ ${age}`,
+        ];
+        const rangePct = computeRangePositionPct({
+          lowerBinId: p.lower_bin,
+          upperBinId: p.upper_bin,
+          activeBinId: p.active_bin,
+        });
+        if (rangePct != null) parts.push(`   📍 Range Position: <b>${rangePct}%</b> ${renderRangeBar(rangePct)}`);
+        const mcap = formatCompactUsd(p.mcap);
+        if (mcap) parts.push(`   🧢 MC: <b>${mcap}</b>`);
+        return parts.join("\n");
       });
-      await sendMessage(`📊 Open Positions (${total_positions}):\n\n${lines.join("\n")}\n\n/close <n> to close | /set <n> <note> to set instruction`);
+      await sendHTML(
+        `📊 <b>Open Positions</b> (${total_positions}):\n\n${lines.join("\n\n")}\n\n` +
+        `/close &lt;n&gt; to close | /set &lt;n&gt; &lt;note&gt; to set instruction`,
+      );
     } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
     return;
   }
 
   // /pool (no argument) — the ONLY LLM-assisted workflow: candidate screening.
-  // The LLM picks a candidate; the deterministic executor sizes and deploys.
+  //
+  // The ENTIRE run (LLM selection, token recon, smart-wallet lookups, deploy
+  // sizing) executes as an isolated task raced against an absolute 8 s deadline.
+  // If it is not done by then the handler aborts the wait, answers the user with
+  // the timeout notice + cached metrics, and lets the detached task finish in the
+  // background — so `/start` and every other command stay responsive.
   if (text === "/pool" || text.toLowerCase() === "/pool screen") {
-    try {
-      await sendMessage("🔍 Screening started — LLM selects a candidate, code executes the entry.").catch(() => {});
-      // Interactive run: every RPC/API read inside the cycle is capped at 5 s.
-      // A timeout comes back as the cycle report, which the live message already
-      // delivers to the user — no duplicate message here.
-      await runScreeningCycle({ useLLM: true, ioTimeoutMs: NETWORK_TIMEOUT_MS });
-    } catch (e) {
-      const timedOut = isTimeoutError(e);
-      await sendMessage(timedOut ? TIMEOUT_MESSAGE : `Error: ${e.message}`).catch(() => {});
+    await sendMessage("🔍 Screening started — LLM selects a candidate, code executes the entry.").catch(() => {});
+    // Cancellation token: when the 8 s budget expires the cycle is told to stop,
+    // so the detached run can never deploy after the user was told it timed out.
+    const abortToken = createAbortToken();
+    const outcome = await runIsolatedTask(
+      // `silent` keeps the detached cycle from posting its own report later; this
+      // handler owns the single, deadline-bounded reply.
+      () => runScreeningCycle({
+        useLLM: true,
+        silent: true,
+        ioTimeoutMs: NETWORK_TIMEOUT_MS,
+        abortToken,
+      }),
+      { timeoutMs: POOL_TIMEOUT_MS, label: "pool screening", onDeadline: () => abortToken.abort() },
+    );
+
+    if (outcome.timedOut) {
+      await sendPoolTimeoutFallback("LLM/RPC slow");
+      return;
+    }
+    if (!outcome.ok) {
+      const e = outcome.error;
+      await sendMessage(isTimeoutError(e) ? TIMEOUT_MESSAGE : `Error: ${e?.message || e}`).catch(() => {});
+      return;
+    }
+    const report = typeof outcome.value === "string" ? outcome.value.trim() : "";
+    if (report) {
+      await sendMessage(`🔍 Screening Cycle\n\n${stripThink(report)}`).catch(() => {});
+    }
+    return;
+  }
+
+  // /pool <mint | pool address> — read-only pool lookup (no LLM). Same 8 s
+  // isolation so a slow RPC/Meteora call degrades to the metrics fallback.
+  const poolAddressMatch = text.match(/^\/pool\s+([1-9A-HJ-NP-Za-km-z]{32,44})$/);
+  if (poolAddressMatch) {
+    const outcome = await runIsolatedTask(
+      () => openLpAddressQuery(msg, poolAddressMatch[1]),
+      { timeoutMs: POOL_TIMEOUT_MS, label: "pool lookup" },
+    );
+    if (outcome.timedOut) {
+      await sendPoolTimeoutFallback("pool lookup slow");
+      return;
+    }
+    if (!outcome.ok) {
+      await sendMessage(isTimeoutError(outcome.error) ? TIMEOUT_MESSAGE : `Error: ${outcome.error?.message}`).catch(() => {});
     }
     return;
   }
@@ -1815,6 +2039,11 @@ async function telegramHandler(msg) {
         const closeTxs = result.close_txs?.length ? result.close_txs : result.txs;
         const claimNote = result.claim_txs?.length ? `\nClaim txs: ${result.claim_txs.join(", ")}` : "";
         await sendMessage(`✅ Closed ${pos.pair}\nPnL: ${config.management.solMode ? "◎" : "$"}${result.pnl_usd ?? "?"} | close txs: ${closeTxs?.join(", ") || "n/a"}${claimNote}`);
+        // Closed positions get the Zenith-style PnL card (open ones stay text-only).
+        await sendClosedPositionPnlCard(
+          { ...result, pair: pos.pair },
+          { tracked: getTrackedPosition(pos.position) },
+        ).catch(() => {});
       } else {
         await sendMessage(`❌ Close failed: ${JSON.stringify(result)}`);
       }
@@ -1832,6 +2061,12 @@ async function telegramHandler(msg) {
         try {
           const result = await closePosition({ position_address: pos.position });
           results.push(`${pos.pair}: ${result.success ? "closed" : `failed (${result.error || "unknown"})`}`);
+          if (result.success) {
+            await sendClosedPositionPnlCard(
+              { ...result, pair: pos.pair },
+              { tracked: getTrackedPosition(pos.position) },
+            ).catch(() => {});
+          }
         } catch (error) {
           results.push(`${pos.pair}: failed (${error.message})`);
         }
@@ -2353,7 +2588,8 @@ Focus on: hold duration, entry/exit timing, what win rates look like, whether sc
   startPolling(telegramHandler);
   (async () => {
     try {
-      await runScreeningCycle({ silent: false });
+      // Goes through the same single-flight guard as every other trigger.
+      await requestScreeningCycle({ reason: "startup", dedupeMs: 0 });
     } catch (e) {
       log("startup_error", e.message);
     }

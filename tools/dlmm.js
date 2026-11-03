@@ -30,6 +30,12 @@ import { appendDecision } from "../decision-log.js";
 import { agentMeridianJson, getAgentIdForRequests, getAgentMeridianHeaders } from "./agent-meridian.js";
 import { getAndClearStagedSignals } from "../signal-tracker.js";
 import { computePositions, fetchDlmmPnlForPool } from "./pnl.js";
+import { withTimeout as withReadDeadline } from "../utils/timeout.js";
+
+/** Deadline for the RPC position read (ms) — falls back to the Meteora API. */
+const POSITIONS_RPC_TIMEOUT_MS = Math.max(1_000, Number(config.pnl?.rpcTimeoutMs ?? 8_000));
+/** Deadline for the Meteora portfolio fallback (ms). */
+const PORTFOLIO_HTTP_TIMEOUT_MS = Math.max(1_000, Number(config.pnl?.httpTimeoutMs ?? 8_000));
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -1190,7 +1196,13 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
     if (config.pnl.source === "rpc") {
       try {
         if (!silent) log("positions", `Computing PnL from RPC (${config.pnl.rpcUrl})...`);
-        const rpcResult = await computePositions(walletAddress);
+        // Hard deadline: a stalled/failed public RPC must not hang the poller —
+        // it rejects here and the Meteora portfolio path below takes over.
+        const rpcResult = await withReadDeadline(
+          computePositions(walletAddress),
+          POSITIONS_RPC_TIMEOUT_MS,
+          "positions rpc",
+        );
         if (useLocalWallet) {
           syncOpenPositions(rpcResult.positions.map((p) => p.position));
           _positionsCache = rpcResult;
@@ -1205,7 +1217,16 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
     // ── Fallback path: Meteora portfolio + /pnl APIs (no LPAgent) ──
     if (!silent) log("positions", "Fetching portfolio via Meteora portfolio API...");
     const portfolioUrl = `https://dlmm.datapi.meteora.ag/portfolio/open?user=${walletAddress}`;
-    const res = await fetch(portfolioUrl);
+    // Same story as the RPC: bounded + try/catch, so a double outage ("fetch
+    // failed" on both paths) ends in an empty, error-tagged snapshot (the outer
+    // catch below) instead of an unhandled rejection inside the poll loop.
+    let res;
+    try {
+      res = await fetch(portfolioUrl, { signal: AbortSignal.timeout(PORTFOLIO_HTTP_TIMEOUT_MS) });
+    } catch (error) {
+      log("positions_warn", `Portfolio API unavailable (${error.message}) — returning empty positions`);
+      return { wallet: walletAddress, total_positions: 0, positions: [], error: `Portfolio API unavailable: ${error.message}` };
+    }
     if (!res.ok) throw new Error(`Portfolio API ${res.status}: ${await res.text().catch(() => "")}`);
     const portfolio = await res.json();
 
@@ -1520,6 +1541,56 @@ export async function claimFees({ position_address }) {
 }
 
 // ─── Close Position ────────────────────────────────────────────
+/** Pool base fee % (same formula `deployPosition` reports as `base_fee`). */
+function baseFeePctFromPool(pool) {
+  const binStep = Number(pool?.lbPair?.binStep ?? 0);
+  const params = pool?.lbPair?.parameters || {};
+  const baseFactor = Number(params.baseFactor ?? 0);
+  const powerFactor = Number(params.baseFeePowerFactor ?? 0);
+  if (!baseFactor || !binStep) return null;
+  const fraction = (baseFactor * binStep * 10 * Math.pow(10, powerFactor)) / 1e9;
+  return Number((fraction * 100).toFixed(4));
+}
+
+/**
+ * Extra fields attached to every successful close so the closed-position PnL
+ * card (`services/pnlCardGenerator.js`) can draw prices, dates and amounts
+ * without another RPC / API round-trip.
+ */
+function buildCloseSummaryFields({
+  tracked = null,
+  pool = null,
+  poolName = null,
+  minutesHeld = null,
+  initialValueUsd = null,
+  finalValueUsd = null,
+  feesEarnedUsd = null,
+  minBinId = null,
+  maxBinId = null,
+  entryBinId = null,
+  closeBinId = null,
+  reason = null,
+} = {}) {
+  const binRange = tracked?.bin_range ?? null;
+  return {
+    pool_name: poolName ?? tracked?.pool_name ?? null,
+    opened_at: tracked?.deployed_at ?? null,
+    closed_at: new Date().toISOString(),
+    minutes_held: minutesHeld != null ? Math.max(0, Math.round(minutesHeld)) : null,
+    initial_value_usd: initialValueUsd,
+    final_value_usd: finalValueUsd,
+    fees_earned_usd: feesEarnedUsd,
+    bin_step: tracked?.bin_step ?? null,
+    bin_range: binRange,
+    min_bin_id: minBinId ?? binRange?.min ?? null,
+    max_bin_id: maxBinId ?? binRange?.max ?? null,
+    entry_bin_id: entryBinId ?? tracked?.active_bin_at_deploy ?? binRange?.active ?? null,
+    close_bin_id: closeBinId ?? null,
+    base_fee_pct: baseFeePctFromPool(pool),
+    close_reason: reason ?? null,
+  };
+}
+
 export async function closePosition({ position_address, reason }) {
   position_address = normalizeMint(position_address);
   if (process.env.DRY_RUN === "true") {
@@ -1752,6 +1823,20 @@ export async function closePosition({ position_address, reason }) {
           pnl_usd: pnlUsd,
           pnl_pct: pnlPct,
           base_mint: closeBaseMint,
+          ...buildCloseSummaryFields({
+            tracked,
+            pool,
+            poolName: tracked.pool_name || poolMeta.name || null,
+            minutesHeld,
+            initialValueUsd: initialUsd,
+            finalValueUsd,
+            feesEarnedUsd: feesUsd,
+            minBinId: livePosition?.lower_bin ?? null,
+            maxBinId: livePosition?.upper_bin ?? null,
+            entryBinId: tracked.active_bin_at_deploy ?? null,
+            closeBinId: livePosition?.active_bin ?? null,
+            reason: reason || "agent decision",
+          }),
         };
       }
 
@@ -1777,6 +1862,15 @@ export async function closePosition({ position_address, reason }) {
         close_txs: closeTxHashes,
         txs: txHashes,
         base_mint: livePosition?.base_mint || null,
+        ...buildCloseSummaryFields({
+          tracked,
+          pool,
+          poolName: poolMeta.name || null,
+          minBinId: livePosition?.lower_bin ?? null,
+          maxBinId: livePosition?.upper_bin ?? null,
+          closeBinId: livePosition?.active_bin ?? null,
+          reason: reason || "agent decision",
+        }),
       };
       } catch (relayError) {
         if (relaySubmitted) throw relayError;
@@ -2055,6 +2149,20 @@ export async function closePosition({ position_address, reason }) {
         pnl_usd: pnlUsd,
         pnl_pct: pnlPct,
         base_mint: closeBaseMint,
+        ...buildCloseSummaryFields({
+          tracked,
+          pool,
+          poolName: tracked.pool_name || poolMeta.name || null,
+          minutesHeld,
+          initialValueUsd: initialUsd,
+          finalValueUsd,
+          feesEarnedUsd: feesUsd,
+          minBinId: closeFromBinId,
+          maxBinId: closeToBinId,
+          entryBinId: tracked.active_bin_at_deploy ?? null,
+          closeBinId: pool.lbPair?.activeId ?? null,
+          reason: reason || "agent decision",
+        }),
       };
     }
 
@@ -2078,6 +2186,15 @@ export async function closePosition({ position_address, reason }) {
       close_txs: closeTxHashes,
       txs: txHashes,
       base_mint: pool.lbPair.tokenXMint.toString(),
+      ...buildCloseSummaryFields({
+        tracked,
+        pool,
+        poolName: poolMeta.name || null,
+        minBinId: closeFromBinId,
+        maxBinId: closeToBinId,
+        closeBinId: pool.lbPair?.activeId ?? null,
+        reason: reason || "agent decision",
+      }),
     };
   } catch (error) {
     log("close_error", error.message);
