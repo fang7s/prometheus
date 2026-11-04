@@ -19,13 +19,14 @@
  * pulls `@coral-xyz/anchor` CJS directory imports that break ESM on newer Node.
  */
 
-import { Connection, Keypair, PublicKey, sendAndConfirmTransaction } from "@solana/web3.js";
+import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import BN from "bn.js";
 import { config, MIN_SAFE_BINS_BELOW } from "../config.js";
 import { log } from "../logger.js";
 import { trackPosition } from "../state.js";
 import { appendDecision } from "../decision-log.js";
 import { swapToken } from "../tools/wallet.js";
+import { sendAndConfirmWithRetry } from "../utils/tx.js";
 
 const DLMM_PROGRAM_ID = new PublicKey("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo");
 const SOL_MINT = "So11111111111111111111111111111111111111112";
@@ -823,7 +824,9 @@ async function openStrategyLeg({ pool, wallet, connection, sdk, leg, range, slip
     const createTxs = Array.isArray(created) ? created : [created];
     for (let i = 0; i < createTxs.length; i++) {
       const signers = i === 0 ? [wallet, positionKeypair] : [wallet];
-      txs.push(await sendAndConfirmTransaction(connection, createTxs[i], signers));
+      txs.push(await sendAndConfirmWithRetry(connection, createTxs[i], signers, {
+        label: `create position tx ${i + 1}/${createTxs.length}`,
+      }));
     }
 
     const added = await pool.addLiquidityByStrategyChunkable({
@@ -835,8 +838,10 @@ async function openStrategyLeg({ pool, wallet, connection, sdk, leg, range, slip
       slippage: slippagePct,
     });
     const addTxs = Array.isArray(added) ? added : [added];
-    for (const tx of addTxs) {
-      txs.push(await sendAndConfirmTransaction(connection, tx, [wallet]));
+    for (const [index, tx] of addTxs.entries()) {
+      txs.push(await sendAndConfirmWithRetry(connection, tx, [wallet], {
+        label: `add liquidity tx ${index + 1}/${addTxs.length}`,
+      }));
     }
   } else {
     const tx = await pool.initializePositionAndAddLiquidityByStrategy({
@@ -847,7 +852,9 @@ async function openStrategyLeg({ pool, wallet, connection, sdk, leg, range, slip
       strategy,
       slippage: slippagePct,
     });
-    txs.push(await sendAndConfirmTransaction(connection, tx, [wallet, positionKeypair]));
+    txs.push(await sendAndConfirmWithRetry(connection, tx, [wallet, positionKeypair], {
+      label: "initialize position",
+    }));
   }
 
   return {

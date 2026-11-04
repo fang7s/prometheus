@@ -77,6 +77,15 @@ function nonEmptyString(...values) {
   return null;
 }
 
+/** Integer env override clamped to `[min, max]` (blank/garbage → `fallback`). */
+function intEnv(name, fallback, min, max) {
+  const raw = process.env[name];
+  if (raw == null || String(raw).trim() === "") return fallback;
+  const n = Number(String(raw).trim());
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, Math.trunc(n)));
+}
+
 // ─── Jupiter referral (opt-in, DISABLED by default) ─────────────
 // There is no hard-coded referral account any more. Unless BOTH
 // `JUPITER_REFERRAL_ACCOUNT` (a valid Solana public key) and a positive
@@ -250,6 +259,26 @@ export const config = {
     // when ENABLE_PUBLIC_RPC_FALLBACK=true. Never used for signed transactions.
     fallbackUrl: getFallbackRpcUrl(),
     heliusApiKey: extractHeliusApiKey(process.env.HELIUS_API_KEY),
+  },
+
+  // ─── Transaction sending (priority fee + blockhash retries) ─────
+  // Consumed by `utils/tx.js#sendAndConfirmWithRetry`, i.e. every transaction
+  // this bot signs locally (DLMM deploy/claim/close and the SOL → token zap).
+  tx: {
+    // ComputeBudgetProgram.setComputeUnitPrice — micro-lamports per compute
+    // unit. A typical swap/position tx uses 200k–400k CU, so 50 000 µL costs
+    // ~0.00001–0.00002 SOL. `0` disables the instruction.
+    priorityFeeMicroLamports: intEnv("TX_PRIORITY_FEE_MICRO_LAMPORTS", 50_000, 0, 10_000_000),
+    // Optional compute-unit ceiling; `0` leaves the runtime default in place
+    // (raising it without simulating wastes fees, lowering it fails txs).
+    computeUnitLimit: intEnv("TX_COMPUTE_UNIT_LIMIT", 0, 0, 1_400_000),
+    // Retries after BlockheightExceeded / expired signature. Each retry fetches
+    // a fresh blockhash, re-signs and re-broadcasts. Clamped to 0..3.
+    maxSendRetries: intEnv("TX_SEND_RETRIES", 3, 0, 3),
+    // Base delay between retries (ms); multiplied by the attempt number.
+    retryDelayMs: intEnv("TX_RETRY_DELAY_MS", 400, 0, 5_000),
+    commitment: "confirmed",
+    skipPreflight: false,
   },
 
   // ─── Common Token Mints ────────────────

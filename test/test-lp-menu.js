@@ -117,7 +117,25 @@ import {
   applyJupiterReferralParams,
   buildJupiterReferralParams,
   getJupiterReferralParams,
+  landJupiterSwap,
 } from "../tools/wallet.js";
+import {
+  MAX_SEND_RETRIES,
+  buildPriorityFeeInstructions,
+  isBlockhashExpiredError,
+  prepareLegacyTransaction,
+  resolveTxSettings,
+  sendAndConfirmWithRetry,
+  withPriorityFeeInstructions,
+} from "../utils/tx.js";
+import {
+  ComputeBudgetProgram,
+  Keypair,
+  SystemProgram,
+  Transaction,
+  TransactionMessage,
+  VersionedTransaction,
+} from "@solana/web3.js";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -2142,6 +2160,369 @@ test("referral card shows 'Disabled (0 BPS)' and hides the account", () => {
     assert.match(enabled.text, new RegExp(`<code>${LEGACY_REFERRAL_ADDRESS}</code>`));
   } finally {
     Object.assign(config.jupiter, snapshot);
+  }
+});
+
+console.log("\n=== Transaction sending: expired blockhash retries + priority fees ===");
+
+/** A 32-byte base58 value usable as a fake blockhash. */
+const fakeBlockhash = () => Keypair.generate().publicKey.toBase58();
+
+/** Deterministic build of one transfer instruction for the sender tests. */
+function buildTestTransaction(payer) {
+  const tx = new Transaction().add(
+    SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: payer.publicKey, lamports: 1 }),
+  );
+  tx.feePayer = payer.publicKey;
+  tx.recentBlockhash = fakeBlockhash();
+  return tx;
+}
+
+/** Fake Connection: records broadcasts, replays a scripted confirm outcome. */
+function fakeConnection({ blockhashes = [], confirmFailures = 0 } = {}) {
+  const state = { hashCalls: 0, broadcasts: [], confirms: 0 };
+  const connection = {
+    async getLatestBlockhash() {
+      const blockhash = blockhashes[Math.min(state.hashCalls, blockhashes.length - 1)] ?? fakeBlockhash();
+      state.hashCalls += 1;
+      return { blockhash, lastValidBlockHeight: 1_000 + state.hashCalls };
+    },
+    async sendRawTransaction(raw) {
+      const decoded = Transaction.from(raw);
+      state.broadcasts.push({
+        blockhash: decoded.recentBlockhash,
+        signature: Buffer.from(decoded.signatures[0].signature).toString("base64"),
+        computeBudget: decoded.instructions
+          .filter((ix) => ix.programId.equals(ComputeBudgetProgram.programId))
+          .map((ix) => Number(ix.data[0])),
+        priorityFee: decoded.instructions
+          .filter((ix) => ix.programId.equals(ComputeBudgetProgram.programId) && Number(ix.data[0]) === 3)
+          .map((ix) => ix.data.readBigUInt64LE(1).toString()),
+      });
+      return `sig-${state.broadcasts.length}`;
+    },
+    async confirmTransaction() {
+      state.confirms += 1;
+      if (state.confirms <= confirmFailures) {
+        const error = new Error("Signature sig-1 expired: block height exceeded");
+        error.name = "TransactionExpiredBlockheightExceededError";
+        throw error;
+      }
+    },
+  };
+  return { connection, state };
+}
+
+test("blockhash-expiry errors are detected across shapes", () => {
+  const named = new Error("signature expired");
+  named.name = "TransactionExpiredBlockheightExceededError";
+  assert.equal(isBlockhashExpiredError(named), true);
+
+  assert.equal(isBlockhashExpiredError(new Error("Signature 4xY… expired: block height exceeded")), true);
+  assert.equal(isBlockhashExpiredError({ code: -32002, message: "Blockhash not found" }), true);
+  assert.equal(isBlockhashExpiredError({ message: "send failed", error: { code: -32002, message: "Blockhash not found" } }), true);
+  assert.equal(isBlockhashExpiredError({ logs: ["Program log: ok", "BlockheightExceeded"] }), true);
+  assert.equal(isBlockhashExpiredError("Signature has expired"), true);
+
+  // Everything else must fail fast instead of burning blockhash slots.
+  assert.equal(isBlockhashExpiredError(new Error("Transaction simulation failed: insufficient funds")), false);
+  assert.equal(isBlockhashExpiredError({ code: 6001, message: "Slippage tolerance exceeded" }), false);
+  assert.equal(isBlockhashExpiredError(null), false);
+  assert.equal(isBlockhashExpiredError(undefined), false);
+});
+
+test("priority fee instructions come from config and are never duplicated", () => {
+  assert.equal(MAX_SEND_RETRIES, 3);
+  const settings = resolveTxSettings();
+  assert.ok(Number.isFinite(settings.priorityFeeMicroLamports));
+  assert.ok(settings.priorityFeeMicroLamports > 0, "priority fee must be enabled by default");
+  assert.equal(settings.maxSendRetries, 3);
+  // Clamped to the hard cap / floor.
+  assert.equal(resolveTxSettings({ maxSendRetries: 99 }).maxSendRetries, 3);
+  assert.equal(resolveTxSettings({ maxSendRetries: -5 }).maxSendRetries, 0);
+
+  const feeInstructions = buildPriorityFeeInstructions({
+    priorityFeeMicroLamports: 50_000,
+    computeUnitLimit: 200_000,
+  });
+  assert.equal(feeInstructions.length, 2);
+  assert.ok(feeInstructions.every((ix) => ix.programId.equals(ComputeBudgetProgram.programId)));
+  assert.equal(Number(feeInstructions[0].data[0]), 2, "setComputeUnitLimit first");
+  assert.equal(Number(feeInstructions[1].data[0]), 3, "setComputeUnitPrice second");
+  assert.equal(feeInstructions[1].data.readBigUInt64LE(1), 50_000n);
+
+  // 0 µL / no limit → no instruction at all (fee disabled).
+  assert.deepEqual(buildPriorityFeeInstructions({}), []);
+  assert.deepEqual(buildPriorityFeeInstructions({ priorityFeeMicroLamports: 0, computeUnitLimit: 0 }), []);
+
+  // Existing ComputeBudget instructions are kept as-is (no duplicates).
+  const deduped = withPriorityFeeInstructions(feeInstructions, {
+    priorityFeeMicroLamports: 50_000,
+    computeUnitLimit: 200_000,
+  });
+  assert.equal(deduped.length, 2);
+});
+
+test("prepared transactions carry the fresh blockhash and the priority fee", () => {
+  const payer = Keypair.generate();
+  const original = buildTestTransaction(payer);
+  const originalBlockhash = original.recentBlockhash;
+  const fresh = fakeBlockhash();
+
+  const prepared = prepareLegacyTransaction(original, {
+    blockhash: fresh,
+    lastValidBlockHeight: 424_242,
+    priorityFeeMicroLamports: 50_000,
+    computeUnitLimit: 200_000,
+  });
+
+  assert.equal(prepared.recentBlockhash, fresh);
+  assert.equal(prepared.lastValidBlockHeight, 424_242);
+  assert.ok(prepared.feePayer.equals(payer.publicKey));
+  assert.equal(prepared.instructions.length, 3, "2 ComputeBudget instructions + the transfer");
+  assert.ok(prepared.instructions[0].programId.equals(ComputeBudgetProgram.programId));
+  assert.ok(prepared.instructions[1].programId.equals(ComputeBudgetProgram.programId));
+  assert.ok(prepared.instructions[2].programId.equals(SystemProgram.programId), "the payload stays last");
+  // The caller's transaction is never mutated, so it can be retried as-is.
+  assert.equal(original.recentBlockhash, originalBlockhash);
+  assert.equal(original.instructions.length, 1);
+});
+
+test("the priority fee is dropped when the packet is already at the size limit", () => {
+  const payer = Keypair.generate();
+  const programId = Keypair.generate().publicKey;
+  const buildBulky = (dataLength) => {
+    const tx = new Transaction().add({
+      programId,
+      keys: [{ pubkey: payer.publicKey, isSigner: true, isWritable: true }],
+      data: Buffer.alloc(dataLength, 7),
+    });
+    tx.feePayer = payer.publicKey;
+    tx.recentBlockhash = fakeBlockhash();
+    return tx;
+  };
+
+  // Size the payload so the transaction fits on its own but NOT with the two
+  // ComputeBudget instructions (~40 bytes) added on top.
+  const overhead = buildBulky(0).serializeMessage().length;
+  const dataLength = Math.max(1, 1232 - 3 - 64 - overhead - 8);
+  const bulky = buildBulky(dataLength);
+  const baseSize = bulky.serializeMessage().length + 3 + 64;
+  assert.ok(baseSize <= 1232, "the fixture itself must fit a packet");
+
+  const prepared = prepareLegacyTransaction(bulky, {
+    blockhash: fakeBlockhash(),
+    priorityFeeMicroLamports: 50_000,
+    computeUnitLimit: 200_000,
+  });
+
+  assert.equal(
+    prepared.instructions.length,
+    bulky.instructions.length,
+    "the fee instructions are skipped rather than blowing the packet limit",
+  );
+  assert.ok(prepared.serializeMessage().length <= 1232 - 3 - 64);
+
+  // A normal-sized transaction still gets the fee.
+  const normal = buildTestTransaction(payer);
+  assert.equal(
+    prepareLegacyTransaction(normal, { blockhash: fakeBlockhash(), priorityFeeMicroLamports: 50_000 }).instructions.length,
+    2,
+  );
+});
+
+await testAsync("an expired blockhash is retried with a fresh one and a new signature", async () => {
+  const payer = Keypair.generate();
+  const tx = buildTestTransaction(payer);
+  const blockhashes = [fakeBlockhash(), fakeBlockhash()];
+  const { connection, state } = fakeConnection({ blockhashes, confirmFailures: 1 });
+
+  const signature = await sendAndConfirmWithRetry(connection, tx, [payer], {
+    label: "zap tx",
+    retryDelayMs: 0,
+    priorityFeeMicroLamports: 50_000,
+    computeUnitLimit: 200_000,
+    maxSendRetries: 3,
+  });
+
+  assert.equal(signature, "sig-2", "the retried broadcast is the one that confirmed");
+  assert.equal(state.hashCalls, 2, "a fresh blockhash is fetched for the retry");
+  assert.equal(state.broadcasts.length, 2);
+  assert.equal(state.broadcasts[0].blockhash, blockhashes[0]);
+  assert.equal(state.broadcasts[1].blockhash, blockhashes[1]);
+  assert.notEqual(state.broadcasts[0].blockhash, state.broadcasts[1].blockhash);
+  // Re-signed: the signature changed with the message.
+  assert.notEqual(state.broadcasts[0].signature, state.broadcasts[1].signature);
+  // Priority fee attached to EVERY broadcast.
+  for (const broadcast of state.broadcasts) {
+    assert.deepEqual(broadcast.computeBudget, [2, 3]);
+    assert.deepEqual(broadcast.priorityFee, ["50000"]);
+  }
+});
+
+await testAsync("the expiry retry is capped at 3 attempts after the first broadcast", async () => {
+  const payer = Keypair.generate();
+  const tx = buildTestTransaction(payer);
+  const { connection, state } = fakeConnection({ confirmFailures: 99 });
+
+  let error = null;
+  try {
+    await sendAndConfirmWithRetry(connection, tx, [payer], {
+      label: "always expired",
+      retryDelayMs: 0,
+      maxSendRetries: 3,
+    });
+  } catch (err) {
+    error = err;
+  }
+
+  assert.ok(error, "the expiry error surfaces once the retries are exhausted");
+  assert.equal(isBlockhashExpiredError(error), true);
+  assert.equal(state.broadcasts.length, 1 + MAX_SEND_RETRIES, "1 broadcast + 3 retries");
+  assert.equal(state.hashCalls, 1 + MAX_SEND_RETRIES, "a fresh blockhash per attempt");
+});
+
+await testAsync("non-expiry failures are never retried", async () => {
+  const payer = Keypair.generate();
+  const tx = buildTestTransaction(payer);
+  let broadcasts = 0;
+  const connection = {
+    async getLatestBlockhash() {
+      return { blockhash: fakeBlockhash(), lastValidBlockHeight: 1 };
+    },
+    async sendRawTransaction() {
+      broadcasts += 1;
+      throw new Error("Transaction simulation failed: insufficient funds");
+    },
+    async confirmTransaction() {},
+  };
+
+  await assert.rejects(
+    () => sendAndConfirmWithRetry(connection, tx, [payer], { label: "no funds", retryDelayMs: 0 }),
+    /insufficient funds/,
+  );
+  assert.equal(broadcasts, 1, "a deterministic failure must fail fast");
+});
+
+await testAsync("a v0 (versioned) message is re-signed against the refreshed blockhash", async () => {
+  const payer = Keypair.generate();
+  const fresh = fakeBlockhash();
+  const message = new TransactionMessage({
+    payerKey: payer.publicKey,
+    recentBlockhash: fakeBlockhash(),
+    instructions: [
+      SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: payer.publicKey, lamports: 1 }),
+    ],
+  }).compileToV0Message();
+  const tx = new VersionedTransaction(message);
+  const seen = [];
+
+  const connection = {
+    async getLatestBlockhash() {
+      return { blockhash: fresh, lastValidBlockHeight: 7 };
+    },
+    async sendRawTransaction(raw) {
+      const decoded = VersionedTransaction.deserialize(raw);
+      seen.push({
+        blockhash: decoded.message.recentBlockhash,
+        signature: Buffer.from(decoded.signatures[0]).toString("base64"),
+      });
+      return "v0-signature";
+    },
+    async confirmTransaction() {},
+  };
+
+  const signature = await sendAndConfirmWithRetry(connection, tx, [payer], {
+    label: "v0 swap",
+    retryDelayMs: 0,
+  });
+
+  assert.equal(signature, "v0-signature");
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].blockhash, fresh, "the freshly fetched blockhash is applied to the v0 message");
+  assert.equal(tx.message.recentBlockhash, fresh);
+  // The re-signature covers the refreshed message.
+  if (typeof tx.verify === "function") {
+    assert.equal(tx.verify([payer.publicKey]), true, "the new signature matches the new message");
+  }
+});
+
+await testAsync("the Jupiter swap re-quotes, re-signs and retries an expired signature", async () => {
+  const wallet = Keypair.generate();
+  const buildOrder = (blockhash, requestId) => {
+    const message = new TransactionMessage({
+      payerKey: wallet.publicKey,
+      recentBlockhash: blockhash,
+      instructions: [
+        SystemProgram.transfer({ fromPubkey: wallet.publicKey, toPubkey: wallet.publicKey, lamports: 1 }),
+      ],
+    }).compileToV0Message();
+    const tx = new VersionedTransaction(message);
+    tx.sign([wallet]);
+    return {
+      transaction: Buffer.from(tx.serialize()).toString("base64"),
+      requestId,
+      prioritizationFeeLamports: 1_000,
+    };
+  };
+
+  const firstHash = fakeBlockhash();
+  const freshHash = fakeBlockhash();
+  const calls = [];
+  const responses = [
+    { ok: true, json: async () => buildOrder(firstHash, "req-1") },
+    {
+      ok: false,
+      status: 502,
+      text: async () => "{\"error\":\"Signature expired: block height exceeded\"}",
+    },
+    { ok: true, json: async () => buildOrder(freshHash, "req-2") },
+    {
+      ok: true,
+      json: async () => ({
+        status: "Success",
+        signature: "swap-sig",
+        inputAmountResult: "100",
+        outputAmountResult: "200",
+      }),
+    },
+  ];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url: String(url), body: init?.body ? JSON.parse(init.body) : null });
+    const next = responses.shift();
+    if (!next) throw new Error("unexpected extra fetch");
+    return next;
+  };
+
+  try {
+    const search = new URLSearchParams({ inputMint: "in", outputMint: "out", amount: "1", taker: "t" });
+    const { order, result, attempts } = await landJupiterSwap({
+      search,
+      jupiterApiKey: null,
+      wallet,
+      connection: { getLatestBlockhash: async () => ({ blockhash: fakeBlockhash(), lastValidBlockHeight: 1 }) },
+      maxRetries: 3,
+    });
+
+    assert.equal(attempts, 2, "one retry after the expired signature");
+    assert.equal(order.requestId, "req-2", "the retry uses a freshly quoted order");
+    assert.equal(result.signature, "swap-sig");
+    assert.equal(calls.length, 4, "order → execute → order → execute");
+    assert.ok(calls[0].url.includes("/order?"));
+    assert.ok(calls[2].url.includes("/order?"), "the retry re-quotes with the same query");
+    assert.equal(calls[0].url, calls[2].url);
+    assert.equal(calls[1].body.requestId, "req-1");
+    assert.equal(calls[3].body.requestId, "req-2");
+
+    // The re-quoted transaction carries a fresh blockhash and is re-signed.
+    const resign = VersionedTransaction.deserialize(Buffer.from(calls[3].body.signedTransaction, "base64"));
+    assert.equal(resign.message.recentBlockhash, freshHash);
+    if (typeof resign.verify === "function") {
+      assert.equal(resign.verify([wallet.publicKey]), true);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
   }
 });
 

@@ -9,6 +9,8 @@ import bs58 from "bs58";
 import { log } from "../logger.js";
 import { config } from "../config.js";
 import { extractHeliusApiKey } from "../utils/rpc.js";
+// Blockhash-expiry detection + the priority-fee settings shared with `utils/tx.js`.
+import { isBlockhashExpiredError, resolveTxSettings } from "../utils/tx.js";
 
 // SPL token programs (avoid pulling in @solana/spl-token just for the ids).
 const TOKEN_PROGRAM = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
@@ -280,6 +282,100 @@ export function normalizeMint(mint) {
   return mint;
 }
 
+// ─── Jupiter Swap V2 landing with blockhash-expiry retries ────────
+/** Hard cap for swap landing retries (mirrors `utils/tx.js`). */
+const SWAP_MAX_RETRIES = 3;
+
+/**
+ * `GET /swap/v2/order` — quote + a ready-to-sign transaction + `requestId`.
+ * Jupiter builds the message with a fresh recent blockhash and its own
+ * managed-landing priority fee on every call.
+ */
+async function requestJupiterSwapOrder({ search, jupiterApiKey }) {
+  const orderRes = await fetch(`${JUPITER_SWAP_V2_API}/order?${search.toString()}`, {
+    headers: jupiterApiKey ? { "x-api-key": jupiterApiKey } : {},
+  });
+  if (!orderRes.ok) {
+    const body = await orderRes.text();
+    throw new Error(`Swap V2 order failed: ${orderRes.status} ${body}`);
+  }
+  const order = await orderRes.json();
+  if (order.errorCode || order.errorMessage) {
+    throw new Error(`Swap V2 order error: ${order.errorMessage || order.errorCode}`);
+  }
+  if (!order?.transaction || !order?.requestId) {
+    throw new Error("Swap V2 order error: missing transaction/requestId");
+  }
+  return order;
+}
+
+/** Sign the order with the wallet and land it through `/execute`. */
+async function postJupiterSwapExecute({ order, tx, wallet, jupiterApiKey }) {
+  tx.sign([wallet]);
+  const signedTransaction = Buffer.from(tx.serialize()).toString("base64");
+  const execRes = await fetch(`${JUPITER_SWAP_V2_API}/execute`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(jupiterApiKey ? { "x-api-key": jupiterApiKey } : {}),
+    },
+    body: JSON.stringify({ signedTransaction, requestId: order.requestId }),
+  });
+  if (!execRes.ok) {
+    throw new Error(`Swap V2 execute failed: ${execRes.status} ${await execRes.text()}`);
+  }
+  const result = await execRes.json();
+  if (result.status === "Failed") {
+    throw new Error(`Swap failed on-chain: code=${result.code}${result.error ? ` (${result.error})` : ""}`);
+  }
+  return result;
+}
+
+/**
+ * Quote → sign → execute, retrying up to `maxRetries` times when the signature
+ * expires ("Signature expired: block height exceeded" / BlockheightExceeded).
+ *
+ * Recovery mirrors the local sender in `utils/tx.js`:
+ *   1. re-quote (`/order`) — Jupiter returns a brand-new message carrying a
+ *      FRESH recent blockhash — then re-sign and re-broadcast immediately;
+ *   2. if the re-quote fails, fetch a fresh blockhash from our RPC, patch the
+ *      existing message, re-sign and re-broadcast.
+ *
+ * Non-expiry errors (slippage, insufficient funds, on-chain failure) surface
+ * immediately — retrying them only burns blockhash slots.
+ */
+export async function landJupiterSwap({ search, jupiterApiKey, wallet, connection, maxRetries = SWAP_MAX_RETRIES }) {
+  let order = await requestJupiterSwapOrder({ search, jupiterApiKey });
+  let tx = VersionedTransaction.deserialize(Buffer.from(order.transaction, "base64"));
+  let attempts = 0;
+
+  for (;;) {
+    attempts += 1;
+    try {
+      const result = await postJupiterSwapExecute({ order, tx, wallet, jupiterApiKey });
+      return { order, result, attempts };
+    } catch (error) {
+      if (!isBlockhashExpiredError(error) || attempts > maxRetries) throw error;
+      log(
+        "swap_warn",
+        `Swap signature expired (block height exceeded) — refreshing blockhash, re-signing and ` +
+        `re-broadcasting (retry ${attempts}/${maxRetries})`,
+      );
+      try {
+        order = await requestJupiterSwapOrder({ search, jupiterApiKey });
+        tx = VersionedTransaction.deserialize(Buffer.from(order.transaction, "base64"));
+      } catch (requoteError) {
+        const { blockhash } = await connection.getLatestBlockhash("confirmed");
+        tx.message.recentBlockhash = blockhash;
+        log(
+          "swap_warn",
+          `Swap re-quote failed (${requoteError.message}) — refreshed blockhash locally (${String(blockhash).slice(0, 8)}…)`,
+        );
+      }
+    }
+  }
+}
+
 export async function swapToken({
   input_mint,
   output_mint,
@@ -320,48 +416,29 @@ export async function swapToken({
     // request carries no fee account at all.
     const referralParams = getJupiterReferralParams();
     applyJupiterReferralParams(search, referralParams);
-    const orderUrl = `${JUPITER_SWAP_V2_API}/order?${search.toString()}`;
     const jupiterApiKey = getJupiterApiKey();
+    const txSettings = resolveTxSettings();
 
-    const orderRes = await fetch(orderUrl, {
-      headers: jupiterApiKey ? { "x-api-key": jupiterApiKey } : {},
+    // ─── Quote → sign → execute, retried on an expired blockhash ──
+    const { order, result, attempts } = await landJupiterSwap({
+      search,
+      jupiterApiKey,
+      wallet,
+      connection,
+      maxRetries: Math.min(SWAP_MAX_RETRIES, txSettings.maxSendRetries),
     });
-    if (!orderRes.ok) {
-      const body = await orderRes.text();
-      throw new Error(`Swap V2 order failed: ${orderRes.status} ${body}`);
+
+    // Jupiter's managed landing owns the swap's priority fee (the /order message
+    // must not be modified). Surface it so a starved bid is visible in the logs.
+    const appliedPriorityFee = Number(order.prioritizationFeeLamports ?? 0);
+    if (txSettings.priorityFeeMicroLamports > 0 && appliedPriorityFee <= 0) {
+      log(
+        "swap_warn",
+        `Jupiter attached no prioritization fee for this swap (config ${txSettings.priorityFeeMicroLamports} µL/CU) — inclusion may be slower`,
+      );
     }
 
-    const order = await orderRes.json();
-    if (order.errorCode || order.errorMessage) {
-      throw new Error(`Swap V2 order error: ${order.errorMessage || order.errorCode}`);
-    }
-
-    const { transaction: unsignedTx, requestId } = order;
-
-    // ─── Deserialize and sign ─────────────────────────────────
-    const tx = VersionedTransaction.deserialize(Buffer.from(unsignedTx, "base64"));
-    tx.sign([wallet]);
-    const signedTx = Buffer.from(tx.serialize()).toString("base64");
-
-    // ─── Execute ───────────────────────────────────────────────
-    const execRes = await fetch(`${JUPITER_SWAP_V2_API}/execute`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...(jupiterApiKey ? { "x-api-key": jupiterApiKey } : {}),
-      },
-      body: JSON.stringify({ signedTransaction: signedTx, requestId }),
-    });
-    if (!execRes.ok) {
-      throw new Error(`Swap V2 execute failed: ${execRes.status} ${await execRes.text()}`);
-    }
-
-    const result = await execRes.json();
-    if (result.status === "Failed") {
-      throw new Error(`Swap failed on-chain: code=${result.code}`);
-    }
-
-    log("swap", `SUCCESS tx: ${result.signature}`);
+    log("swap", `SUCCESS tx: ${result.signature}${attempts > 1 ? ` (retry ${attempts - 1})` : ""}`);
     if (referralParams && order.feeBps !== referralParams.referralFee) {
       log(
         "swap_warn",
@@ -386,6 +463,10 @@ export async function swapToken({
         : {}),
       fee_bps_applied: order.feeBps ?? null,
       fee_mint: order.feeMint ?? null,
+      // Landing telemetry: how many broadcasts it took and the priority fee
+      // Jupiter attached through its managed landing.
+      swap_attempts: attempts,
+      priority_fee_lamports: Number.isFinite(appliedPriorityFee) ? appliedPriorityFee : null,
     };
   } catch (error) {
     log("swap_error", error.message);
