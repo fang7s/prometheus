@@ -47,7 +47,29 @@ import {
   strategyLabel,
   normalizeStrategyKind,
 } from "./meteoraService.js";
+import {
+  computeRangePositionPct,
+  escapeHtml,
+  formatCompactUsd,
+  formatMoney,
+  formatRangeStatus,
+  formatSolAmount,
+  formatUsd,
+  renderProgressBar,
+} from "./telegramFormat.js";
 
+// The pure formatters live in `services/telegramFormat.js` (shared with
+// `telegram.js` and the `/positions` view). They stay re-exported here so every
+// existing caller and test keeps importing them from this module.
+export {
+  computeRangePositionPct,
+  escapeHtml,
+  formatCompactUsd,
+  formatMoney,
+  formatRangeStatus,
+  formatSolAmount,
+  formatUsd,
+};
 
 const CALLBACK_PREFIX = "lp:";
 const POOL_LIST_LIMIT = 6;
@@ -64,30 +86,7 @@ const SESSION_TTL_MS = 30 * 60_000;
 const NETWORK_TIMEOUT_MS = 5_000;
 const TIMEOUT_NOTE = "⚠️ Network timeout, please try again";
 
-// ─── Formatting helpers ───────────────────────────────────────────
-export function escapeHtml(value) {
-  return String(value ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-export function formatUsd(value) {
-  const n = Number(value);
-  if (!Number.isFinite(n) || n === 0) return "$0";
-  if (Math.abs(n) >= 1_000_000) return `$${(n / 1_000_000).toFixed(2)}M`;
-  if (Math.abs(n) >= 1_000) return `$${(n / 1_000).toFixed(1)}K`;
-  return `$${n.toFixed(2)}`;
-}
-
-export function formatSolAmount(value, digits = 4) {
-  const n = Number(value);
-  if (!Number.isFinite(n)) return "?";
-  if (n === 0) return "0";
-  if (n < 0.001) return n.toExponential(2);
-  return n.toFixed(digits).replace(/0+$/, "").replace(/\.$/, "");
-}
-
+// ─── Formatting helpers (see `services/telegramFormat.js`) ─────────
 /**
  * Estimated APR from the screening fee/TVL percentage.
  *
@@ -930,58 +929,13 @@ function currencyMode({ mode = null, solMode = null } = {}) {
   return (solMode ?? config.management?.solMode) ? "SOL" : "USD";
 }
 
-export function formatMoney(value, mode = "USD") {
-  const n = Number(value);
-  if (value == null || !Number.isFinite(n)) return "?";
-  return mode === "SOL" ? `${formatSolAmount(n)} SOL` : formatUsd(n);
-}
-
 // ─── Active-position text metrics (no images) ─────────────────────
-/**
- * Bold range badge for OPEN positions. PnL cards are reserved for closed
- * positions / PnL history — open positions stay text-only.
- */
-export function formatRangeStatus(inRange) {
-  if (inRange === true) return "🟢 <b>IN RANGE</b>";
-  if (inRange === false) return "🔴 <b>OUT OF RANGE</b>";
-  return "⚪ <b>RANGE UNKNOWN</b>";
-}
-
-/**
- * Relative position (0-100 %) of the active bin inside the user's min/max bins.
- * 0 % = active bin sits on the lower bound, 100 % = on/above the upper bound.
- *
- * Single-sided SOL limit ranges (both bounds BELOW the active price) correctly
- * read 100 %: the price is above the whole range, so the position is filled to
- * the top. Ranges entirely above the active price read 0 %.
- */
-export function computeRangePositionPct({ lowerBinId = null, upperBinId = null, activeBinId = null } = {}) {
-  // `Number(null)` is 0 — guard missing bins explicitly so an unknown range can
-  // never masquerade as "active bin at the bottom of the range".
-  const toBin = (value) => {
-    if (value == null || value === "") return null;
-    const n = Number(value);
-    return Number.isFinite(n) ? n : null;
-  };
-  const lower = toBin(lowerBinId);
-  const upper = toBin(upperBinId);
-  const active = toBin(activeBinId);
-  if (lower == null || upper == null || active == null) return null;
-  const min = Math.min(lower, upper);
-  const max = Math.max(lower, upper);
-  // Single-bin range: 100 % only once the price reached that bin.
-  if (max === min) return active >= max ? 100 : 0;
-  const pct = ((active - min) / (max - min)) * 100;
-  return Math.max(0, Math.min(100, Math.round(pct)));
-}
+// `formatMoney`, `formatRangeStatus` and `computeRangePositionPct` are the pure
+// helpers from `services/telegramFormat.js` (re-exported at the top of this file).
 
 /** `[██████░░░░]` — 10 slots, floored so 65 % fills 6 blocks. */
 export function renderRangeBar(pct, slots = 10) {
-  const total = Math.max(1, Math.round(Number(slots) || 10));
-  const value = Number(pct);
-  const ratio = Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : 0;
-  const filled = Math.max(0, Math.min(total, Math.floor((ratio / 100) * total)));
-  return `[${"█".repeat(filled)}${"░".repeat(total - filled)}]`;
+  return renderProgressBar(pct, slots);
 }
 
 /** `📍 Range Position: 65% [██████░░░░]` (null when the bins are unknown). */
@@ -993,17 +947,6 @@ export function formatRangePositionLine(position) {
   });
   if (pct == null) return null;
   return `📍 Range Position: <b>${pct}%</b> ${renderRangeBar(pct)}`;
-}
-
-/** `$1.25M` / `$940.0K` / `$12.30` (null for missing/zero values). */
-export function formatCompactUsd(value) {
-  const n = Number(value);
-  if (value == null || !Number.isFinite(n) || n <= 0) return null;
-  if (n >= 1e12) return `$${(n / 1e12).toFixed(2)}T`;
-  if (n >= 1e9) return `$${(n / 1e9).toFixed(2)}B`;
-  if (n >= 1e6) return `$${(n / 1e6).toFixed(2)}M`;
-  if (n >= 1e3) return `$${(n / 1e3).toFixed(1)}K`;
-  return `$${n.toFixed(2)}`;
 }
 
 /** `🧢 MC: $1.25M` (null when the market cap is unknown). */
@@ -1241,18 +1184,27 @@ export function renderDammView() {
   };
 }
 
+/**
+ * Referral card. The built-in referral is **disabled by default** (0 bps, no
+ * account), so this renders a "Disabled (0 BPS)" card with no address at all —
+ * the account block only appears when the operator opted in via `.env`.
+ */
 export function renderReferralsView() {
-  const account = config.jupiter?.referralAccount || null;
-  const bps = Number(config.jupiter?.referralFeeBps ?? 0);
+  const account = String(config.jupiter?.referralAccount || "").trim();
+  const bpsRaw = Number(config.jupiter?.referralFeeBps ?? 0);
+  const bps = Number.isFinite(bpsRaw) && bpsRaw > 0 ? Math.round(bpsRaw) : 0;
+  const enabled = Boolean(account) && bps > 0;
   return {
     text: [
       "👥 <b>Referrals</b>",
       "═══════════════════════",
-      account ? `🔗 Jupiter referral account:\n<code>${escapeHtml(account)}</code>` : "No referral account configured.",
-      bps > 0 ? `💸 Referral fee: ${bps} bps (${(bps / 100).toFixed(2)}%) of swap fees` : null,
+      enabled ? `💸 Referral Fee: ${bps} BPS (${(bps / 100).toFixed(2)}%)` : "💸 Referral Fee: Disabled (0 BPS)",
+      enabled ? `🔗 Jupiter referral account:\n<code>${escapeHtml(account)}</code>` : null,
       "",
-      "Referral fees are attached automatically to the SOL → token zap swaps this bot makes.",
-      "Override with <code>JUPITER_REFERRAL_ACCOUNT</code> / <code>JUPITER_REFERRAL_FEE_BPS</code> in .env.",
+      enabled
+        ? "Referral fees are attached to the SOL → token zap swaps this bot makes."
+        : "No referral account is attached to any Jupiter quote or swap request — swaps run at zero platform fee.",
+      "Enable with <code>JUPITER_REFERRAL_ACCOUNT</code> + <code>JUPITER_REFERRAL_FEE_BPS</code> (50–255) in .env.",
     ].filter((line) => line != null).join("\n"),
     keyboard: [BACK_ROW()],
   };

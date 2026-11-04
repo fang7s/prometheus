@@ -54,12 +54,21 @@ function getJupiterApiKey() {
   return config.jupiter.apiKey || process.env.JUPITER_API_KEY || DEFAULT_JUPITER_API_KEY;
 }
 
-function getJupiterReferralParams() {
-  const referralAccount = String(config.jupiter.referralAccount || "").trim();
-  const referralFee = Number(config.jupiter.referralFeeBps || 0);
-  if (!referralAccount || !Number.isFinite(referralFee) || referralFee <= 0) {
-    return null;
-  }
+/**
+ * Jupiter referral parameters for a Swap V2 `/order` request.
+ *
+ * Referral fees are **opt-in and disabled by default**: this returns `null`
+ * (so NO `referralAccount` / `referralFee` query params are added at all)
+ * unless a referral account is configured AND a positive fee is requested.
+ * There is no built-in/hard-coded referral account any more.
+ */
+export function buildJupiterReferralParams({ account = null, feeBps = 0 } = {}) {
+  const referralAccount = String(account ?? "").trim();
+  // No account (the default) → feature off. No warning: this is the normal path.
+  if (!referralAccount) return null;
+  const referralFee = Number(feeBps ?? 0);
+  // 0 bps / unset / garbage → off, again silently.
+  if (!Number.isFinite(referralFee) || referralFee <= 0) return null;
   if (referralFee < 50 || referralFee > 255) {
     log("swap_warn", `Ignoring Jupiter referral fee ${referralFee}; Ultra requires 50-255 bps`);
     return null;
@@ -71,6 +80,27 @@ function getJupiterReferralParams() {
     return null;
   }
   return { referralAccount, referralFee: Math.round(referralFee) };
+}
+
+/** Configured referral params from `.env` — `null` when the feature is disabled. */
+export function getJupiterReferralParams() {
+  if (config.jupiter?.referralEnabled === false) return null;
+  return buildJupiterReferralParams({
+    account: config.jupiter?.referralAccount,
+    feeBps: config.jupiter?.referralFeeBps,
+  });
+}
+
+/**
+ * Attach referral params to a Jupiter order query.
+ * When `params` is `null` (0 bps / not configured) the query is returned
+ * untouched — the request carries zero fee-account parameters.
+ */
+export function applyJupiterReferralParams(search, params = null) {
+  if (!params) return search;
+  search.set("referralAccount", params.referralAccount);
+  search.set("referralFee", String(params.referralFee));
+  return search;
 }
 
 /**
@@ -286,11 +316,10 @@ export async function swapToken({
       amount: amountStr,
       taker: wallet.publicKey.toString(),
     });
+    // Referral is disabled by default → `referralParams === null` and the order
+    // request carries no fee account at all.
     const referralParams = getJupiterReferralParams();
-    if (referralParams) {
-      search.set("referralAccount", referralParams.referralAccount);
-      search.set("referralFee", String(referralParams.referralFee));
-    }
+    applyJupiterReferralParams(search, referralParams);
     const orderUrl = `${JUPITER_SWAP_V2_API}/order?${search.toString()}`;
     const jupiterApiKey = getJupiterApiKey();
 
@@ -347,8 +376,14 @@ export async function swapToken({
       output_mint,
       amount_in: result.inputAmountResult,
       amount_out: result.outputAmountResult,
-      referral_account: referralParams?.referralAccount || null,
-      referral_fee_bps_requested: referralParams?.referralFee || 0,
+      // Referral metadata only when a referral fee was actually requested
+      // (never when the feature is disabled — the default).
+      ...(referralParams
+        ? {
+            referral_account: referralParams.referralAccount,
+            referral_fee_bps_requested: referralParams.referralFee,
+          }
+        : {}),
       fee_bps_applied: order.feeBps ?? null,
       fee_mint: order.feeMint ?? null,
     };

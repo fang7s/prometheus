@@ -77,6 +77,18 @@ function nonEmptyString(...values) {
   return null;
 }
 
+// ─── Jupiter referral (opt-in, DISABLED by default) ─────────────
+// There is no hard-coded referral account any more. Unless BOTH
+// `JUPITER_REFERRAL_ACCOUNT` (a valid Solana public key) and a positive
+// `JUPITER_REFERRAL_FEE_BPS` are set in the environment, the swap path attaches
+// no `referralAccount` / `referralFee` parameters to Jupiter quote/swap requests.
+const JUPITER_REFERRAL_ACCOUNT = nonEmptyString(process.env.JUPITER_REFERRAL_ACCOUNT);
+const JUPITER_REFERRAL_FEE_BPS_RAW = Number(process.env.JUPITER_REFERRAL_FEE_BPS ?? 0);
+const JUPITER_REFERRAL_FEE_BPS =
+  Number.isFinite(JUPITER_REFERRAL_FEE_BPS_RAW) && JUPITER_REFERRAL_FEE_BPS_RAW > 0
+    ? Math.round(JUPITER_REFERRAL_FEE_BPS_RAW)
+    : 0;
+
 export const config = {
   // ─── Risk Limits ─────────────────────────
   risk: {
@@ -313,12 +325,12 @@ export const config = {
   jupiter: {
     // Internal Jupiter Ultra settings; override by env only, do not expose in user-config.
     apiKey: process.env.JUPITER_API_KEY ?? "",
-    referralAccount:
-      process.env.JUPITER_REFERRAL_ACCOUNT ??
-      "9MzhDUnq3KxecyPzvhguQMMPbooXQ3VAoCMPDnoijwey",
-    referralFeeBps: Number(
-      process.env.JUPITER_REFERRAL_FEE_BPS ?? 50,
-    ),
+    // Referral is OPT-IN: `null` account + `0` bps (the defaults) means the swap
+    // path never sends a referral fee account to Jupiter.
+    referralAccount: JUPITER_REFERRAL_ACCOUNT,
+    referralFeeBps: JUPITER_REFERRAL_FEE_BPS,
+    // Convenience flag for the swap path and the Telegram referral card.
+    referralEnabled: Boolean(JUPITER_REFERRAL_ACCOUNT) && JUPITER_REFERRAL_FEE_BPS > 0,
   },
 
   indicators: {

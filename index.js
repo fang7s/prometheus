@@ -47,13 +47,20 @@ import {
   handleLpCallback,
   handleLpText,
   openAddressQuery as openLpAddressQuery,
-  computeRangePositionPct,
   enrichPositionsWithMarketCap,
-  escapeHtml,
-  formatCompactUsd,
-  formatRangeStatus,
-  renderRangeBar,
 } from "./services/lp-menu.js";
+// Pure, synchronous Telegram layout helpers (tree branches, dividers, progress
+// bars, monospace blocks). Zero I/O — they only format the in-memory snapshot.
+import {
+  SECTION_DIVIDER,
+  computeRangePositionPct,
+  formatMoney,
+  formatOpenPositionsMessage,
+  formatProgressBar,
+  formatSignedPct,
+  formatTreeRows,
+  rangeStatusText,
+} from "./services/telegramFormat.js";
 import { recordPriceSample, queueClosedPositionPnlCard } from "./services/pnlCardGenerator.js";
 import { monitorPosition } from "./services/positionMonitor.js";
 import {
@@ -354,31 +361,45 @@ export async function runManagementCycle({ silent = false } = {}) {
       actionMap.set(p.position, { action: "STAY" });
     }
 
-    // ── Build JS report ──────────────────────────────────────────────
-    const totalValue = positionData.reduce((s, p) => s + (p.total_value_usd ?? 0), 0);
-    const totalUnclaimed = positionData.reduce((s, p) => s + (p.unclaimed_fees_usd ?? 0), 0);
+    // ── Build JS report (pure local snapshot → ASCII tree, no I/O) ───
+    // Plain text: this report is delivered through `sendMessage`/`editMessage`
+    // (the live message), which does not parse markup — so no HTML tags here,
+    // just the same tree branches / dividers / progress bars as `/positions`.
+    const totalValue = positionData.reduce((s, p) => s + (Number(p.total_value_usd) || 0), 0);
+    const totalUnclaimed = positionData.reduce((s, p) => s + (Number(p.unclaimed_fees_usd) || 0), 0);
+    const moneyMode = config.management.solMode ? "SOL" : "USD";
 
-    const reportLines = positionData.map((p) => {
-      const act = actionMap.get(p.position);
-      const inRange = p.in_range ? "🟢 IN RANGE" : `🔴 OUT OF RANGE ${p.minutes_out_of_range ?? 0}m`;
-      const val = config.management.solMode ? `◎${p.total_value_usd ?? "?"}` : `$${p.total_value_usd ?? "?"}`;
-      const unclaimed = config.management.solMode ? `◎${p.unclaimed_fees_usd ?? "?"}` : `$${p.unclaimed_fees_usd ?? "?"}`;
+    const reportLines = positionData.map((p, index) => {
+      const act = actionMap.get(p.position) ?? { action: "STAY" };
       const statusLabel = act.action === "CLOSE" ? `CLOSE (${act.headline || act.name})` : act.action;
       const rangePct = computeRangePositionPct({
         lowerBinId: p.lower_bin,
         upperBinId: p.upper_bin,
         activeBinId: p.active_bin,
       });
-      const rangeLabel = rangePct != null ? ` | 📍 ${rangePct}% ${renderRangeBar(rangePct)}` : "";
-      let line = `**${p.pair}** | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | PnL: ${p.pnl_pct ?? "?"}% | Yield: ${p.fee_per_tvl_24h ?? "?"}% | ${inRange}${rangeLabel} | ${statusLabel}`;
+      let instructionRow = null;
       if (p.instruction) {
         const overrides = parseInstructionOverrides(p.instruction);
         const parsed = Object.entries(overrides).map(([k, v]) => `${k}=${v}`).join(", ");
-        line += `\nNote: "${p.instruction}"${parsed ? ` (rules: ${parsed})` : " (informational only)"}`;
+        instructionRow = {
+          label: "📝 Note",
+          value: `"${p.instruction}"${parsed ? ` (rules: ${parsed})` : " (info only)"}`,
+        };
       }
-      if (act.action === "CLOSE") line += `\n${act.headline || act.name}: ${act.reason}`;
-      if (act.action === "CLAIM") line += `\n→ Claiming fees`;
-      return line;
+      const rows = [
+        { label: "⏱ Age", value: `${p.age_minutes ?? "?"}m` },
+        { label: "💵 Value", value: formatMoney(p.total_value_usd, moneyMode) },
+        { label: "🎁 Unclaimed", value: formatMoney(p.unclaimed_fees_usd, moneyMode) },
+        { label: "📈 PnL", value: formatSignedPct(p.pnl_pct) },
+        { label: "🌾 Yield", value: `${p.fee_per_tvl_24h ?? "?"}%` },
+        rangePct != null ? { label: "📍 Range", value: formatProgressBar(rangePct) } : null,
+        { label: "🎯 Action", value: statusLabel },
+        act.action === "CLOSE" ? { label: "↳ Why", value: `${act.headline || act.name}: ${act.reason}` } : null,
+        act.action === "CLAIM" ? { label: "↳", value: "Claiming fees" } : null,
+        instructionRow,
+      ];
+      const header = `${index + 1} · ${p.pair} · ${rangeStatusText(p.in_range, p.minutes_out_of_range)}`;
+      return `${header}\n${formatTreeRows(rows)}`;
     });
 
     const needsAction = [...actionMap.values()].filter(a => a.action !== "STAY");
@@ -388,9 +409,16 @@ export async function runManagementCycle({ silent = false } = {}) {
         : a.action).join(", ")
       : "no action";
 
-    const cur = config.management.solMode ? "◎" : "$";
-    mgmtReport = reportLines.join("\n\n") +
-      `\n\nSummary: 💼 ${positions.length} positions | ${cur}${totalValue.toFixed(4)} | fees: ${cur}${totalUnclaimed.toFixed(4)} | ${actionSummary}`;
+    const summaryBlock = [
+      "📊 Summary",
+      formatTreeRows([
+        { label: "💼 Positions", value: String(positions.length) },
+        { label: "💵 Value", value: formatMoney(totalValue, moneyMode) },
+        { label: "🎁 Unclaimed", value: formatMoney(totalUnclaimed, moneyMode) },
+        { label: "🎯 Actions", value: actionSummary },
+      ]),
+    ].join("\n");
+    mgmtReport = [SECTION_DIVIDER, reportLines.join("\n\n"), SECTION_DIVIDER, summaryBlock].join("\n\n");
 
     // ── Execute rule decisions directly (no LLM) ────────────────────
     const actionPositions = positionData.filter(p => {
@@ -426,7 +454,15 @@ export async function runManagementCycle({ silent = false } = {}) {
       }
       for (const p of positions) {
         if (!p.in_range && p.minutes_out_of_range >= config.management.outOfRangeWaitMinutes) {
-          notifyOutOfRange({ pair: p.pair, minutesOOR: p.minutes_out_of_range }).catch(() => { });
+          // The alert is rendered from this in-memory snapshot only — no extra
+          // RPC/API read is triggered just to describe the position.
+          notifyOutOfRange({
+            pair: p.pair,
+            minutesOOR: p.minutes_out_of_range,
+            position: p,
+            mode: config.management.solMode ? "SOL" : "USD",
+            waitMinutes: config.management.outOfRangeWaitMinutes,
+          }).catch(() => { });
         }
       }
     }
@@ -1921,32 +1957,18 @@ async function telegramHandler(msg) {
 
   if (text === "/positions") {
     try {
-      const { positions, total_positions } = await getMyPositions({ force: true });
-      if (total_positions === 0) { await sendMessage("No open positions."); return; }
+      const { positions = [], total_positions } = await getMyPositions({ force: true });
       // Live market cap is a display-only enrichment — failures leave it off.
-      const enriched = await enrichPositionsWithMarketCap(positions);
-      const cur = config.management.solMode ? "◎" : "$";
-      const lines = enriched.map((p, i) => {
-        const pnl = p.pnl_usd >= 0 ? `+${cur}${p.pnl_usd}` : `-${cur}${Math.abs(p.pnl_usd)}`;
-        const age = p.age_minutes != null ? `${p.age_minutes}m` : "?";
-        const parts = [
-          `${i + 1}. <b>${escapeHtml(p.pair)}</b> ${formatRangeStatus(p.in_range)}`,
-          `   ${cur}${p.total_value_usd} · PnL ${pnl} · fees ${cur}${p.unclaimed_fees_usd} · ⏱ ${age}`,
-        ];
-        const rangePct = computeRangePositionPct({
-          lowerBinId: p.lower_bin,
-          upperBinId: p.upper_bin,
-          activeBinId: p.active_bin,
-        });
-        if (rangePct != null) parts.push(`   📍 Range Position: <b>${rangePct}%</b> ${renderRangeBar(rangePct)}`);
-        const mcap = formatCompactUsd(p.mcap);
-        if (mcap) parts.push(`   🧢 MC: <b>${mcap}</b>`);
-        return parts.join("\n");
-      });
-      await sendHTML(
-        `📊 <b>Open Positions</b> (${total_positions}):\n\n${lines.join("\n\n")}\n\n` +
-        `/close &lt;n&gt; to close | /set &lt;n&gt; &lt;note&gt; to set instruction`,
-      );
+      // Skipped entirely when there is nothing to show (no wasted HTTP call).
+      const enriched = positions.length ? await enrichPositionsWithMarketCap(positions) : [];
+      // 100 % local rendering: tree branches, dividers, progress bars and
+      // monospace blocks are built synchronously from this snapshot.
+      await sendHTML(formatOpenPositionsMessage({
+        positions: enriched,
+        totalPositions: total_positions ?? enriched.length,
+        mode: config.management.solMode ? "SOL" : "USD",
+        maxPositions: config.risk.maxPositions,
+      }));
     } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
     return;
   }

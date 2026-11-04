@@ -62,6 +62,16 @@ import {
   truncateAddress,
 } from "../services/lp-menu.js";
 import {
+  MESSAGE_LIMIT,
+  SECTION_DIVIDER,
+  escapeHtml,
+  formatOpenPositionsMessage,
+  formatOutOfRangeAlert,
+  formatProgressBar,
+  formatTreeRows,
+  renderProgressBar,
+} from "../services/telegramFormat.js";
+import {
   PNL_CARD_CAPTION_LIMIT,
   PNL_CARD_DEFAULT_HEIGHT,
   PNL_CARD_DEFAULT_WIDTH,
@@ -103,6 +113,11 @@ import {
   selectAxisTicks,
 } from "../services/chartService.js";
 import { config } from "../config.js";
+import {
+  applyJupiterReferralParams,
+  buildJupiterReferralParams,
+  getJupiterReferralParams,
+} from "../tools/wallet.js";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -1845,6 +1860,289 @@ test("RPC position reads degrade to empty positions instead of stalling", () => 
   assert.match(index, /POSITIONS_READ_TIMEOUT_MS/);
   assert.match(index, /pnl_poll_warn/);
   assert.match(index, /if \(result\?\.error\)/);
+});
+
+console.log("\n=== ASCII tree layout & progress bars ===");
+
+test("progress bar helper renders the range concentration", () => {
+  assert.equal(renderProgressBar(65), "[██████░░░░]");
+  assert.equal(renderProgressBar(0), "[░░░░░░░░░░]");
+  assert.equal(renderProgressBar(100), "[██████████]");
+  assert.equal(renderProgressBar(99.9), "[█████████░]");
+  assert.equal(renderProgressBar(null), "[░░░░░░░░░░]");
+  assert.equal(renderProgressBar(50, 4), "[██░░]");
+
+  assert.equal(formatProgressBar(100), "[██████████] 100%");
+  assert.equal(formatProgressBar(65), "[██████░░░░] 65%");
+  assert.equal(formatProgressBar(null), null);
+  // `renderRangeBar` keeps its historical name/behaviour on top of the helper.
+  assert.equal(renderRangeBar(65), renderProgressBar(65));
+  assert.equal(renderRangeBar(50, 4), "[██░░]");
+});
+
+test("tree rows use branch glyphs and drop empty optional rows", () => {
+  assert.equal(formatTreeRows([]), "");
+  assert.equal(formatTreeRows([null, undefined, ""]), "");
+  assert.equal(
+    formatTreeRows([
+      { label: "💵 Value", value: "$52.40" },
+      null,
+      "plain",
+      { label: "⏱ Age", value: "42m" },
+    ]),
+    "├─ 💵 Value $52.40\n├─ plain\n└─ ⏱ Age 42m",
+  );
+  assert.match(SECTION_DIVIDER, /^━{10,}$/);
+});
+
+test("/positions renders the tree layout with monospace values", () => {
+  const text = formatOpenPositionsMessage({
+    totalPositions: 2,
+    maxPositions: 4,
+    mode: "USD",
+    positions: [
+      {
+        position: "AbCdEfGhIjKlMnOpQrStUvWxYz1234567890abcd",
+        pair: "Anakin/SOL",
+        in_range: true,
+        total_value_usd: 52.4,
+        pnl_usd: -4.2,
+        pnl_pct: -8.1,
+        unclaimed_fees_usd: 1.15,
+        lower_bin: -805,
+        upper_bin: -112,
+        active_bin: 0,
+        age_minutes: 42,
+        mcap: 1_250_000,
+      },
+      {
+        position: "ZzZzYyYyXxXx",
+        pair: "Bonk/SOL",
+        in_range: false,
+        minutes_out_of_range: 14,
+        total_value_usd: 10,
+        pnl_usd: 1.5,
+        pnl_pct: 3.2,
+        unclaimed_fees_usd: 0.2,
+        lower_bin: 100,
+        upper_bin: 140,
+        active_bin: 126,
+        age_minutes: 61,
+      },
+    ],
+  });
+
+  assert.match(text, /📊 <b>OPEN POSITIONS<\/b> · <code>2\/4<\/code>/);
+  assert.ok(text.includes(SECTION_DIVIDER), "sections are separated by the divider");
+  assert.match(text, /<b>1<\/b> · <code>Anakin\/SOL<\/code> · 🟢 <b>IN RANGE<\/b>/);
+  assert.match(text, /├─ 💵 Value <code>\$52\.40<\/code>/);
+  assert.match(text, /├─ 📈 PnL <code>-\$4\.20<\/code> <code>-8\.10%<\/code>/);
+  assert.match(text, /├─ 📍 Range <code>\[██████████\]<\/code> <code>100%<\/code>/);
+  assert.match(text, /├─ 🧢 MC <code>\$1\.25M<\/code>/);
+  assert.match(text, /<b>2<\/b> · <code>Bonk\/SOL<\/code> · 🔴 <b>OUT OF RANGE<\/b>/);
+  assert.match(text, /├─ 📍 Range <code>\[██████░░░░\]<\/code> <code>65%<\/code>/);
+  assert.match(text, /├─ 🚨 OOR <code>14m<\/code>/);
+  assert.match(text, /└─ ⏱ Age <code>61m<\/code> · 🆔 <code>ZzZzYyYy…<\/code>/);
+  assert.match(text, /💼 <code>2\/4<\/code> open · 💵 <code>\$62\.40<\/code>/);
+  assert.match(text, /\/close &lt;n&gt; to close/);
+
+  // Empty state keeps the divider + a way forward.
+  const empty = formatOpenPositionsMessage({ positions: [], totalPositions: 0 });
+  assert.match(empty, /No open positions\./);
+  assert.match(empty, /\/pool/);
+});
+
+test("/positions never exceeds Telegram's 4096-character cap", () => {
+  // Whole blocks are dropped and counted — the message is never sliced mid-tag.
+  const many = formatOpenPositionsMessage({
+    positions: Array.from({ length: 40 }, (_, i) => ({
+      position: `Position${i}AbCdEfGhIjKlMnOpQrSt`,
+      pair: `Token${i}/SOL`,
+      in_range: true,
+      total_value_usd: 10,
+      pnl_usd: 1,
+      pnl_pct: 1,
+      unclaimed_fees_usd: 0.1,
+      lower_bin: 0,
+      upper_bin: 10,
+      active_bin: 5,
+      age_minutes: 5,
+    })),
+    totalPositions: 40,
+  });
+  assert.ok(many.length <= MESSAGE_LIMIT, `message must fit the Telegram cap (got ${many.length})`);
+  assert.match(many, /… \+\d+ more/);
+  assert.match(many, /<\/code>$|\/set &lt;n&gt; &lt;note&gt; to set instruction$/);
+});
+
+test("token symbols and values are escaped for the Telegram HTML parser", () => {
+  assert.equal(escapeHtml("a<b>&c"), "a&lt;b&gt;&amp;c");
+  const text = formatOpenPositionsMessage({
+    positions: [{ pair: "<b>A&B</b>/SOL", in_range: null, total_value_usd: 10 }],
+  });
+  assert.match(text, /&lt;b&gt;A&amp;B&lt;\/b&gt;\/SOL/);
+  assert.doesNotMatch(text, /<b>A&B<\/b>\/SOL/);
+  assert.match(text, /⚪ <b>RANGE UNKNOWN<\/b>/);
+});
+
+test("out-of-range alerts reuse the same tree layout", () => {
+  const text = formatOutOfRangeAlert({
+    pair: "Anakin/SOL",
+    minutesOOR: 14,
+    mode: "USD",
+    waitMinutes: 30,
+    position: {
+      lower_bin: 1180,
+      upper_bin: 1234,
+      active_bin: 1234,
+      pnl_pct: -8.1,
+      total_value_usd: 52.4,
+    },
+  });
+  assert.match(text, /⚠️ <b>OUT OF RANGE<\/b> · <code>Anakin\/SOL<\/code>/);
+  assert.ok(text.includes(SECTION_DIVIDER));
+  assert.match(text, /├─ ⏱ Drifting <code>14m<\/code>/);
+  assert.match(text, /├─ 📍 Range <code>\[██████████\]<\/code> <code>100%<\/code>/);
+  assert.match(text, /├─ 📈 PnL <code>-8\.10%<\/code>/);
+  assert.match(text, /└─ 💵 Value <code>\$52\.40<\/code>/);
+  assert.match(text, /Close rule fires at <code>30m<\/code> out of range/);
+
+  // Flat signature (pair + minutes only) still renders a valid message.
+  const minimal = formatOutOfRangeAlert({ pair: "X/SOL", minutesOOR: 5 });
+  assert.match(minimal, /└─ ⏱ Drifting <code>5m<\/code>/);
+  assert.match(minimal, /Monitoring — no action taken yet/);
+});
+
+test("management cycle and /positions share the pure tree helpers", () => {
+  const indexSrc = fs.readFileSync(path.join(ROOT, "index.js"), "utf8");
+  const management = indexSrc.slice(
+    indexSrc.indexOf("export async function runManagementCycle"),
+    indexSrc.indexOf("export async function runScreeningCycle"),
+  );
+  assert.match(management, /formatTreeRows\(/, "management report uses the tree layout");
+  assert.match(management, /formatProgressBar\(/, "management report uses the progress bar");
+  assert.match(management, /SECTION_DIVIDER/, "management report uses section dividers");
+
+  const positionsHandler = indexSrc.slice(
+    indexSrc.indexOf('if (text === "/positions")'),
+    indexSrc.indexOf("// /pool (no argument)"),
+  );
+  assert.match(positionsHandler, /formatOpenPositionsMessage\(/);
+
+  const telegramSrc = fs.readFileSync(path.join(ROOT, "telegram.js"), "utf8");
+  assert.match(telegramSrc, /formatOutOfRangeAlert\(/);
+
+  // The layout module must stay pure: no imports, no I/O, no async work.
+  const formatSrc = fs.readFileSync(path.join(ROOT, "services/telegramFormat.js"), "utf8");
+  assert.equal(/^import\s/m.test(formatSrc), false, "format helpers must stay dependency-free");
+  assert.equal(/\bfetch\s*\(/.test(formatSrc), false, "format helpers must never fetch");
+  assert.equal(/\bawait\b/.test(formatSrc), false, "format helpers must stay synchronous");
+});
+
+console.log("\n=== Jupiter referral (disabled by default) ===");
+
+// The old built-in referral address. It must not exist outside these fixtures.
+const LEGACY_REFERRAL_ADDRESS = "9MzhDUnq3KxecyPzvhguQMMPbooXQ3VAoCMPDnoijwey";
+
+test("referral params are omitted entirely when the fee is disabled", () => {
+  // Default config: no account + 0 bps → feature off.
+  assert.equal(buildJupiterReferralParams({ account: null, feeBps: 0 }), null);
+  assert.equal(buildJupiterReferralParams({}), null);
+  // 0 bps disables the fee even when an account is configured.
+  assert.equal(buildJupiterReferralParams({ account: LEGACY_REFERRAL_ADDRESS, feeBps: 0 }), null);
+  assert.equal(buildJupiterReferralParams({ account: LEGACY_REFERRAL_ADDRESS }), null);
+  // No account disables the fee even with a valid bps.
+  assert.equal(buildJupiterReferralParams({ account: "", feeBps: 50 }), null);
+  assert.equal(buildJupiterReferralParams({ account: "not-a-pubkey", feeBps: 50 }), null);
+  // Below Jupiter Ultra's 50 bps minimum.
+  assert.equal(buildJupiterReferralParams({ account: LEGACY_REFERRAL_ADDRESS, feeBps: 40 }), null);
+
+  // Payload: a disabled referral adds ZERO fee-account query parameters.
+  const search = new URLSearchParams({
+    inputMint: "So11111111111111111111111111111111111111112",
+    outputMint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    amount: "1000000",
+  });
+  const before = search.toString();
+  applyJupiterReferralParams(search, buildJupiterReferralParams({ account: null, feeBps: 0 }));
+  assert.equal(search.toString(), before, "the request query must be untouched");
+  assert.equal(search.has("referralAccount"), false);
+  assert.equal(search.has("referralFee"), false);
+  assert.equal(search.has("feeAccount"), false);
+  assert.equal(search.has("referralFeeBps"), false);
+});
+
+test("referral params are attached only on an explicit opt-in", () => {
+  const params = buildJupiterReferralParams({ account: LEGACY_REFERRAL_ADDRESS, feeBps: 50 });
+  assert.deepEqual(params, { referralAccount: LEGACY_REFERRAL_ADDRESS, referralFee: 50 });
+
+  const search = new URLSearchParams({ inputMint: "in", outputMint: "out" });
+  applyJupiterReferralParams(search, params);
+  assert.equal(search.get("referralAccount"), LEGACY_REFERRAL_ADDRESS);
+  assert.equal(search.get("referralFee"), "50");
+
+  // 255 is the documented ceiling, 256 is rejected.
+  assert.equal(buildJupiterReferralParams({ account: LEGACY_REFERRAL_ADDRESS, feeBps: 255 }).referralFee, 255);
+  assert.equal(buildJupiterReferralParams({ account: LEGACY_REFERRAL_ADDRESS, feeBps: 256 }), null);
+});
+
+test("config ships with the referral disabled and no hard-coded address", () => {
+  const configSrc = fs.readFileSync(path.join(ROOT, "config.js"), "utf8");
+  assert.match(configSrc, /JUPITER_REFERRAL_FEE_BPS \?\? 0/, "the BPS default must be 0");
+  assert.match(configSrc, /referralEnabled:/, "config exposes the derived flag");
+  assert.doesNotMatch(configSrc, new RegExp(LEGACY_REFERRAL_ADDRESS), "no built-in referral address");
+
+  assert.equal(typeof config.jupiter.referralEnabled, "boolean");
+  const bps = Number(config.jupiter.referralFeeBps ?? 0);
+  assert.ok(Number.isFinite(bps) && bps >= 0, `referralFeeBps must be a non-negative number (got ${bps})`);
+  // Unless .env opts in with BOTH values, the feature is off.
+  if (!config.jupiter.referralAccount || bps === 0) {
+    assert.equal(config.jupiter.referralEnabled, false);
+    assert.equal(getJupiterReferralParams(), null);
+  }
+
+  // Repo-wide guard: the legacy address must not survive anywhere in the
+  // shipped sources / docs / .env.example (test fixtures are excluded).
+  const SKIP_DIRS = new Set(["node_modules", ".git", "logs", "test", ".claude", "discord-listener"]);
+  const offenders = [];
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (entry.isDirectory()) {
+        if (!SKIP_DIRS.has(entry.name)) walk(path.join(dir, entry.name));
+        continue;
+      }
+      if (!/\.(js|mjs|cjs|md|example)$/.test(entry.name)) continue;
+      const full = path.join(dir, entry.name);
+      if (fs.readFileSync(full, "utf8").includes(LEGACY_REFERRAL_ADDRESS)) {
+        offenders.push(path.relative(ROOT, full));
+      }
+    }
+  };
+  walk(ROOT);
+  assert.deepEqual(offenders, [], `built-in referral address still present in: ${offenders.join(", ")}`);
+});
+
+test("referral card shows 'Disabled (0 BPS)' and hides the account", () => {
+  const snapshot = { ...config.jupiter };
+  try {
+    config.jupiter.referralAccount = null;
+    config.jupiter.referralFeeBps = 0;
+    const disabled = renderReferralsView();
+    assert.match(disabled.text, /Referral Fee: Disabled \(0 BPS\)/);
+    // No account block at all — no address is displayed or hinted at.
+    assert.doesNotMatch(disabled.text, /🔗/);
+    assert.doesNotMatch(disabled.text, /<code>[1-9A-HJ-NP-Za-km-z]{32,44}<\/code>/);
+    assert.match(disabled.text, /zero platform fee/);
+
+    // Opt-in (custom account) → the card shows the fee and the account.
+    config.jupiter.referralAccount = LEGACY_REFERRAL_ADDRESS;
+    config.jupiter.referralFeeBps = 50;
+    const enabled = renderReferralsView();
+    assert.match(enabled.text, /Referral Fee: 50 BPS \(0\.50%\)/);
+    assert.match(enabled.text, new RegExp(`<code>${LEGACY_REFERRAL_ADDRESS}</code>`));
+  } finally {
+    Object.assign(config.jupiter, snapshot);
+  }
 });
 
 console.log(`\n✓ ${passed} LP-menu tests passed`);

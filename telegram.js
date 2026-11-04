@@ -2,6 +2,10 @@ import fs from "fs";
 import { log } from "./logger.js";
 import { repoPath } from "./repo-root.js";
 import { isTimeoutError } from "./utils/timeout.js";
+// Pure, synchronous layout helpers (tree branches, dividers, progress bars,
+// monospace blocks). No I/O, no imports of its own — so no import cycle with
+// `services/lp-menu.js` (which imports this module).
+import { formatOutOfRangeAlert } from "./services/telegramFormat.js";
 
 const USER_CONFIG_PATH = repoPath("user-config.json");
 
@@ -750,12 +754,21 @@ export async function notifySwap({ inputSymbol, outputSymbol, amountIn, amountOu
   );
 }
 
-export async function notifyOutOfRange({ pair, minutesOOR }) {
+/**
+ * Management-cycle range alert, rendered in the same structured tree layout as
+ * `/positions`. `position` is the in-memory snapshot the management cycle
+ * already holds — passing it adds the range bar, PnL and value rows without a
+ * single extra RPC/API read.
+ */
+export async function notifyOutOfRange({
+  pair = null,
+  minutesOOR = null,
+  position = null,
+  mode = "USD",
+  waitMinutes = null,
+} = {}) {
   if (hasActiveLiveMessage()) return;
-  await sendHTML(
-    `⚠️ <b>Out of Range</b> ${pair}\n` +
-    `Been OOR for ${minutesOOR} minutes`
-  );
+  await sendHTML(formatOutOfRangeAlert({ pair, minutesOOR, position, mode, waitMinutes }));
 }
 
 function sleep(ms) {
