@@ -165,15 +165,15 @@ export const config = {
     allowLiveRedeploy:  u.flipperAllowLiveRedeploy ?? false,
   },
 
-  // ─── Exit safety net (Priority 3: Supertrend 15m candle break) ──
-  // TP/SL (priority 1) and range bounds (priority 2) are config-driven through
-  // `management`; this block only tunes the fallback Supertrend safety net.
-  // RSI/MACD are NOT exit inputs — see exit-rules.js.
+  // ─── Exit safety net (Supertrend guard — RETIRED) ──────────────
+  // The exit engine is a pure 2-priority hierarchy now: Priority 1 hard TP/SL
+  // (total PnL) → Priority 2 range out. No candle/historical price data is
+  // fetched anywhere in the exit path, so there is nothing left to tune here.
+  // `enable_supertrend_guard` is kept as an explicit kill-switch record in
+  // user-config.json (default **false**); setting it to true does NOT re-enable
+  // the removed Priority 3 — the code path no longer exists.
   exitSafety: {
-    // The timeframe is fixed at 15m by design (SUPERTREND_INTERVAL in exit-rules.js).
-    supertrendEnabled: u.exitSupertrendEnabled ?? true,
-    cacheSec:          Number(u.exitSupertrendCacheSec ?? 60),
-    confirmTicks:      Math.max(1, Number(u.exitSupertrendConfirmTicks ?? 2)),
+    supertrendEnabled: u.enable_supertrend_guard ?? u.enableSupertrendGuard ?? u.exitSupertrendEnabled ?? false,
   },
 
   // ─── Smart-Wallet Radar (optional wallet-convergence tracker) ──

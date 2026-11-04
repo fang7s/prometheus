@@ -2,7 +2,7 @@
  * Zenith-style closed-position PnL card (PNG) for Telegram close summaries.
  *
  * This renderer is used **only** for closed positions (manual `/close`,
- * `/closeall`, rule-engine exits: TP/SL, range-out, 15m Supertrend break) and for
+ * `/closeall`, rule-engine exits: hard TP/SL or range out) and for
  * PnL history. Open positions always stay text-only (see `lp-menu.js`).
  *
  * Rendering is **100 % code** — pure Node.js canvas drawing with the rust-backed

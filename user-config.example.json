@@ -58,6 +58,8 @@
   "trailingTakeProfit": true,
   "trailingTriggerPct": 3,
   "trailingDropPct": 1.5,
+  "_comment_exits": "Exit engine is a pure 2-priority hierarchy: Priority 1 hard TP/SL (total PnL incl. claimable/claimed fees vs deposit) -> Priority 2 range out (only after the position has entered its range). No Supertrend / candle feed.",
+  "enable_supertrend_guard": false,
   "pnlSanityMaxDiffPct": 5,
   "solMode": false,
 

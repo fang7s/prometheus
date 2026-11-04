@@ -2,13 +2,14 @@
  * Deterministic exit-hierarchy tests (no network, no state writes, no LLM).
  * Run: node test/test-exit-rules.js
  *
- * Verifies the strict priority hierarchy:
- *   1. TP / SL (percentage PnL)
- *   2. Range boundaries (far above / far below the configured outer bounds),
- *      guarded by `hasEnteredRange` so a below-price limit order is never closed
- *      before it has filled at least once
- *   3. Supertrend 15m 1-candle close break
- * and that RSI(2) / MACD / Bollinger signals can never close a position.
+ * Verifies the simplified 2-priority hierarchy:
+ *   1. Hard TP / SL on Total PnL % (unrealized value + claimable/claimed fees vs
+ *      the initial deposit)
+ *   2. Range out (far above / far below the configured outer bounds), guarded by
+ *      `hasEnteredRange` so a below-price limit order is never closed before it
+ *      has filled at least once
+ * and that the removed Supertrend 15m check (plus RSI(2) / MACD / Bollinger) can
+ * never close a position and never triggers a candle/historical price fetch.
  */
 
 import assert from "node:assert/strict";
@@ -21,11 +22,11 @@ import {
   detectExit,
   evaluateExitHierarchy,
   evaluateNumericRules,
-  evaluateSupertrendExit,
   formatExitLog,
   hasEnteredRangeOf,
   isPnlSuspect,
   parseInstructionOverrides,
+  resolveTotalPnlPct,
   ruleDecision,
 } from "../exit-rules.js";
 import {
@@ -84,22 +85,28 @@ function position(overrides = {}) {
 
 console.log("=== exit-rules.js (strict exit priority hierarchy) ===\n");
 
-test("rule ids and priorities match the documented hierarchy", () => {
-  assert.deepEqual(EXIT_PRIORITY, { TP_SL: 1, RANGE: 2, SUPERTREND: 3 });
+test("rule ids and priorities match the documented 2-priority hierarchy", () => {
+  assert.deepEqual(EXIT_PRIORITY, { TP_SL: 1, RANGE: 2 });
 
   assert.equal(EXIT_RULES.STOP_LOSS.rule, 1);
   assert.equal(EXIT_RULES.TAKE_PROFIT.rule, 2);
   assert.equal(EXIT_RULES.FAR_ABOVE_RANGE.rule, 4);
   assert.equal(EXIT_RULES.FAR_BELOW_RANGE.rule, 5);
-  assert.equal(EXIT_RULES.SUPERTREND_BREAK.rule, 6);
 
   assert.equal(EXIT_RULES.STOP_LOSS.priority, 1);
   assert.equal(EXIT_RULES.TAKE_PROFIT.priority, 1);
   assert.equal(EXIT_RULES.TRAILING_TP.priority, 1);
   assert.equal(EXIT_RULES.FAR_ABOVE_RANGE.priority, 2);
   assert.equal(EXIT_RULES.FAR_BELOW_RANGE.priority, 2);
-  assert.equal(EXIT_RULES.SUPERTREND_BREAK.priority, 3);
-  assert.equal(EXIT_RULES.SUPERTREND_BREAK.name, "Supertrend 15m Candle Break");
+
+  // Priority 3 (Supertrend 15m) is gone, and no priority above 2 may come back.
+  assert.equal(EXIT_RULES.SUPERTREND_BREAK, undefined);
+  assert.equal("SUPERTREND" in EXIT_PRIORITY, false);
+  assert.equal(
+    Object.values(EXIT_RULES).every((rule) => rule.priority <= 2),
+    true,
+    "no rule may sit outside the 2-priority hierarchy",
+  );
 
   // The removed indicator / decay rules must be gone from the ladder.
   assert.equal(EXIT_RULES.EVIL_PANDA, undefined);
@@ -154,6 +161,41 @@ test("Priority 1 — trailing take-profit stays a profit-taking exit", () => {
   assert.equal(disabled, null);
 });
 
+test("Priority 1 — Total PnL counts claimable + claimed fees against the deposit", () => {
+  // The on-chain percentage is authoritative (pnl.js already folds fees in).
+  assert.equal(resolveTotalPnlPct({ pnl_pct: 7.5 }), 7.5);
+  assert.equal(resolveTotalPnlPct(position({ pnl_pct: -12 }), null), -12);
+
+  // Hand-built / legacy payloads without pnl_pct derive it from USD fields:
+  // (value 100 + claimable 2 + claimed 1 − deposit 100) / 100 = +3 %.
+  const payload = {
+    total_value_true_usd: 100,
+    unclaimed_fees_true_usd: 2,
+    collected_fees_true_usd: 1,
+    initial_value_usd: 100,
+  };
+  assert.equal(resolveTotalPnlPct(payload), 3);
+
+  // `pnl_usd` wins over the component fields when present.
+  assert.equal(resolveTotalPnlPct({ pnl_true_usd: 4, initial_value_usd: 100 }), 4);
+  // Deposit may come from persisted state.
+  assert.equal(resolveTotalPnlPct({ pnl_true_usd: 5 }, { initial_value_usd: 100 }), 5);
+  // No deposit → no percentage (PnL rules are skipped, never guessed).
+  assert.equal(resolveTotalPnlPct({ total_value_true_usd: 100 }), null);
+  assert.equal(resolveTotalPnlPct({}), null);
+
+  // Fees alone can push a flat position over the TP line.
+  const feeDriven = position({
+    pnl_pct: undefined,
+    total_value_true_usd: 99,
+    unclaimed_fees_true_usd: 6,
+    initial_value_usd: 100,
+  });
+  const d = evaluateExitHierarchy(feeDriven, MGMT);
+  assert.equal(d.rule_key, "TAKE_PROFIT", "claimable fees must count toward TP");
+  assert.equal(d.pnl_pct, 5);
+});
+
 test("suspect PnL ticks never trigger PnL rules", () => {
   const p = position({ pnl_pct: -100, pnl_pct_suspicious: true });
   assert.equal(isPnlSuspect(p, { amount_sol: 1 }), true);
@@ -182,11 +224,16 @@ test("Priority 2 — far below range closes beyond the configured outer bound", 
   assert.equal(evaluateExitHierarchy(position({ active_bin: 70, in_range: false }), MGMT), null);
 });
 
-test("Priority 2 — range outranks the Supertrend fallback", () => {
+test("Priority 2 — range out ranks below TP/SL and fires only past the bound", () => {
   const d = evaluateExitHierarchy(position({ active_bin: 200, in_range: false }), MGMT);
   assert.equal(d.priority, 2);
-  // The caller only asks for Priority 3 when this returns null.
+  // Inside the bounds nothing closes; there is no lower priority left to ask.
   assert.equal(evaluateExitHierarchy(position({ active_bin: 100 }), MGMT), null);
+  // TP/SL on the same tick always win.
+  assert.equal(
+    evaluateExitHierarchy(position({ pnl_pct: 9, active_bin: 400, in_range: false }), MGMT).rule_key,
+    "TAKE_PROFIT",
+  );
 });
 
 test("Priority 2 — data-gap fallback keeps the out-of-range wait", () => {
@@ -392,31 +439,53 @@ test("deploy starts hasEnteredRange=false and both exit loops run the monitor ti
   assert.match(exitSrc, /monitorPosition\(position, \{ tracked: trackedBefore \}\)/);
 });
 
-console.log("\n--- Priority 3: Supertrend 15m candle break ---");
+console.log("\n--- Supertrend guard removed (no candle fetching) ---");
 
-test("Priority 3 — one 15m candle closing below the Supertrend closes", () => {
-  const d = evaluateSupertrendExit({ interval: "15_MINUTE", close: 0.00072, supertrendValue: 0.00081 });
-  assert.equal(d.priority, 3);
-  assert.equal(d.action, "CLOSE");
-  assert.equal(d.rule_key, "SUPERTREND_BREAK");
-  assert.equal(d.headline, "Priority 3: Supertrend 15m Candle Break");
-  assert.equal(d.candle_close, 0.00072);
-  assert.equal(d.supertrend_value, 0.00081);
-
-  // API-flagged break-down on the latest closed candle is enough on its own.
-  const flagged = evaluateSupertrendExit({ interval: "15_MINUTE", supertrendBreakDown: true });
-  assert.equal(flagged.rule_key, "SUPERTREND_BREAK");
+test("the Supertrend priority and its evaluator no longer exist", () => {
+  const engineSrc = fs.readFileSync(path.join(ROOT, "exit-rules.js"), "utf8");
+  assert.equal(/export\s+function\s+evaluateSupertrendExit/.test(engineSrc), false);
+  assert.equal(/SUPERTREND_INTERVAL/.test(engineSrc), false);
+  assert.equal(EXIT_RULES.SUPERTREND_BREAK, undefined);
+  assert.equal(EXIT_PRIORITY.SUPERTREND, undefined);
+  // `ruleDecision` cannot build a Supertrend decision any more.
+  assert.throws(() => ruleDecision("SUPERTREND_BREAK", "15m close"), /Unknown exit rule/);
 });
 
-test("Priority 3 — no break above the line, and non-15m data is ignored", () => {
-  assert.equal(evaluateSupertrendExit({ interval: "15_MINUTE", close: 0.0009, supertrendValue: 0.00081 }), null);
-  assert.equal(evaluateSupertrendExit({ interval: "15_MINUTE", close: 0.00081, supertrendValue: 0.00081 }), null);
-  assert.equal(evaluateSupertrendExit({ interval: "15_MINUTE", close: null, supertrendValue: null }), null);
-  // A 5m break must never drive the 15m safety net.
-  assert.equal(evaluateSupertrendExit({ interval: "5_MINUTE", close: 0.0001, supertrendValue: 0.0009 }), null);
-  assert.equal(evaluateSupertrendExit(null), null);
+test("the exit path never fetches candle or historical price data", () => {
+  const engine = stripComments(fs.readFileSync(path.join(ROOT, "exit-rules.js"), "utf8"));
+  for (const banned of [/\bsupertrend\b/i, /\bcandle/i, /\bohlcv\b/i, /\bhistorical\b/i]) {
+    assert.equal(banned.test(engine), false, `exit-rules.js must not reference ${banned}`);
+  }
+  // No network surface at all in the engine: no fetch/HTTP client, no API tools.
+  assert.equal(/\bfetch\s*\(/.test(engine), false, "exit-rules.js must not fetch");
+  assert.equal(/agentMeridian|chart-indicators|abortSignal/i.test(engine), false);
+
+  // index.js drives both loops from the local snapshot only.
+  const indexSrc = stripComments(fs.readFileSync(path.join(ROOT, "index.js"), "utf8"));
+  assert.match(indexSrc, /function evaluatePositionExit\(position\)\s*\{\s*return detectExit\(position, config\.management\);/);
+  assert.equal(/fetchSupertrend15m/.test(indexSrc), false, "index.js must not fetch Supertrend data");
+  assert.equal(/evaluateSupertrendExit/.test(indexSrc), false, "index.js must not evaluate Supertrend");
+  assert.equal(/detectExitWithSupertrend/.test(indexSrc), false, "the Priority 3 helper must be gone");
+  assert.equal(/chart-indicators/.test(indexSrc), false, "the exit path must not import the indicator API");
+  assert.equal(/exitSafety/.test(indexSrc), false, "no exit-safety knobs are read any more");
+
+  // The 15m fetch helper is gone from the indicator tool as well.
+  const indicators = stripComments(fs.readFileSync(path.join(ROOT, "tools/chart-indicators.js"), "utf8"));
+  assert.equal(/fetchSupertrend15m/.test(indicators), false, "fetchSupertrend15m must be deleted");
+  assert.equal(/SUPERTREND_EXIT_INTERVAL|_supertrendCache/.test(indicators), false);
 });
 
+test("the Supertrend guard is disabled in the documented config", () => {
+  for (const file of ["user-config.json", "user-config.example.json"]) {
+    const parsed = JSON.parse(fs.readFileSync(path.join(ROOT, file), "utf8"));
+    assert.equal(parsed.enable_supertrend_guard, false, `${file} must disable the Supertrend guard`);
+  }
+
+  // config.js keeps the flag as an explicit, default-off kill-switch.
+  const configSrc = fs.readFileSync(path.join(ROOT, "config.js"), "utf8");
+  assert.match(configSrc, /enable_supertrend_guard/);
+  assert.match(configSrc, /\?\?\s*u\.exitSupertrendEnabled\s*\?\?\s*false/);
+});
 
 console.log("\n--- Technical indicators never close a position ---");
 
@@ -443,16 +512,18 @@ test("legacy low-yield / instruction-time exits are no longer automatic closes",
   );
 });
 
-test("a hot RSI/MACD payload without a Supertrend break closes nothing", () => {
-  const signal = {
-    interval: "15_MINUTE",
-    close: 0.0009,
-    supertrendValue: 0.0008,
+test("a hot RSI/MACD/Bollinger position closes nothing", () => {
+  // Same rule the "hot payload" test above applies to snapshots — kept as a
+  // reminder that no indicator value can reach the 2-priority ladder.
+  const hot = position({
+    pnl_pct: 1.2,
+    active_bin: 118, // inside the bounds
     rsi: 99,
     macdHistogram: 0.5,
     macdFirstGreenCandle: true,
-  };
-  assert.equal(evaluateSupertrendExit(signal), null);
+    bb_upper: 0.0007,
+  });
+  assert.equal(evaluateExitHierarchy(hot, MGMT), null);
 });
 
 test("indicator confluence is decoupled from the exit path", () => {
@@ -487,12 +558,8 @@ test("exit log lines carry the exact priority reason", () => {
   assert.equal(below, "[EXIT] Priority 2: Far Below Range — HYPE/USDC");
   assert.match(below, /^\[EXIT\] Priority 2: Far Below Range/);
 
-  const st = formatExitLog(
-    "HYPE/USDC",
-    evaluateSupertrendExit({ interval: "15_MINUTE", close: 1, supertrendValue: 2 }),
-  );
-  assert.equal(st, "[EXIT] Priority 3: Supertrend 15m Candle Break — HYPE/USDC");
-  assert.match(st, /^\[EXIT\] Priority 3: Supertrend 15m Candle Break/);
+  // There is no lower priority left: a healthy position logs nothing at all.
+  assert.equal(formatExitLog("HYPE/USDC", evaluateExitHierarchy(position(), MGMT)), "[EXIT] Exit — HYPE/USDC");
 });
 
 test("ruleDecision defaults carry the priority headline", () => {
@@ -519,10 +586,6 @@ test("close-reason text keeps downstream classification working", () => {
   assert.match(
     evaluateExitHierarchy(position({ active_bin: 69, in_range: false }), MGMT).reason.toLowerCase(),
     /out of range/,
-  );
-  assert.match(
-    evaluateSupertrendExit({ interval: "15_MINUTE", close: 1, supertrendValue: 2 }).reason.toLowerCase(),
-    /supertrend break/,
   );
 
   const lessons = fs.readFileSync(path.join(ROOT, "lessons.js"), "utf8");
@@ -559,31 +622,31 @@ test("detectExit integrates state refresh and the numeric hierarchy", () => {
   assert.equal(evaluateNumericRules, evaluateExitHierarchy);
 });
 
-test("both exit loops use the strict hierarchy (TP/SL → range → Supertrend)", () => {
+test("both exit loops use the simplified 2-priority hierarchy", () => {
   const src = fs.readFileSync(path.join(ROOT, "index.js"), "utf8");
   const managementBody = src.slice(
     src.indexOf("export async function runManagementCycle"),
     src.indexOf("export async function runScreeningCycle"),
   );
-  assert.match(managementBody, /detectExitWithSupertrend\(/);
+  assert.match(managementBody, /evaluatePositionExit\(/, "management must use the 2-priority evaluator");
   assert.match(managementBody, /executeRuleClose|executeManagementActions/);
 
-  assert.match(src, /export async function detectExitWithSupertrend/);
-  assert.match(src, /evaluateSupertrendExit\(/);
-  assert.match(src, /fetchSupertrend15m\(/);
-  assert.match(src, /\[EXIT\]/, "exit logs must carry the [EXIT] prefix");
-
-  // The helper walks 1 → 2 → 3 in order and only then asks for candles.
+  // One synchronous helper owns the whole exit decision — no network, no candles.
   const helper = src.slice(
-    src.indexOf("export async function detectExitWithSupertrend"),
+    src.indexOf("function evaluatePositionExit(position)"),
     src.indexOf("export async function runManagementCycle"),
   );
   assert.match(helper, /detectExit\(position, config\.management\)/);
-  assert.match(helper, /getSupertrendExit\(position\)/);
-  assert.ok(
-    helper.indexOf("detectExit(position") < helper.indexOf("getSupertrendExit(position)"),
-    "TP/SL + range must be evaluated before the Supertrend fallback",
-  );
+  assert.equal(/await/.test(helper), false, "the exit helper must not await anything");
+
+  // The fast poller uses the same helper and the plain tick confirmation.
+  const pollStart = src.indexOf("const pnlPollInterval = setInterval");
+  assert.ok(pollStart > 0, "fast PnL poller must exist");
+  const pollBody = src.slice(pollStart, pollStart + 6_000);
+  assert.match(pollBody, /evaluatePositionExit\(p\)/);
+  assert.match(pollBody, /registerExitSignal\(p\.position, signal, confirmTicks\)/);
+  assert.match(src, /\[EXIT\]/, "exit logs must carry the [EXIT] prefix");
+  assert.match(src, /formatExitLog\(/);
 });
 
 test("exit engine has no LLM dependency", () => {
@@ -613,7 +676,9 @@ test("management cycle never sends position data to an LLM", () => {
 
 test("healthy positions produce no exit", () => {
   assert.equal(evaluateExitHierarchy(position(), MGMT), null);
-  assert.equal(evaluateSupertrendExit({ interval: "15_MINUTE", close: 1.1, supertrendValue: 1 }), null);
+  // No reported PnL and no cost basis → no PnL rule fires, and the range is intact.
+  assert.equal(resolveTotalPnlPct({ active_bin: 100 }), null);
+  assert.equal(evaluateExitHierarchy({ position: "x", active_bin: 100, lower_bin: 80, upper_bin: 120 }, MGMT), null);
 });
 
 test("management cycle body contains no LLM call", () => {
@@ -623,7 +688,7 @@ test("management cycle body contains no LLM call", () => {
   assert.ok(start > 0 && end > start, "management/screening functions must exist");
   const managementBody = src.slice(start, end);
   assert.equal(/agentLoop\(/.test(managementBody), false, "management cycle must never call the LLM");
-  assert.match(managementBody, /detectExitWithSupertrend\(/);
+  assert.match(managementBody, /evaluatePositionExit\(/);
   assert.match(managementBody, /executeRuleClose|executeManagementActions/);
 });
 

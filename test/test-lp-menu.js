@@ -1441,7 +1441,7 @@ test("every close path triggers the closed-position PnL card", () => {
   const indexSrc = fs.readFileSync(path.join(ROOT, "index.js"), "utf8");
   const executorSrc = fs.readFileSync(path.join(ROOT, "tools/executor.js"), "utf8");
   const dlmmSrc = fs.readFileSync(path.join(ROOT, "tools/dlmm.js"), "utf8");
-  // Automatic exits (TP/SL, range-out, Supertrend) close through the executor.
+  // Automatic exits (hard TP/SL, range out) close through the executor.
   assert.match(executorSrc, /queueClosedPositionPnlCard\(result/);
   // Manual /close and /closeall close directly and dispatch the card themselves.
   const manualCalls = indexSrc.match(/dispatchClosedPositionPnlCard\(pos, result\)/g) || [];

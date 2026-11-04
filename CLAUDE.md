@@ -81,7 +81,7 @@ Autonomous DLMM liquidity provider agent for Meteora pools on Solana.
 |---|---:|---|
 | **Entry / orchestration** | | |
 | `index.js` | ~2500 | Daemon. Cron, REPL, Telegram bot, briefing, HiveMind bootstrap, PnL poller, deterministic exit execution, single-candidate skip rule, settings menu. **All** automatic cycles start here. Cron is idempotent + minute-granular (`cronExprForInterval`, `_cronStarted`), every screening trigger goes through `requestScreeningCycle()` (single-flight `isScreeningRunning()` + dedupe window), `/pool` runs as an 8 s isolated task (`runIsolatedTask`, cancellable via `createAbortToken`), and every position read is bounded (`POSITIONS_READ_TIMEOUT_MS`). |
-| `exit-rules.js` | ~420 | **The only exit engine — a strict 3-step hierarchy.** Priority 1 TP/SL (1 stop-loss, 2 take-profit, 3 trailing TP), Priority 2 range bounds (4 far above, 5 far below), Priority 3 Supertrend 15m 1-candle break (6). `detectExit()` runs the range-entry tick (`monitorPosition`) and evaluates 1–2 synchronously; `evaluateSupertrendExit()` is the priority-3 safety net. **Priority 2 is guarded by `hasEnteredRange`**: while the flag is `false` (position has never traded inside its bounds) `evaluateExitHierarchy()` returns `null` from the Priority 2 block, so a below-price limit order is never cancelled before it fills (only an explicit `false` blocks — legacy records without the field keep the old behaviour). `formatExitLog()` emits `[EXIT] Priority N: <reason> — <pair>`. RSI/MACD/Bollinger are **not** exit inputs. No LLM imports. |
+| `exit-rules.js` | ~400 | **The only exit engine — a simplified 2-priority hierarchy.** Priority 1 hard TP/SL (1 stop-loss, 2 take-profit, 3 trailing TP) on **Total PnL %** (`resolveTotalPnlPct()` = unrealized value + claimable/claimed fees vs the initial deposit), Priority 2 range out (4 far above, 5 far below). `detectExit()` runs the range-entry tick (`monitorPosition`) and evaluates both priorities **synchronously from the local snapshot** — no candle/historical price fetch, no indicators, no network. **Priority 2 is guarded by `hasEnteredRange`**: while the flag is `false` (position has never traded inside its bounds) `evaluateExitHierarchy()` returns `null` from the Priority 2 block, so a below-price limit order is never cancelled before it fills (only an explicit `false` blocks — legacy records without the field keep the old behaviour). `formatExitLog()` emits `[EXIT] Priority N: <reason> — <pair>`. The old Priority 3 Supertrend 15m check, RSI/MACD/Bollinger are **not** exit inputs. No LLM imports. |
 | `agent.js` | 416 | `agentLoop(goal, maxSteps, history, agentType, model, maxOut, opts)`. The ReAct loop. Provider fallback, JSON repair, once-per-session tool locks, no-tool retries, `onToolStart`/`onToolFinish` callbacks for live Telegram messages. |
 | `cli.js` | 676 | One-shot CLI; every tool exposed as a subcommand. Also writes a `~/.meridian/SKILL.md` at startup for agent discovery. Loads `.env`/`user-config.json` from `~/.meridian/` if present, else from cwd. |
 | `setup.js` | ~750 | Interactive first-run wizard. Three presets (degen/moderate/safe) + custom. Covers strategy, screening filters, position sizing, trailing TP, per-role models. |
@@ -97,7 +97,7 @@ Autonomous DLMM liquidity provider agent for Meteora pools on Solana.
 | `tools/token.js` | 209 | `getTokenInfo` (Jupiter datapi), `getTokenHolders` (top 100 + filter pool-tagged), `getTokenNarrative` (Jupiter ChainInsight). Cross-references smart wallets from `smart-wallets.json`. |
 | `tools/study.js` | 152 | `studyTopLPers` → Agent Meridian `/top-lp` + `/study-top-lp`. Returns ranked LPer patterns (avg hold, win rate, preferred strategy). |
 | `tools/agent-meridian.js` | 110 | `agentMeridianJson(path, opts)` with retry/backoff. Default base = `https://api.agentmeridian.xyz/api`. |
-| `tools/chart-indicators.js` | ~380 | `confirmIndicatorPreset({mint, side})` — entry gate. Eight presets: `supertrend_break`, `rsi_reversal`, `bollinger_reversion`, `rsi_plus_supertrend`, `supertrend_or_rsi`, `bb_plus_rsi`, `fibo_reclaim`, `fibo_reject`. `fetchSupertrend15m(mint)` — 15m Supertrend snapshot for exit priority 3 (60 s cache, Supertrend fields only). Fetches from Agent Meridian `/chart-indicators/{mint}`. |
+| `tools/chart-indicators.js` | ~300 | `confirmIndicatorPreset({mint, side})` — optional **entry** gate. Eight presets: `supertrend_break`, `rsi_reversal`, `bollinger_reversion`, `rsi_plus_supertrend`, `supertrend_or_rsi`, `bb_plus_rsi`, `fibo_reclaim`, `fibo_reject`. Fetches Agent Meridian `/chart-indicators/{mint}`. The 15m exit snapshot (`fetchSupertrend15m`) was **removed** — the exit engine never reads candles. |
 | **Persistence (all `.json` at repo root)** | | |
 | `state.js` | 560 | `trackPosition` (new positions start with `has_entered_range: false`), `markOutOfRange/InRange`, `markRangeEntered` (one-way Priority 2 arming used by `services/positionMonitor.js`), `hasEnteredRange`, `recordClaim`, `recordClose`, `setPositionInstruction`, `updatePnlAndCheckExits` (the deterministic rules: STOP_LOSS, TRAILING_TP, OUT_OF_RANGE, LOW_YIELD), `getStateSummary`. `syncOpenPositions` reconciles local state with on-chain after 5 min grace. |
 | `pool-memory.js` | 405 | Per-pool deploy history + rolling 48-snapshot trend (5min × 4h). Computes `avg_pnl_pct`, `win_rate`, `adjusted_win_rate` (excludes OOR pumps). Cooldown logic: low yield → 4h pool cooldown, 3× OOR closes → 12h pool+token cooldown, optional repeat-deploy cooldown (configurable trigger count/hours/min fee yield/scope). `recordPositionSnapshot`, `recallForPool` for prompt injection. |
@@ -199,12 +199,11 @@ The management cycle is **mostly deterministic in JS, LLM only for the hard case
 
 1. `getMyPositions({ force: true })` → snapshot.
 2. `recordPositionSnapshot` per pool.
-3. For every position: `confirmPeak(...)` then `detectExitWithSupertrend(p)` (`index.js`), which walks the strict hierarchy of `exit-rules.js`:
-   - **Priority 1 — TP/SL:** `pnl_pct` vs `takeProfitPct` / `stopLossPct` (trailing TP is the same profit-taking family).
-   - **Priority 2 — Range bounds:** active bin far above (`> upper + outOfRangeBinsToClose`) or far below (`< lower − outOfRangeBinsToClose`); a data-gap fallback keeps the `outOfRangeWaitMinutes` exit when bin geometry is missing. **Guarded by `hasEnteredRange`:** while the flag is `false` (deploy default — e.g. a below-price limit order still waiting) the whole of Priority 2 is bypassed and `evaluateExitHierarchy()` returns `null`. `monitorPosition()` flips it to `true` on the first tick with the active bin inside `[minBinId, maxBinId]` (one-way, persisted in state.json).
-   - **Priority 3 — Supertrend 15m:** only when 1–2 returned nothing, `fetchSupertrend15m()` + `evaluateSupertrendExit()` close on a single closed 15m candle breaking the Supertrend line.
+3. For every position: `confirmPeak(...)` then `evaluatePositionExit(p)` (`index.js` → `detectExit()`), which walks the simplified 2-priority hierarchy of `exit-rules.js` — synchronous, local-snapshot-only, no candle fetch:
+   - **Priority 1 — hard TP/SL:** **Total PnL %** (unrealized value + claimable/claimed fees vs the initial deposit, `resolveTotalPnlPct()`) vs `takeProfitPct` / `stopLossPct` (trailing TP is the same profit-taking family).
+   - **Priority 2 — range out:** active bin far above (`> upper + outOfRangeBinsToClose`) or far below (`< lower − outOfRangeBinsToClose`); a data-gap fallback keeps the `outOfRangeWaitMinutes` exit when bin geometry is missing. **Guarded by `hasEnteredRange`:** while the flag is `false` (deploy default — e.g. a below-price limit order still waiting) the whole of Priority 2 is bypassed and `evaluateExitHierarchy()` returns `null`. `monitorPosition()` flips it to `true` on the first tick with the active bin inside `[minBinId, maxBinId]` (one-way, persisted in state.json).
    - `refreshPositionState()` (state.js) only updates bookkeeping (trailing arm + `out_of_range_since`).
-   - **RSI(2) / MACD / Bollinger never close a position** — the Evil Panda confluence was removed from the exit path.
+   - **RSI(2) / MACD / Bollinger / Supertrend never close a position** — the Evil Panda confluence and the Priority 3 Supertrend 15m check were removed from the exit path (and their candle feeds are no longer fetched).
 4. Positions needing `CLAIM` if `unclaimed_fees_usd >= minClaimAmount`.
 5. **No LLM is invoked in management.** Each close logs
    `[EXIT] Priority N: <reason> — <pair>` (e.g. `[EXIT] Priority 1: TP hit (+5.20%) — HYPE/USDC`) and then calls
@@ -215,9 +214,10 @@ The management cycle is **mostly deterministic in JS, LLM only for the hard case
 `hold until <x>% profit`. Only `tp` / `sl` change the exit hierarchy; the rest are
 parsed for the report and are informational only — never sent to a model.
 
-**Real-time exits** come from the 3s PnL poller: the same `detectExitWithSupertrend()` +
-`registerExitSignal()` require `pnlConfirmTicks` consecutive confirming polls before the
-close fires (`config.exitSafety.confirmTicks` for the Supertrend fallback).
+**Real-time exits** come from the 3s PnL poller: the same `evaluatePositionExit()` (→
+`detectExit()`) + `registerExitSignal()` require `pnlConfirmTicks` consecutive confirming
+polls before the close fires. The check is synchronous and network-free — no candle /
+Supertrend request sits between the price tick and the close.
 
 ### The screening cycle (multi-stage pipeline)
 
@@ -250,8 +250,9 @@ deployPosition()                   tools/dlmm.js
 
 manage cycle (every N min) — 100% deterministic, no LLM
    ├─ recordPositionSnapshot per pool
-   ├─ detectExitWithSupertrend → P1 TP/SL → P2 range bounds → P3 Supertrend 15m
-   │   (trailing arm/OOR state refreshed; RSI/MACD are NOT exit inputs)
+   ├─ evaluatePositionExit → P1 hard TP/SL (total PnL) → P2 range out
+   │   (trailing arm/OOR state refreshed; RSI/MACD/Supertrend are NOT exit inputs,
+   │    no candle data is fetched)
    ├─ log `[EXIT] Priority N: <reason> — <pair>` → executeTool("close_position")
    └─ on close: recordClose() → recordPerformance() in lessons.js
                  ├─ recordPoolDeploy (pool-memory.json)
@@ -311,6 +312,7 @@ All persistent files are loaded/saved on each call — no in-memory caching laye
 | `risk` | `maxPositions`, `maxDeployAmount` | 3, 50 |
 | `screening` | `excludeHighSupplyConcentration`, `minFeeActiveTvlRatio`, `minTvl`, `maxTvl`, `minVolume`, `minOrganic`, `minQuoteOrganic`, `minHolders`, `minMcap`, `maxMcap`, `minBinStep`, `maxBinStep`, `timeframe`, `category`, `minTokenFeesSol`, `useDiscordSignals`, `discordSignalMode`, `avoidPvpSymbols`, `blockPvpSymbols`, `maxBotHoldersPct`, `maxTop10Pct`, `allowedLaunchpads`, `blockedLaunchpads`, `minTokenAgeHours`, `maxTokenAgeHours` | see `user-config.example.json` |
 | `management` | `minClaimAmount`, `autoSwapAfterClaim`, `outOfRangeBinsToClose`, `outOfRangeWaitMinutes`, `oorCooldownTriggerCount`, `oorCooldownHours`, `repeatDeployCooldownEnabled`, `repeatDeployCooldownTriggerCount`, `repeatDeployCooldownHours`, `repeatDeployCooldownScope`, `repeatDeployCooldownMinFeeEarnedPct`, `minVolumeToRebalance`, `stopLossPct`, `takeProfitPct`, `minFeePerTvl24h`, `minAgeBeforeYieldCheck`, `minSolToOpen`, `deployAmountSol`, `gasReserve`, `positionSizePct`, `trailingTakeProfit`, `trailingTriggerPct`, `trailingDropPct`, `pnlSanityMaxDiffPct`, `solMode` | 5, false, 10, 30, 3, 12, true, 3, 12, "token", 0, 1000, -50, 5, 7, 60, 0.55, 0.5, 0.2, 0.35, true, 3, 1.5, 5, false |
+| `exitSafety` | `enable_supertrend_guard` (retired kill-switch; the 2-priority exit engine never fetches candles) | false |
 | `strategy` | `strategy`, `minBinsBelow`, `maxBinsBelow`, `defaultBinsBelow` | bid_ask, 35, 69, 69 |
 | `schedule` | `managementIntervalMin`, `screeningIntervalMin`, `healthCheckIntervalMin` | 10, 30, 60 |
 | `llm` | `temperature`, `maxTokens`, `maxSteps`, `managementModel`, `screeningModel`, `generalModel` | 0.373, 4096, 20, healer-alpha, hunter-alpha, healer-alpha |

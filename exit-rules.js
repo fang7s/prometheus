@@ -1,13 +1,20 @@
 /**
- * Deterministic exit engine — strict, simplified priority hierarchy. 100% numeric
- * JavaScript: NO LLM, no sentiment, no free-text interpretation.
+ * Deterministic exit engine — simplified 2-priority hierarchy. 100% numeric
+ * JavaScript: NO LLM, no sentiment, no free-text interpretation, and **no candle
+ * or historical price fetching** (the old Priority 3 Supertrend 15m check has
+ * been removed, so the exit path never touches the network).
+ *
+ * Every rule is evaluated from the local position snapshot only
+ * (`getMyPositions()` / `computePositions()` output + persisted state.json fields).
  *
  * The ONLY automatic close triggers, evaluated in this exact order:
  *
- *   Priority 1 — Immediate TP / SL
- *     `pnl_pct` against `config.management.takeProfitPct` / `stopLossPct`.
+ *   Priority 1 — Hard TP / SL
+ *     Total PnL % (unrealized value + claimable/claimed fees vs the initial
+ *     deposit — see `resolveTotalPnlPct()`) against
+ *     `config.management.takeProfitPct` / `stopLossPct`.
  *     A trailing take-profit (armed peak → drop) belongs to the same family.
- *   Priority 2 — Range boundaries
+ *   Priority 2 — Range out
  *     the active bin has moved FAR above or FAR below the position's outer bounds
  *     (`config.management.outOfRangeBinsToClose`), securing IL / freeing SOL.
  *     Guarded by `hasEnteredRange`: a position that has never traded inside its
@@ -15,15 +22,12 @@
  *     it can never be range-closed before it fills. The flag is maintained by
  *     `services/positionMonitor.js` (`false` on deploy → `true` on first in-range
  *     tick) and persisted in state.json as `has_entered_range`.
- *   Priority 3 — Supertrend 15m candle break
- *     the latest *closed* 15m candle closes through the Supertrend line
- *     (1-candle break, fallback safety net). Needs a candle feed, so the caller
- *     evaluates it via `evaluateSupertrendExit()` only when 1 and 2 did not fire.
  *
  * Technical oscillators are deliberately NOT part of the exit path. RSI(2) at
- * 90-100 and the MACD first-green-candle confluence (the old "Evil Panda" exit)
- * closed positions on momentum spikes long before TP/SL or the range bounds were
- * reached, so they no longer trigger automatic closes. Indicators may still be
+ * 90-100, the MACD first-green-candle confluence (the old "Evil Panda" exit) and
+ * the Supertrend 15m break closed positions on momentum spikes long before TP/SL
+ * or the range bounds were reached, so they no longer trigger automatic closes —
+ * and their candle feeds are no longer fetched at all. Indicators may still be
  * reported for context — never used to close a position.
  *
  * Every decision carries the priority, a stable rule id and a greppable headline
@@ -34,15 +38,11 @@ import { log } from "./logger.js";
 import { getTrackedPosition, refreshPositionState } from "./state.js";
 import { monitorPosition } from "./services/positionMonitor.js";
 
-/** The three automatic exit priorities, in strict evaluation order. */
+/** The two automatic exit priorities, in strict evaluation order. */
 export const EXIT_PRIORITY = Object.freeze({
   TP_SL: 1,
   RANGE: 2,
-  SUPERTREND: 3,
 });
-
-/** The Supertrend safety net only ever reads the 15m timeframe. */
-export const SUPERTREND_INTERVAL = "15_MINUTE";
 
 export const EXIT_RULES = Object.freeze({
   STOP_LOSS: {
@@ -74,12 +74,6 @@ export const EXIT_RULES = Object.freeze({
     rule: 5,
     name: "Far Below Range",
     headline: "Priority 2: Far Below Range",
-  },
-  SUPERTREND_BREAK: {
-    priority: EXIT_PRIORITY.SUPERTREND,
-    rule: 6,
-    name: "Supertrend 15m Candle Break",
-    headline: "Priority 3: Supertrend 15m Candle Break",
   },
   // Outside the automatic hierarchy — the bid-ask flipper's close-and-redeploy.
   FLIPPER_REBALANCE: {
@@ -136,6 +130,55 @@ export function isPnlSuspect(position, tracked = null) {
     return true;
   }
   return false;
+}
+
+/**
+ * Total PnL % used by Priority 1 — **unrealized value + claimable/claimed fees vs
+ * the initial deposit**, exactly the number the on-chain PnL engine reports:
+ *
+ *   total_pnl_usd = current balance value + unclaimed (claimable) fees
+ *                   + already-claimed fees − initial deposit
+ *   total_pnl_pct = total_pnl_usd / initial deposit × 100
+ *
+ * `tools/pnl.js` already folds claimable + collected fees into its `pnl_pct`, so
+ * that value is authoritative and returned as-is. When a caller supplies a
+ * hand-built payload without `pnl_pct` (history records, tests, legacy state) the
+ * percentage is derived from the USD fields instead — never from candle data.
+ *
+ * Returns `null` when neither a reported percentage nor a usable
+ * deposit/value pair is available, so the caller skips the PnL rules.
+ *
+ * @param {object} position - getMyPositions() entry
+ * @param {object|null} tracked - persisted state.json record (deposit fallback)
+ * @returns {number|null} total PnL percentage
+ */
+export function resolveTotalPnlPct(position = {}, tracked = null) {
+  const reported = toFiniteNumber(position?.pnl_pct);
+  if (reported != null) return reported;
+
+  const pick = (source, ...keys) => {
+    for (const key of keys) {
+      const value = toFiniteNumber(source?.[key]);
+      if (value != null) return value;
+    }
+    return null;
+  };
+
+  const deposit = pick(position, "initial_value_usd", "deposited_usd", "deposit_usd")
+    ?? pick(tracked, "initial_value_usd", "deposited_usd", "amount_usd");
+  if (deposit == null || !(deposit > 0)) return null;
+
+  // Prefer the always-USD `*_true_usd` fields so SOL-mode snapshots never mix units.
+  const pnlUsd = pick(position, "pnl_true_usd", "pnl_usd");
+  if (pnlUsd != null) return Math.round((pnlUsd / deposit) * 100 * 100) / 100;
+
+  const currentValue = pick(position, "total_value_true_usd", "total_value_usd", "current_value_usd");
+  if (currentValue == null) return null;
+
+  const claimableFees = pick(position, "unclaimed_fees_true_usd", "unclaimed_fees_usd") ?? 0;
+  const claimedFees = pick(position, "collected_fees_true_usd", "collected_fees_usd") ?? 0;
+  const total = currentValue + claimableFees + claimedFees - deposit;
+  return Math.round((total / deposit) * 100 * 100) / 100;
 }
 
 /**
@@ -212,11 +255,9 @@ export function hasEnteredRangeOf(position = {}, tracked = null) {
 }
 
 /**
- * Priorities 1 and 2 of the exit hierarchy — pure numeric evaluation. No I/O, no
- * state writes, no LLM, no technical indicators.
- *
- * Priority 3 (Supertrend 15m break) lives in `evaluateSupertrendExit()` and is
- * only consulted by the caller when this function returns null.
+ * Priorities 1 and 2 of the simplified exit hierarchy — pure numeric evaluation
+ * from the local position snapshot. No I/O, no state writes, no LLM, no technical
+ * indicators, **no candle/historical price fetching**.
  *
  * @param {object} position - a getMyPositions() entry
  * @param {object} managementConfig - config.management (with instruction overrides merged)
@@ -226,11 +267,12 @@ export function hasEnteredRangeOf(position = {}, tracked = null) {
 export function evaluateExitHierarchy(position, managementConfig = {}, ctx = {}) {
   if (!position) return null;
   const { tracked = null, overrides = {}, now = Date.now() } = ctx;
-  const pnl = toFiniteNumber(position.pnl_pct);
+  // Total PnL % = unrealized value + claimable/claimed fees vs the initial deposit.
+  const pnl = resolveTotalPnlPct(position, tracked);
   const suspect = isPnlSuspect(position, tracked);
   const noteSuffix = (key) => (overrides[key] != null ? " (position instruction)" : "");
 
-  // ═══ Priority 1 — immediate TP / SL (percentage PnL) ════════════
+  // ═══ Priority 1 — hard TP / SL (total percentage PnL) ═══════════
   const stopLossPct = toFiniteNumber(managementConfig.stopLossPct);
   if (!suspect && pnl != null && stopLossPct != null && pnl <= stopLossPct) {
     return ruleDecision(
@@ -331,59 +373,21 @@ export function evaluateExitHierarchy(position, managementConfig = {}, ctx = {})
 }
 
 /**
- * Priority 3 — Supertrend 15m candle break (fallback safety net).
- *
- * Break condition = the latest **closed** 15m candle:
- *   - the API flagged `supertrendBreakDown` on that candle, or
- *   - the candle closed strictly below the Supertrend line.
- *
- * A single candle close is enough by design. Only genuine Supertrend data is
- * consulted — RSI/MACD/Bollinger values in the same payload are ignored.
- *
- * @param {object|null} signal - { interval, close|candleClose, supertrendValue, supertrendBreakDown }
- * @param {object} [options] - { interval } expected timeframe (defaults to 15m)
- * @returns {object|null} rule decision or null
- */
-export function evaluateSupertrendExit(signal, { interval = SUPERTREND_INTERVAL } = {}) {
-  if (!signal) return null;
-
-  const expected = String(interval).trim().toUpperCase();
-  const actual = String(signal.interval ?? expected).trim().toUpperCase();
-  if (actual !== expected) return null; // never size the safety net off another timeframe
-
-  const close = toFiniteNumber(signal.candleClose ?? signal.close);
-  const line = toFiniteNumber(signal.supertrendValue ?? signal.supertrend);
-  const breakDown = signal.supertrendBreakDown === true || signal.breakDown === true;
-  const closedBelow = close != null && line != null && close < line;
-
-  if (!breakDown && !closedBelow) return null;
-
-  return ruleDecision(
-    "SUPERTREND_BREAK",
-    `supertrend break: 15m close ${close ?? "n/a"} ${closedBelow ? "<" : "broke"} Supertrend ${line ?? "n/a"}`,
-    {
-      interval: expected,
-      candle_close: close,
-      supertrend_value: line,
-    },
-  );
-}
-
-/**
  * Backwards-compatible alias — the pure numeric evaluator keeps its old name.
  * New code should call `evaluateExitHierarchy()`.
  */
 export const evaluateNumericRules = evaluateExitHierarchy;
 
 /**
- * Full deterministic exit evaluation for one position (priorities 1 and 2).
+ * Full deterministic exit evaluation for one position.
  *
  * 1. Reads the persisted instruction and derives numeric TP/SL overrides.
  * 2. Refreshes stateful flags (trailing arm, OOR timestamp) via state.js.
- * 3. Walks the strict hierarchy: Priority 1 (TP/SL) → Priority 2 (range bounds).
+ * 3. Walks the 2-priority hierarchy: Priority 1 (hard TP/SL on total PnL) →
+ *    Priority 2 (range out, only once `hasEnteredRange === true`).
  *
- * Priority 3 (Supertrend 15m) needs a candle feed, so callers that own the market
- * data pipe run `evaluateSupertrendExit()` when this returns null.
+ * Synchronous and network-free by design: everything it needs is already in the
+ * position snapshot / state.json, so it never blocks the poll loop on I/O.
  *
  * @param {object} position - getMyPositions() entry
  * @param {object} managementConfig - config.management
@@ -421,7 +425,6 @@ export function detectExit(position, managementConfig = {}) {
  *   `[EXIT] Priority 1: SL hit (-52.00%) — HYPE/USDC`
  *   `[EXIT] Priority 2: Far Above Range — HYPE/USDC`
  *   `[EXIT] Priority 2: Far Below Range — HYPE/USDC`
- *   `[EXIT] Priority 3: Supertrend 15m Candle Break — HYPE/USDC`
  */
 export function formatExitLog(pair, decision) {
   const label = pair || "position";

@@ -1,6 +1,12 @@
 /**
  * Position monitor — per-tick range-entry bookkeeping for open positions.
  *
+ * This module is the ONLY monitoring state the 2-priority exit engine needs
+ * (`exit-rules.js`): Priority 1 (hard TP/SL) is stateless, Priority 2 (range out)
+ * is armed here. Deliberately **local and network-free** — it reads the position
+ * snapshot + persisted state.json and never fetches candles, historical prices or
+ * indicator data (the Supertrend 15m feed was removed from the exit path).
+ *
  * Why this exists:
  *   A limit order deployed *below the price* (both bounds under the active bin)
  *   is created fully out of range: 100 % SOL waiting for price to drop into the

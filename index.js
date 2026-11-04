@@ -27,7 +27,7 @@ import {
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
 import { getLastBriefingDate, setLastBriefingDate, getTrackedPositions, getTrackedPosition, setPositionInstruction, confirmPeak, registerExitSignal } from "./state.js";
-import { detectExit, evaluateSupertrendExit, formatExitLog, parseInstructionOverrides } from "./exit-rules.js";
+import { detectExit, formatExitLog, parseInstructionOverrides } from "./exit-rules.js";
 // `withDeadline` rejects with TimeoutError; the local `withTimeout` below is the
 // non-throwing shutdown helper and keeps its existing contract.
 import { isTimeoutError, withTimeout as withDeadline } from "./utils/timeout.js";
@@ -66,7 +66,6 @@ import {
 import { SCREENING_TRIGGER_DEDUPE_MS, clampIntervalMin, cronExprForInterval, shouldAcceptScreeningTrigger } from "./utils/schedule.js";
 // Import only what we actually need for the new functionality
 import { evaluateEvilPandaCandidate, getEvilPandaRecommendedParams } from "./tools/evil-panda-enhanced.js";
-import { fetchSupertrend15m } from "./tools/chart-indicators.js";
 import { checkAllPositionsForFlip } from "./tools/bid-ask-flipper.js";
 
 import { REPO_ROOT, repoPath } from "./repo-root.js";
@@ -264,34 +263,15 @@ async function executeRuleClose(position, decision, { liveMessage = null } = {})
 }
 
 /**
- * Priority 3 of the exit hierarchy — Supertrend 15m 1-candle break.
+ * Simplified 2-priority exit evaluation: Priority 1 hard TP/SL on total PnL →
+ * Priority 2 range out (only once `hasEnteredRange === true`).
  *
- * Only consulted when Priority 1 (TP/SL) and Priority 2 (range bounds) produced
- * nothing: it is the fallback safety net, not a signal generator. RSI/MACD are
- * never read here (or anywhere else in the exit path).
+ * Both priorities are pure numeric checks over the local position snapshot, so
+ * this is synchronous and never touches the network — no candle/Supertrend fetch,
+ * no indicator call, no added exit latency.
  */
-async function getSupertrendExit(position) {
-  if (!position?.base_mint) return null;
-  if (config.exitSafety?.supertrendEnabled === false) return null;
-  try {
-    const signal = await fetchSupertrend15m(position.base_mint, {
-      cacheSec: config.exitSafety?.cacheSec,
-    });
-    return evaluateSupertrendExit(signal);
-  } catch (error) {
-    log("exit_warn", `Supertrend 15m check failed for ${position.pair || position.pool}: ${error.message}`);
-    return null;
-  }
-}
-
-/**
- * Strict exit evaluation: Priority 1 TP/SL → Priority 2 range bounds →
- * Priority 3 Supertrend 15m candle break. Returns the first hit or null.
- */
-export async function detectExitWithSupertrend(position) {
-  const decision = detectExit(position, config.management);
-  if (decision) return decision;
-  return getSupertrendExit(position);
+function evaluatePositionExit(position) {
+  return detectExit(position, config.management);
 }
 
 export async function runManagementCycle({ silent = false } = {}) {
@@ -338,15 +318,16 @@ export async function runManagementCycle({ silent = false } = {}) {
       return { ...p, recall: recallForPool(p.pool) };
     });
 
-    // Strict exit hierarchy — Priority 1 TP/SL → Priority 2 range bounds →
-    // Priority 3 Supertrend 15m candle break. Management is the slow cron
-    // backstop: raise peak immediately (confirmTicks=1) and act on detected exits
-    // directly. Real-time 2-tick confirmation lives in the fast poller below.
-    // RSI/MACD never close a position, and no position data reaches an LLM.
+    // Simplified 2-priority exit hierarchy — Priority 1 hard TP/SL (total PnL:
+    // unrealized + claimable/claimed fees vs deposit) → Priority 2 range out.
+    // Pure local snapshot math: no candle/indicator fetch, no LLM, no position
+    // data to a model. Management is the slow cron backstop: raise peak
+    // immediately (confirmTicks=1) and act on detected exits directly. Real-time
+    // 2-tick confirmation lives in the fast poller below.
     const exitMap = new Map();
     for (const p of positionData) {
       confirmPeak(p.position, p.pnl_pct, 1);
-      const decision = await detectExitWithSupertrend(p);
+      const decision = evaluatePositionExit(p);
       if (decision) {
         exitMap.set(p.position, decision);
         log(
@@ -986,11 +967,13 @@ export function startCronJobs() {
   }, { timezone: 'UTC' });
 
   // Fast PnL poller — the real-time exit path between management cycles.
-  // 100% deterministic and strictly hierarchical: Priority 1 TP/SL → Priority 2
-  // range bounds → Priority 3 Supertrend 15m candle break. RSI/MACD/BB never close
-  // a position. Exits require `confirmTicks` consecutive confirming polls
-  // (registerExitSignal) so a single noisy tick can't close a position; a confirmed
-  // rule fires the close directly in code — no LLM, no position data to a model.
+  // 100% deterministic 2-priority hierarchy: Priority 1 hard TP/SL (total PnL:
+  // unrealized + claimable/claimed fees vs deposit) → Priority 2 range out (only
+  // once hasEnteredRange is true). RSI/MACD/BB/Supertrend never close a position
+  // and no candle data is fetched. Exits require `confirmTicks` consecutive
+  // confirming polls (registerExitSignal) so a single noisy tick can't close a
+  // position; a confirmed rule fires the close directly in code — no LLM, no
+  // position data to a model.
   const pnlPollMs = Math.max(1, Number(config.pnl.pollIntervalSec ?? 3)) * 1000;
   const confirmTicks = Math.max(1, Number(config.pnl.confirmTicks ?? 2));
   let _pnlPollBusy = false;
@@ -1024,20 +1007,19 @@ export function startCronJobs() {
         // Monitoring tick: a position only earns Priority 2 once it traded in range.
         monitorPosition(p, { tracked });
 
-        // Strict hierarchy: Priority 1 TP/SL → Priority 2 range bounds →
-        // Priority 3 Supertrend 15m candle break. RSI/MACD never close a position.
-        const decision = await detectExitWithSupertrend(p);
+        // Simplified 2-priority hierarchy — Priority 1 hard TP/SL (total PnL:
+        // unrealized + claimable/claimed fees vs deposit) → Priority 2 range out
+        // (only once hasEnteredRange is true). Synchronous local snapshot math:
+        // no candle/Supertrend fetch, no indicators, no LLM.
+        const decision = evaluatePositionExit(p);
         const signal = decision?.rule_key ?? null;
 
-        // Require N consecutive confirming ticks before acting. The Supertrend
-        // safety net is the loosest signal, so it gets its own (higher) threshold.
-        const requiredTicks = signal === "SUPERTREND_BREAK"
-          ? Math.max(1, Number(config.exitSafety?.confirmTicks ?? confirmTicks))
-          : confirmTicks;
-        const { fire } = registerExitSignal(p.position, signal, requiredTicks);
+        // Require N consecutive confirming ticks before acting — a single noisy
+        // tick can never close a position.
+        const { fire } = registerExitSignal(p.position, signal, confirmTicks);
         if (!decision || !fire) continue;
 
-        log("rule_engine", `${formatExitLog(p.pair, decision)} — confirmed after ${requiredTicks} ticks`);
+        log("rule_engine", `${formatExitLog(p.pair, decision)} — confirmed after ${confirmTicks} ticks`);
         // Hold the management lock so the cron cycle can't double-act on this position.
         _managementBusy = true;
         try {
