@@ -651,8 +651,12 @@ const BOT_COMMANDS = [
   { command: "setcfg",     description: "Update persisted config key" },
   { command: "screen",     description: "Refresh deterministic candidate list" },
   { command: "candidates", description: "Show latest cached candidates" },
+  // Hot Fees Opportunity digest — read-only ranking broadcast with one-tap
+  // hand-off into the deploy menu. `/hot` and `/screener` are aliases.
+  { command: "hot",        description: "Hot Fees digest — top fee-generating pools now" },
+  { command: "screener",   description: "Alias of /hot — hot fee pools + deploy shortcuts" },
   { command: "lp",         description: "LP dashboard / pool search (/lp <token mint | pool address>)" },
-  { command: "deploy",     description: "Deploy candidate by cached index" },
+  { command: "deploy",     description: "Deploy candidate by index, or open a pool (/deploy <address>)" },
   { command: "briefing",   description: "Morning briefing" },
   { command: "hive",       description: "HiveMind sync status" },
   { command: "pause",      description: "Stop cron cycles" },

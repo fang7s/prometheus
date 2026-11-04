@@ -1,9 +1,10 @@
 import fs from "fs";
 import { REPO_ROOT, repoPath } from "./repo-root.js";
 import { getScreeningDefaultsForTimeframe, normalizeTimeframe, scaleScreeningToTimeframe, TIMEFRAME_SCREENING_SCALES } from "./screening-scales.js";
+import { normalizeScreenerIntervalHours } from "./utils/schedule.js";
 import { extractHeliusApiKey, getFallbackRpcUrl, normalizeRpcUrl, resolveRpcUrl } from "./utils/rpc.js";
 
-export { REPO_ROOT, repoPath, getScreeningDefaultsForTimeframe, normalizeTimeframe, scaleScreeningToTimeframe, TIMEFRAME_SCREENING_SCALES };
+export { REPO_ROOT, repoPath, getScreeningDefaultsForTimeframe, normalizeTimeframe, scaleScreeningToTimeframe, TIMEFRAME_SCREENING_SCALES, normalizeScreenerIntervalHours };
 
 const USER_CONFIG_PATH = repoPath("user-config.json");
 const DEFAULT_HIVEMIND_URL = "https://api.agentmeridian.xyz";
@@ -339,6 +340,50 @@ export const config = {
     // active-TVL floor (≈ minTvl) so it acts as a dust floor, not a stretch goal — the
     // screening minTvl filter already removes tiny pools.
     targetLiquidity: Number(u.degenTargetLiquidity ?? 20000),
+  },
+
+  // ─── Hot Fees Opportunity Digest (scheduled screener broadcast) ──
+  // Read-only ranking of the highest fee-generating Meteora DLMM pools, pushed
+  // to the operator's Telegram chat every `intervalHours` (3 or 6) and on demand
+  // via /hot · /screener. Nothing here feeds the autonomous entry/exit engine:
+  // the digest is an ops surface, and `Open n` only *pre-fills* the existing
+  // deploy menu (`/deploy <pool address>`) — it never signs a transaction.
+  screener: {
+    enabled: u.screenerEnabled ?? true,
+    // 3 h or 6 h — any other value snaps to the nearest supported cadence.
+    intervalHours: normalizeScreenerIntervalHours(u.screenerIntervalHours, 6),
+    // Pools per digest (the "Open n" buttons map 1:1 onto this ordering).
+    limit: Math.min(6, Math.max(1, Math.trunc(Number(u.screenerLimit ?? 3)) || 3)),
+    // At most N pools per base mint, so one hot token can't fill every slot.
+    perToken: Math.min(5, Math.max(1, Math.trunc(Number(u.screenerPerToken ?? 1)) || 1)),
+    // Metric window requested from the Meteora discovery API (fees + volume).
+    timeframe: nonEmptyString(u.screenerTimeframe, "24h"),
+    // Rows pulled per feed (4 feeds: fee / volume / APR / market cap).
+    pageSize: Math.min(100, Math.max(5, Math.trunc(Number(u.screenerPageSize ?? 50)) || 50)),
+    // Floors that keep dust pools and idle pools out of the digest.
+    minTvl: Number(u.screenerMinTvl ?? 20_000),
+    maxTvl: Number(u.screenerMaxTvl ?? 0) > 0 ? Number(u.screenerMaxTvl) : null,
+    minVolume24h: Number(u.screenerMinVolume24h ?? 25_000),
+    minFee24hUsd: Number(u.screenerMinFee24h ?? 100),
+    minFeeTvlPct: Number(u.screenerMinFeeTvlPct ?? 0.5),
+    // Strict fee-tier + bin-step gate. Meteora's DLMM fee tiers are 0.01 / 0.05 /
+    // 0.10 / 0.25 / 0.30 / 0.40 … %, so a 0.30 floor excludes every pool at or
+    // below 0.25 % while keeping the 0.30 %+ tiers. Bin step must sit in the
+    // 80-125 band (0.80 %-1.25 %), which is where the deep/stable DLMM pools live.
+    // Applied server-side (`filter_by`) and again client-side in
+    // `passesDigestFloors` as a safety net.
+    minBinStep: Number(u.screenerMinBinStep ?? 80),
+    maxBinStep: Number(u.screenerMaxBinStep ?? 125),
+    minBaseFeePct: Number(u.screenerMinBaseFeePct ?? 0.3),
+    // DexScreener is only a fallback enrichment (mcap / pair age / 24h change).
+    dexScreener: u.screenerDexScreener ?? true,
+    // In-memory snapshot TTL — /hot re-uses a fresh snapshot instead of refetching.
+    cacheTtlSec: Math.max(0, Number(u.screenerCacheTtlSec ?? 300)),
+    // Per-request deadline; every screener call is aborted after this.
+    fetchTimeoutMs: intEnv("SCREENER_FETCH_TIMEOUT_MS", Number(u.screenerFetchTimeoutMs ?? 6000), 1_000, 30_000),
+    // How long 😴 Snooze / 🔕 Mute silence the automatic digest.
+    snoozeHours: Math.max(0.1, Number(u.screenerSnoozeHours ?? 6)),
+    muteHours: Math.max(0.1, Number(u.screenerMuteHours ?? 24)),
   },
 
   // ─── GMGN (fee source for minTokenFeesSol gate) ──────────────

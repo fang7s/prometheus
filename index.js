@@ -18,8 +18,10 @@ import {
   sendMessage,
   sendMessageWithButtons,
   sendHTML,
+  sendHTMLWithButtons,
   editMessage,
   editMessageWithButtons,
+  editHTMLWithButtons,
   answerCallbackQuery,
   notifyOutOfRange,
   isEnabled as telegramEnabled,
@@ -47,8 +49,24 @@ import {
   handleLpCallback,
   handleLpText,
   openAddressQuery as openLpAddressQuery,
+  openPoolByAddress as openLpPoolByAddress,
   enrichPositionsWithMarketCap,
 } from "./services/lp-menu.js";
+// Hot Fees Opportunity digest — read-only ranking broadcast (/hot, /screener)
+// plus its inline keyboard. The service owns fetch + cache + rendering; this
+// module only schedules it and routes the button callbacks.
+import {
+  SCREENER_CALLBACK_PREFIX,
+  buildHotDigestMessage,
+  clearDigestSuppression,
+  getScreenerSettings,
+  getSuppressionState,
+  invalidateHotDigest,
+  isDigestSuppressed,
+  parseScreenerCallback,
+  resolveHotPool,
+  suppressDigest,
+} from "./services/screenerService.js";
 // Pure, synchronous Telegram layout helpers (tree branches, dividers, progress
 // bars, monospace blocks). Zero I/O — they only format the in-memory snapshot.
 import {
@@ -70,7 +88,14 @@ import {
   formatBasicPoolMetrics,
   runIsolatedTask,
 } from "./services/poolScreening.js";
-import { SCREENING_TRIGGER_DEDUPE_MS, clampIntervalMin, cronExprForInterval, shouldAcceptScreeningTrigger } from "./utils/schedule.js";
+import {
+  SCREENING_TRIGGER_DEDUPE_MS,
+  clampIntervalMin,
+  cronExprForHours,
+  cronExprForInterval,
+  normalizeScreenerIntervalHours,
+  shouldAcceptScreeningTrigger,
+} from "./utils/schedule.js";
 // Import only what we actually need for the new functionality
 import { evaluateEvilPandaCandidate, getEvilPandaRecommendedParams } from "./tools/evil-panda-enhanced.js";
 import { checkAllPositionsForFlip } from "./tools/bid-ask-flipper.js";
@@ -144,6 +169,11 @@ let _screeningLastAcceptedAt = 0; // epoch ms — dedupe window for screening tr
 let _cronStarted = false;    // idempotent-ish scheduler guard (no duplicate timer sets)
 let _flipperBusy = false;    // prevents overlapping bid-ask flipper cycles
 let _screeningLastTriggered = 0; // epoch ms — prevents management from spamming screening
+// Hot Fees digest: single-flight guard only. The screener's network calls are
+// fire-and-forget from the cron tick — nothing here ever awaits them on the
+// fast 3 s PnL path or on the Telegram poll loop.
+let _hotDigestBusy = false;
+let _hotDigestLastSentAt = 0;
 // Exit/peak confirmation is now done by consecutive-tick counting in state.js
 // (registerExitSignal / confirmPeak), driven by the 3s RPC poller — no setTimeout rechecks.
 
@@ -202,6 +232,63 @@ function stopCronJobs() {
   if (_cronTasks._opportunityPollInterval) clearInterval(_cronTasks._opportunityPollInterval);
   _cronTasks = [];
   _cronStarted = false;
+}
+
+// ─── Hot Fees Opportunity digest ─────────────────────────────────
+/**
+ * Broadcast the "Hot Fees Right Now" digest to the operator's chat.
+ *
+ * Non-blocking contract: this function *is* the background job. The cron tick
+ * calls it and returns immediately; nothing on the 3 s PnL poller, the
+ * management/screening cycles or the Telegram poll loop ever awaits it. Inside,
+ * every network call is deadline-bounded by the screener service.
+ *
+ * Suppression: when the operator tapped 😴 Snooze or 🔕 Mute, the *automatic*
+ * broadcast is skipped (the manual /hot command still works — see
+ * `handleHotDigestCommand`).
+ *
+ * @param {{ reason?: string, force?: boolean, silent?: boolean, editMessageId?: number|null }} [options]
+ * @returns {Promise<object|null>} the built message, or null when skipped/failed
+ */
+async function runHotDigestBroadcast({ reason = "cron", force = false, silent = false, editMessageId = null } = {}) {
+  if (!telegramEnabled()) {
+    log("screener", "Hot Fees digest skipped — Telegram not configured");
+    return null;
+  }
+  if (_hotDigestBusy) {
+    log("screener", `Hot Fees digest skipped — previous run still in flight (${reason})`);
+    return null;
+  }
+  _hotDigestBusy = true;
+  const startedAt = Date.now();
+  try {
+    const message = await buildHotDigestMessage({
+      force,
+      intervalHours: config.screener?.intervalHours,
+    });
+    if (editMessageId) {
+      const edited = await editHTMLWithButtons(message.html, editMessageId, message.keyboard);
+      // "message is not modified" / a deleted message → fall back to a fresh send.
+      if (!edited) await sendHTMLWithButtons(message.html, message.keyboard);
+    } else {
+      await sendHTMLWithButtons(message.html, message.keyboard);
+    }
+    _hotDigestLastSentAt = Date.now();
+    log(
+      "screener",
+      `Hot Fees digest sent (${message.snapshot?.pools?.length ?? 0} pool(s), ` +
+        `${_hotDigestLastSentAt - startedAt}ms, reason=${reason}${message.snapshot?.stale ? ", stale" : ""})`,
+    );
+    return message;
+  } catch (error) {
+    log("screener_warn", `Hot Fees digest failed (${reason}): ${error?.message || error}`);
+    if (!silent) {
+      await sendMessage(`⚠️ Hot Fees digest unavailable: ${error?.message || error}`).catch(() => {});
+    }
+    return null;
+  } finally {
+    _hotDigestBusy = false;
+  }
 }
 
 /**
@@ -1002,6 +1089,29 @@ export function startCronJobs() {
     await maybeRunMissedBriefing();
   }, { timezone: 'UTC' });
 
+  // ── Hot Fees Opportunity digest — every 3h or 6h (config.screener.intervalHours) ──
+  // The tick itself is *fire-and-forget*: `runHotDigestBroadcast()` is started and
+  // the cron callback returns at once, so the 3 s PnL poller, the management
+  // cycle and the Telegram poll loop never wait on the screener's network calls.
+  // Snooze/Mute only silence this automatic path; /hot always runs on demand.
+  let hotDigestTask = null;
+  if (config.screener?.enabled !== false) {
+    const hotIntervalHours = normalizeScreenerIntervalHours(config.screener?.intervalHours, 6);
+    const hotExpr = cronExprForHours(hotIntervalHours, 6);
+    hotDigestTask = cron.schedule(hotExpr, () => {
+      if (isDigestSuppressed()) {
+        const state = getSuppressionState();
+        log("screener", `Hot Fees digest skipped — ${state.mode} for ${state.minutesLeft} more min`);
+        return;
+      }
+      runHotDigestBroadcast({ reason: "cron" })
+        .catch((error) => log("screener_warn", `Hot Fees digest tick failed: ${error?.message || error}`));
+    }, { timezone: 'UTC' });
+    log("cron", `Hot Fees digest scheduled — "${hotExpr}" (every ${hotIntervalHours}h)`);
+  } else {
+    log("cron", "Hot Fees digest disabled (screenerEnabled=false) — /hot still works on demand");
+  }
+
   // Fast PnL poller — the real-time exit path between management cycles.
   // 100% deterministic 2-priority hierarchy: Priority 1 hard TP/SL (total PnL:
   // unrealized + claimable/claimed fees vs deposit) → Priority 2 range out (only
@@ -1133,12 +1243,12 @@ export function startCronJobs() {
     }, oppMs);
   }
 
-  _cronTasks = [mgmtTask, screenTask, healthTask, briefingTask, briefingWatchdog, flipperTask].filter(Boolean);
+  _cronTasks = [mgmtTask, screenTask, healthTask, briefingTask, briefingWatchdog, flipperTask, hotDigestTask].filter(Boolean);
   // Store interval refs so stopCronJobs can clear them
   _cronTasks._pnlPollInterval = pnlPollInterval;
   _cronTasks._opportunityPollInterval = opportunityPollInterval;
   _cronStarted = true;
-  log("cron", `Cycles started — management "${mgmtExpr}", screening "${screenExpr}"${config.opportunity.enabled ? `, opportunity poll every ${config.opportunity.pollIntervalSec}s` : ""}`);
+  log("cron", `Cycles started — management "${mgmtExpr}", screening "${screenExpr}"${config.opportunity.enabled ? `, opportunity poll every ${config.opportunity.pollIntervalSec}s` : ""}${config.screener?.enabled !== false ? `, hot digest every ${normalizeScreenerIntervalHours(config.screener?.intervalHours, 6)}h` : ""}`);
 }
 
 // ═══════════════════════════════════════════
@@ -1571,9 +1681,14 @@ function formatHelpText() {
     "/setcfg <key> <value> — update persisted config",
     "/screen — refresh deterministic candidate list",
     "/candidates — show latest cached candidates",
+    "/hot — 🔥 Hot Fees digest (top fee-generating pools right now)",
+    "/hot fresh — force a fresh Meteora ranking (ignores the cache)",
+    "/hot <n> — digest with n pools (1-6)",
+    "/screener — alias of /hot",
     "/lp — LP dashboard (positions, balances, trending, settings)",
     "/lp <token mint | pool address> — list every DLMM pool for a token CA, then deploy",
     "/deploy <n> — deploy candidate by cached index (deterministic)",
+    "/deploy <pool address> — open the deploy menu pre-filled for that pool",
     "/briefing — morning briefing",
     "/hive — HiveMind sync status",
     "/hive pull — manual HiveMind pull now",
@@ -1849,9 +1964,191 @@ async function drainTelegramQueue() {
   }
 }
 
+/**
+ * Route one `scr:*` inline-button callback from the digest.
+ *
+ *   open:<n>    → open the existing deploy menu pre-filled with that pool address
+ *   refresh     → force a fresh ranking and edit the message in place
+ *   snooze:<h>  → silence automatic digests for h hours (/hot still works)
+ *   mute:<h>    → same, longer default
+ *   resume      → clear the suppression immediately
+ *   help        → explain the digest
+ */
+async function handleScreenerCallback(msg) {
+  const parsed = parseScreenerCallback(msg?.callbackData ?? msg?.text);
+  if (!parsed) {
+    await answerCallbackQuery(msg?.callbackQueryId, "Unknown Hot Fees action").catch(() => {});
+    return;
+  }
+  const { action, index, hours } = parsed;
+  const settings = getScreenerSettings();
+
+  if (action === "open") {
+    const pool = resolveHotPool(index);
+    if (!pool) {
+      await answerCallbackQuery(msg?.callbackQueryId, "Pool left the digest — tap 🔄 Refresh").catch(() => {});
+      return;
+    }
+    await answerCallbackQuery(msg?.callbackQueryId, `Opening ${pool.pair}`).catch(() => {});
+    // Hand-off into the existing deploy menu, pre-filled with this pool address:
+    // `openPoolByAddress` presents the pool dashboard (Quick Zap / amount / range /
+    // strategy → Deploy) exactly as `/lp <pool address>` would. Nothing is signed
+    // until the operator confirms in that menu.
+    const opened = await openLpPoolByAddress(msg, pool.pool, { quiet: true }).catch((error) => {
+      log("screener_warn", `Open digest pool failed (${pool.pool.slice(0, 8)}): ${error?.message || error}`);
+      return false;
+    });
+    if (!opened) await openLpAddressQuery(msg, pool.pool).catch(() => {});
+    return;
+  }
+
+  if (action === "refresh") {
+    await answerCallbackQuery(msg?.callbackQueryId, "Refreshing…").catch(() => {});
+    invalidateHotDigest();
+    await handleHotDigestCommand(msg, { editMessageId: msg?.messageId ?? null, force: true });
+    return;
+  }
+
+  if (action === "snooze" || action === "mute") {
+    const fallbackHours = action === "mute" ? settings.muteHours : settings.snoozeHours;
+    const state = suppressDigest(hours ?? fallbackHours, action);
+    const label = action === "mute" ? "Muted" : "Snoozed";
+    await answerCallbackQuery(msg?.callbackQueryId, `${label} for ${state.hours}h`).catch(() => {});
+    // Re-render from the cache (no network): the header gains the suppression
+    // note and the keyboard swaps Snooze/Mute for 🔔 Resume. Uses the
+    // lock-free re-render so a background digest in flight can't swallow the tap.
+    await reRenderHotDigest(msg);
+    return;
+  }
+
+  if (action === "resume") {
+    clearDigestSuppression();
+    await answerCallbackQuery(msg?.callbackQueryId, "Automatic digests resumed").catch(() => {});
+    await reRenderHotDigest(msg);
+    return;
+  }
+
+  if (action === "help") {
+    await answerCallbackQuery(msg?.callbackQueryId).catch(() => {});
+    await sendMessage([
+      "🔥 Hot Fees digest",
+      "",
+      "Open n — load that pool in the deploy menu (nothing is signed until you confirm).",
+      "🔄 Refresh — force a fresh Meteora ranking now.",
+      "😴 Snooze / 🔕 Mute — pause the automatic digest (on-demand /hot still works).",
+      "🔔 Resume — turn the automatic digest back on.",
+      "",
+      "Manual: /hot · /hot fresh · /hot <n> · /screener",
+    ].join("\n")).catch(() => {});
+    return;
+  }
+
+  await answerCallbackQuery(msg?.callbackQueryId, "Unsupported action").catch(() => {});
+}
+
+/**
+ * Manual Hot Fees digest — `/hot` and `/screener` (aliases).
+ *
+ *   /hot             cache-first (instant when the snapshot is younger than the TTL)
+ *   /hot fresh       force a network refresh
+ *   /hot 5           top 5 pools (clamped 1..6 by the service)
+ *   /hot fresh 2     forced refresh, 2 pools
+ *
+ * Callback re-renders pass explicit `force`/`limit` options so digits inside
+ * callback data (`scr:snooze:6`) can never be mistaken for a pool count.
+ *
+ * Runs on the Telegram dispatch path, which `telegram.js` already executes
+ * without awaiting the poll loop — a slow Meteora response can never block the
+ * next command or the 3 s PnL poller.
+ */
+async function handleHotDigestCommand(msg, { editMessageId = null, force = null, limit = null } = {}) {
+  const text = String(msg?.text ?? "").trim();
+  const isCallback = msg?.isCallback === true;
+  const resolvedForce = force ?? (!isCallback && /\b(fresh|force)\b/i.test(text));
+  const limitArg = isCallback
+    ? null
+    : text
+        .split(/\s+/)
+        .slice(1)
+        .find((token) => /^\d+$/.test(token));
+  const resolvedLimit = limit ?? (limitArg ? Number(limitArg) : undefined);
+
+  if (_hotDigestBusy) {
+    await answerCallbackQuery(msg?.callbackQueryId, "Digest already building — one moment").catch(() => {});
+    return null;
+  }
+
+  _hotDigestBusy = true;
+  try {
+    const message = await buildHotDigestMessage({
+      force: resolvedForce,
+      limit: resolvedLimit,
+      intervalHours: config.screener?.intervalHours,
+    });
+    const targetId = editMessageId ?? null;
+    if (targetId) {
+      const edited = await editHTMLWithButtons(message.html, targetId, message.keyboard);
+      if (!edited) await sendHTMLWithButtons(message.html, message.keyboard);
+    } else {
+      await sendHTMLWithButtons(message.html, message.keyboard);
+    }
+    _hotDigestLastSentAt = Date.now();
+    return message;
+  } catch (error) {
+    log("screener_warn", `Hot Fees digest (manual) failed: ${error?.message || error}`);
+    await sendMessage(`⚠️ Hot Fees digest unavailable: ${error?.message || error}`).catch(() => {});
+    return null;
+  } finally {
+    _hotDigestBusy = false;
+  }
+}
+
+/**
+ * Re-render the digest in place after a Snooze/Mute/Resume tap.
+ *
+ * Deliberately bypasses the `_hotDigestBusy` lock: these callbacks must always
+ * refresh the keyboard (Snooze/Mute → 🔔 Resume), and the underlying
+ * `buildHotDigestMessage({ force: false })` is cache-first, so a fresh snapshot
+ * costs zero network calls and a stale one is de-duplicated by the service's
+ * single-flight guard.
+ *
+ * @returns {Promise<object|null>} the rebuilt message, or null on failure
+ */
+async function reRenderHotDigest(msg) {
+  try {
+    const message = await buildHotDigestMessage({
+      force: false,
+      intervalHours: config.screener?.intervalHours,
+    });
+    const targetId = msg?.messageId ?? null;
+    if (targetId) {
+      const edited = await editHTMLWithButtons(message.html, targetId, message.keyboard);
+      if (!edited) await sendHTMLWithButtons(message.html, message.keyboard);
+    } else {
+      await sendHTMLWithButtons(message.html, message.keyboard);
+    }
+    return message;
+  } catch (error) {
+    log("screener_warn", `Hot Fees digest re-render failed: ${error?.message || error}`);
+    return null;
+  }
+}
+
 async function telegramHandler(msg) {
   const text = msg?.text?.trim();
   if (!text) return;
+  if (msg?.isCallback && text.startsWith(SCREENER_CALLBACK_PREFIX)) {
+    // 🔥 Hot Fees digest buttons (`scr:open:1`, `scr:refresh`, `scr:snooze:6`,
+    // `scr:mute:24`, `scr:resume`). Routed before lp:/cfg: so the digest never
+    // depends on the LP menu's in-memory session state.
+    try {
+      await handleScreenerCallback(msg);
+    } catch (e) {
+      log("screener_warn", `Hot Fees callback failed: ${e?.message || e}`);
+      await answerCallbackQuery(msg.callbackQueryId, String(e?.message || "Hot Fees error").slice(0, 180)).catch(() => {});
+    }
+    return;
+  }
   if (msg?.isCallback && text.startsWith("lp:")) {
     // Dashboard hub + every sub-view (`lp:main`, `lp:positions`, `lp:balance`,
     // `lp:new_position`, `lp:trending`, `lp:calendar`, `lp:chain`, `lp:wallet`,
@@ -2152,6 +2449,34 @@ async function telegramHandler(msg) {
 
   if (text === "/candidates") {
     await sendMessage(describeLatestCandidates(5)).catch(() => {});
+    return;
+  }
+
+  // 🔥 Hot Fees digest — manual/on-demand execution. `/screener` is an alias.
+  // `/hot fresh` forces a network refresh; `/hot 5` selects the pool count.
+  if (/^\/(?:hot|screener)(?:@[A-Za-z0-9_]+)?(?:\s|$)/i.test(text)) {
+    await handleHotDigestCommand(msg);
+    return;
+  }
+
+  // `/deploy <pool address>` — pre-fill the deployment menu for one specific
+  // pool. This is what the Hot Fees digest's `Open n` buttons ultimately call:
+  // the digest only resolves index → address and hands it over here. Nothing is
+  // signed by this command; it opens the pool dashboard (Quick Zap / amount /
+  // range / strategy → Deploy) exactly like `/lp <pool address>`.
+  const deployAddressMatch = text.match(/^\/deploy\s+([1-9A-HJ-NP-Za-km-z]{32,44})$/i);
+  if (deployAddressMatch) {
+    const address = deployAddressMatch[1];
+    try {
+      const opened = await openLpPoolByAddress(msg, address, { quiet: true }).catch((error) => {
+        log("screener_warn", `Deploy address open failed (${address.slice(0, 8)}): ${error?.message || error}`);
+        return false;
+      });
+      if (!opened) await openLpAddressQuery(msg, address);
+    } catch (e) {
+      log("telegram_error", `Deploy address failed: ${e.message}`);
+      await sendMessage(`Error: ${e.message}`).catch(() => {});
+    }
     return;
   }
 
