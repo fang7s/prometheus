@@ -124,7 +124,7 @@ function clampInt(value, min, max, fallback) {
   return Math.min(max, Math.max(min, Math.trunc(n)));
 }
 
-/** `[A-Za-z0-9._+-]` only — keeps `<pre>` alignment and Telegram HTML safe. */
+/** `[A-Za-z0-9._+-]` only — keeps the digest header and button labels clean and HTML-safe. */
 export function sanitizePairLabel(value) {
   const cleaned = String(value ?? "")
     .replace(/[^A-Za-z0-9._+-]/g, "")
@@ -823,7 +823,7 @@ export async function getHotDigest({ force = false, limit, timeframe, now = Date
 }
 
 // ─── Formatting (pure) ───────────────────────────────────────────
-/** `12m` / `5h` / `3d` — compact pair age; `?` when the pool has no timestamp. */
+/** `12m` / `5.9h` / `3d` — compact pair age; `?` when the pool has no timestamp. */
 export function formatPairAge(poolCreatedAt, { now = Date.now() } = {}) {
   const created = finite(poolCreatedAt);
   if (created == null || created <= 0) return "?";
@@ -831,17 +831,13 @@ export function formatPairAge(poolCreatedAt, { now = Date.now() } = {}) {
   const ms = created > 1e12 ? created : created * 1000;
   const minutes = Math.floor(Math.max(0, now - ms) / 60_000);
   if (minutes < 60) return `${minutes}m`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h`;
-  const days = Math.floor(hours / 24);
+  // One decimal for hours (`5.9h`) — a pool that is hours old is still "new",
+  // so the digit carries real signal. Floored to 0.1 h (so 23.98 h never reads
+  // "24h") and whole hours stay short (`2h`, not `2.0h`).
+  if (minutes < 24 * 60) return `${(Math.floor(minutes / 6) / 10).toFixed(1).replace(/\.0$/, "")}h`;
+  const days = Math.floor(minutes / (24 * 60));
   if (days < 1000) return `${days}d`;
   return "999d+";
-}
-
-/** `36.5K` / `1.2M` — compact number without the `$` (the table header carries it). */
-export function formatCompactAmount(value) {
-  const compact = formatCompactUsd(value);
-  return compact ? compact.replace(/^\$/, "") : "?";
 }
 
 /** `21900%` / `1.2K%` — compact APR percentage. */
@@ -853,52 +849,87 @@ export function formatApr(aprPct) {
   return `${Math.round(n)}%`;
 }
 
-/** Pad or truncate to an exact width so `<pre>` columns line up. */
-function padCell(value, width, align = "left") {
-  const text = String(value ?? "");
-  const clipped = text.length > width ? `${text.slice(0, Math.max(0, width - 1))}…` : text;
-  return align === "right" ? clipped.padStart(width, " ") : clipped.padEnd(width, " ");
-}
-
-/** One table row for the `<pre>` block. */
-export function formatDigestRow(pool, { now = Date.now() } = {}) {
-  return [
-    padCell(pool?.index ?? "?", 2, "right"),
-    padCell(pool?.pair ?? "?", 12),
-    padCell(formatCompactAmount(pool?.feeWindowUsd), 8, "right"),
-    padCell(formatCompactAmount(pool?.tvl), 8, "right"),
-    padCell(formatApr(pool?.aprPct), 7, "right"),
-    padCell(formatCompactAmount(pool?.mcap), 7, "right"),
-    padCell(formatPairAge(pool?.poolCreatedAt, { now }), 5, "right"),
-    padCell(Array.isArray(pool?.feeds) ? pool.feeds.length : 0, 2, "right"),
-  ].join(" ");
+// ─── Deep links (Meteora · GMGN) ─────────────────────────────────
+/**
+ * `https://app.meteora.ag/pools/<pool_address>` — the Meteora LP page.
+ *
+ * The address is percent-encoded, so a malformed feed value can never break out
+ * of the `href` attribute (Telegram parses our HTML).
+ *
+ * @param {string} poolAddress - Meteora DLMM pool address
+ * @returns {string|null} link, or null when the address is missing
+ */
+export function buildMeteoraPoolUrl(poolAddress) {
+  const address = String(poolAddress ?? "").trim();
+  return address ? `https://app.meteora.ag/pools/${encodeURIComponent(address)}` : null;
 }
 
 /**
- * Column header matching {@link formatDigestRow}.
+ * `https://gmgn.ai/sol/token/<mint_or_pool>` — GMGN chart for the pool's token.
  *
- * The fee column label follows the metric window (`FEE24H`, `FEE4H`, …) so a
- * 4h or 12h digest never claims to be showing 24h fees.
- *
- * @param {string} [timeframe="24h"] - metric window from the snapshot
- * @returns {string} padded header row for the `<pre>` block
+ * @param {string} mintOrPool - base-token mint (falls back to the pool address)
+ * @returns {string|null} link, or null when the address is missing
  */
-export function buildDigestTableHeader(timeframe = "24h") {
-  const window = HOT_TIMEFRAMES.includes(String(timeframe)) ? String(timeframe) : "24h";
-  return [
-    padCell("#", 2, "right"),
-    padCell("PAIR", 12),
-    padCell(`FEE${window.toUpperCase()}`, 8, "right"),
-    padCell("TVL", 8, "right"),
-    padCell("APR", 7, "right"),
-    padCell("MC", 7, "right"),
-    padCell("AGE", 5, "right"),
-    padCell("AX", 2, "right"),
-  ].join(" ");
+export function buildGmgnTokenUrl(mintOrPool) {
+  const address = String(mintOrPool ?? "").trim();
+  return address ? `https://gmgn.ai/sol/token/${encodeURIComponent(address)}` : null;
 }
 
-/** Header for the default 24h window (kept as a constant for convenience). */
-export const HOT_DIGEST_TABLE_HEADER = buildDigestTableHeader("24h");
+/** `<a href="…">label</a>` — both sides escaped so a symbol can't break the markup. */
+function digestLink(label, url) {
+  if (!url) return null;
+  return `<a href="${escapeHtml(url)}">${escapeHtml(label)}</a>`;
+}
+
+/**
+ * One digest candidate as an itemized block (clean list layout, no ASCII table):
+ *
+ *   <b>1. AMD-SOL</b>
+ *   📈 APR <code>196K%</code> · 💧 TVL <code>$62.0K</code> · 💸 Fees 24h <code>$33.3K</code>
+ *   🧢 MC <code>$558.6K</code> · ⏱️ Age <code>5.9h</code>
+ *   <code>3uijTWAzhQKnqZ59Wwgay7sccFWAk5reEibKg2ZRAGZ9</code>
+ *   🌊 <a href="https://app.meteora.ag/pools/…">Meteora</a> · 👁️ <a href="https://gmgn.ai/sol/token/…">GMGN</a>
+ *
+ * Every interpolated value goes through {@link code} / {@link bold} /
+ * {@link escapeHtml}, so a symbol containing `&`, `<` or `>` renders verbatim
+ * instead of being parsed as markup.
+ *
+ * @param {object} pool - normalized digest entry
+ * @param {{ now?: number, windowLabel?: string }} [options] - windowLabel labels the fee column
+ * @returns {string|null} HTML block, or null when there is no usable pool
+ */
+export function formatHotDigestPoolBlock(pool, { now = Date.now(), windowLabel = "24h" } = {}) {
+  if (!pool || typeof pool !== "object") return null;
+  const window = HOT_TIMEFRAMES.includes(String(windowLabel)) ? String(windowLabel) : "24h";
+  const label = String(pool.name ?? pool.pair ?? "").trim() || "unknown pool";
+  const index = Number.isFinite(Number(pool.index)) ? Number(pool.index) : null;
+  const address = String(pool.pool ?? "").trim();
+
+  const lines = [`<b>${escapeHtml(`${index != null ? `${index}. ` : ""}${label}`)}</b>`];
+  lines.push(
+    [
+      `📈 APR ${code(formatApr(pool.aprPct))}`,
+      `💧 TVL ${code(formatCompactUsd(pool.tvl ?? pool.activeTvl) ?? "?")}`,
+      `💸 Fees ${escapeHtml(window)} ${code(formatCompactUsd(pool.feeWindowUsd) ?? "?")}`,
+    ].join(" · "),
+  );
+  lines.push(
+    [`🧢 MC ${code(formatCompactUsd(pool.mcap) ?? "?")}`, `⏱️ Age ${code(formatPairAge(pool.poolCreatedAt, { now }))}`].join(
+      " · ",
+    ),
+  );
+  if (address) lines.push(code(address));
+
+  // Direct deep links — one tap into Meteora or the GMGN chart.
+  const links = [];
+  const meteora = digestLink("Meteora", buildMeteoraPoolUrl(address));
+  if (meteora) links.push(`🌊 ${meteora}`);
+  const gmgn = digestLink("GMGN", buildGmgnTokenUrl(pool.baseMint ?? address));
+  if (gmgn) links.push(`👁️ ${gmgn}`);
+  if (links.length > 0) lines.push(links.join(" · "));
+
+  return lines.join("\n");
+}
 
 /** `12:34 UTC` — short, timezone-stable stamp for the digest header. */
 export function formatDigestStamp(isoOrMs = Date.now()) {
@@ -921,10 +952,22 @@ export function describeSuppression(state = getSuppressionState()) {
 /**
  * Render the "Hot Fees Right Now" digest as Telegram HTML.
  *
- * Layout: bold header → window/stamp line → section divider → `<pre>` monospace
- * table (# · pair · 24h fees · TVL · APR · MC · age · axes) → action hint →
- * optional stale/error/suppression notes. Every interpolated value is escaped by
- * {@link code} / {@link bold} or sanitized before it reaches the table.
+ * Layout (clean itemized list, no monospaced ASCII table):
+ *
+ *   🔥 <b>Hot Fees Right Now</b>
+ *   <code>24h</code> window · every 6h · <code>09:59 UTC</code>
+ *   ━━━━━━━━━━━━━━━━━━━━━━━━━━
+ *
+ *   <b>1. AMD-SOL</b>
+ *   📈 APR <code>196K%</code> · 💧 TVL <code>$62.0K</code> · 💸 Fees 24h <code>$33.3K</code>
+ *   🧢 MC <code>$558.6K</code> · ⏱️ Age <code>5.9h</code>
+ *   <code>3uijTWAzhQKnqZ59Wwgay7sccFWAk5reEibKg2ZRAGZ9</code>
+ *   🌊 <a href="…">Meteora</a> · 👁️ <a href="…">GMGN</a>
+ *
+ * …followed by the action hint and optional stale/error/suppression notes. Every
+ * interpolated value is escaped by {@link code} / {@link bold} /
+ * {@link escapeHtml}, so a token symbol containing `&`, `<` or `>` renders
+ * verbatim instead of being parsed as markup.
  *
  * @param {object} snapshot - output of {@link getHotDigest}
  * @param {{ now?: number, intervalHours?: number, suppression?: object }} [options]
@@ -933,44 +976,57 @@ export function describeSuppression(state = getSuppressionState()) {
 export function formatHotDigest(snapshot, { now = Date.now(), intervalHours = null, suppression = null } = {}) {
   const pools = Array.isArray(snapshot?.pools) ? snapshot.pools : [];
   const windowLabel = snapshot?.timeframe ?? "24h";
-  const lines = [];
+  const header = [];
 
-  lines.push(`🔥 ${bold("Hot Fees Right Now")}`);
+  header.push(`🔥 ${bold("Hot Fees Right Now")}`);
   const cadence = Number.isFinite(Number(intervalHours)) ? ` · every ${Number(intervalHours)}h` : "";
-  lines.push(
+  header.push(
     `${code(windowLabel)} window${cadence} · ${code(formatDigestStamp(snapshot?.updatedAt ?? now))}` +
       (snapshot?.stale ? " · ⚠️ cached" : ""),
   );
-  lines.push(SECTION_DIVIDER);
+  header.push(SECTION_DIVIDER);
 
-  if (pools.length === 0) {
-    lines.push("No pool currently clears the fee/volume/TVL floors.");
-    lines.push("Try again later, or loosen the screener floors in /settings.");
-    return lines.join("\n").slice(0, MESSAGE_LIMIT);
+  const blocks = pools.map((pool) => formatHotDigestPoolBlock(pool, { now, windowLabel })).filter(Boolean);
+
+  if (blocks.length === 0) {
+    return [
+      ...header,
+      "No pool currently clears the fee/volume/TVL floors.",
+      "Try again later, or loosen the screener floors in /settings.",
+    ]
+      .join("\n")
+      .slice(0, MESSAGE_LIMIT);
   }
 
-  lines.push(
-    `<pre>${escapeHtml(
-      [buildDigestTableHeader(windowLabel), ...pools.map((pool) => formatDigestRow(pool, { now }))].join("\n"),
-    )}</pre>`,
-  );
-  lines.push("");
-  lines.push("Tap <b>Open n</b> to load the pool in the deploy menu. AX = ranked axes (1-4).");
-  lines.push(`Pool addresses:`);
-  for (const pool of pools.slice(0, MAX_DIGEST_LIMIT)) {
-    lines.push(`${pool.index}. ${code(pool.pool)} — ${code(pool.name)}`);
-  }
+  const footer = ["Tap <b>Open n</b> to load the pool in the deploy menu · links open Meteora / GMGN."];
 
   const suppressed = suppression ?? getSuppressionState({ now });
   const suppressedNote = describeSuppression(suppressed);
-  if (suppressedNote) lines.push("", `${suppressedNote} — automatic digests paused.`);
+  if (suppressedNote) footer.push(`${suppressedNote} — automatic digests paused.`);
 
   const feedErrors = Array.isArray(snapshot?.feedErrors) ? snapshot.feedErrors : [];
   if (feedErrors.length > 0) {
-    lines.push("", `⚠️ Partial data: ${escapeHtml(feedErrors.join(" | ").slice(0, 200))}`);
+    footer.push(`⚠️ Partial data: ${escapeHtml(feedErrors.join(" | ").slice(0, 200))}`);
   }
 
-  return lines.join("\n").slice(0, MESSAGE_LIMIT);
+  // Telegram rejects messages over 4096 characters, and slicing the HTML could
+  // cut through a tag or a link. Drop WHOLE candidate blocks instead and leave a
+  // "+N more" counter, so what reaches `sendHTMLWithButtons` is always well-formed.
+  const compose = (visibleCount) => {
+    const hidden = blocks.length - visibleCount;
+    return [
+      ...header,
+      "",
+      [...blocks.slice(0, visibleCount), hidden > 0 ? `… +${hidden} more` : null].filter(Boolean).join("\n\n"),
+      "",
+      ...footer,
+    ].join("\n");
+  };
+  for (let visibleCount = blocks.length; visibleCount > 1; visibleCount -= 1) {
+    const html = compose(visibleCount);
+    if (html.length <= MESSAGE_LIMIT) return html;
+  }
+  return compose(Math.min(1, blocks.length)).slice(0, MESSAGE_LIMIT);
 }
 
 // ─── Inline keyboard ─────────────────────────────────────────────
@@ -985,7 +1041,7 @@ function digestButton(text, data) {
 /**
  * Inline keyboard for the digest.
  *
- *   [ Open 1 · AMD-SOL ]        ← one row per pool, index matches the table
+ *   [ Open 1 · AMD-SOL ]        ← one row per pool, index matches the list item
  *   [ Open 2 · BTC-SOL ]
  *   [ 🔄 Refresh ] [ 😴 Snooze 6h ] [ 🔕 Mute 24h ]   (+ 🔔 Resume when silenced)
  *
