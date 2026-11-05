@@ -2,6 +2,11 @@ import fs from "fs";
 import { log } from "./logger.js";
 import { repoPath } from "./repo-root.js";
 import { isTimeoutError } from "./utils/timeout.js";
+// Bot API addressing + `fetch failed` decoding. The raw undici error hides the
+// real transport cause (ENOTFOUND / ECONNREFUSED / ETIMEDOUT / CERT_*) inside
+// `error.cause`, so every log line used to read "fetch failed" with no clue
+// whether DNS, the network, TLS or the token was at fault.
+import { describeTelegramError, resolveTelegramApiBase } from "./utils/telegramNet.js";
 // Pure, synchronous layout helpers (tree branches, dividers, progress bars,
 // monospace blocks). No I/O, no imports of its own — so no import cycle with
 // `services/lp-menu.js` (which imports this module).
@@ -19,9 +24,26 @@ const POLL_BACKOFF_BASE_MS = 1_000;
 const POLL_BACKOFF_MAX_MS = 60_000;
 /** A handler slower than this is reported (it no longer blocks the poll loop). */
 const SLOW_HANDLER_WARN_MS = 5_000;
+/** Startup reachability probe deadline (getMe). */
+const STARTUP_PROBE_TIMEOUT_MS = 8_000;
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN || null;
-const BASE  = TOKEN ? `https://api.telegram.org/bot${TOKEN}` : null;
+/**
+ * Bot API origin. Defaults to `https://api.telegram.org`; set TELEGRAM_API_BASE
+ * when the host cannot reach api.telegram.org directly (country-level block or
+ * hosting-provider egress firewall) and you run a reverse proxy / Worker that
+ * forwards to Telegram. Without it every Bot API call dies as "fetch failed"
+ * while RPC traffic keeps working.
+ */
+const API_BASE = resolveTelegramApiBase();
+const BASE = TOKEN ? `${API_BASE}/bot${TOKEN}` : null;
+const API_BASE_LABEL = (() => {
+  try {
+    return new URL(API_BASE).host;
+  } catch {
+    return API_BASE;
+  }
+})();
 const ALLOWED_USER_IDS = new Set(
   String(process.env.TELEGRAM_ALLOWED_USER_IDS || "")
     .split(",")
@@ -141,7 +163,7 @@ async function postTelegram(method, body) {
     }
     return await res.json();
   } catch (e) {
-    log("telegram_error", `${method} failed: ${e.message}`);
+    log("telegram_error", `${method} failed: ${describeTelegramError(e)}`);
     return null;
   }
 }
@@ -165,7 +187,7 @@ async function postTelegramRaw(method, body) {
     }
     return await res.json();
   } catch (e) {
-    log("telegram_error", `${method} failed: ${e.message}`);
+    log("telegram_error", `${method} failed: ${describeTelegramError(e)}`);
     return null;
   }
 }
@@ -286,7 +308,7 @@ async function postTelegramMultipart(method, form) {
     }
     return await res.json();
   } catch (e) {
-    log("telegram_error", `${method} failed: ${e.message}`);
+    log("telegram_error", `${method} failed: ${describeTelegramError(e)}`);
     return null;
   }
 }
@@ -351,7 +373,7 @@ function createTypingIndicator() {
       await postTelegram("sendChatAction", { action: "typing" });
     } catch (error) {
       // Suppress network errors to prevent script crashes from failed Telegram API calls
-      log("telegram_error", `Failed to send typing indicator: ${error.message}`);
+      log("telegram_error", `Failed to send typing indicator: ${describeTelegramError(error)}`);
     }
     timer = setTimeout(() => {
       tick().catch(() => null);
@@ -621,10 +643,11 @@ async function poll(onMessage, generation) {
 
       failures += 1;
       const delay = pollBackoffMs(failures);
-      // A stalled socket shows up as a timeout; `fetch failed` is a plain outage.
+      // A stalled socket shows up as a timeout; `fetch failed` is a plain outage
+      // and carries the real cause one level down (`error.cause.code`).
       const reason = isTimeoutError(error)
         ? `long-poll timeout after ${POLL_WINDOW_TIMEOUT_MS}ms`
-        : (error?.message || String(error));
+        : describeTelegramError(error);
       log(
         "telegram_error",
         `Poll error (attempt ${failures}): ${reason} — reconnecting in ${delay}ms`,
@@ -667,14 +690,54 @@ const BOT_COMMANDS = [
 async function registerCommands() {
   if (!BASE) return;
   try {
-    await telegramFetch(`${BASE}/setMyCommands`, {
+    const res = await telegramFetch(`${BASE}/setMyCommands`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ commands: BOT_COMMANDS }),
     });
+    if (!res.ok) {
+      log("telegram_warn", `Failed to register bot commands: HTTP ${res.status}`);
+      return;
+    }
     log("telegram", "Bot commands registered");
   } catch (e) {
-    log("telegram_warn", `Failed to register bot commands: ${e.message}`);
+    log("telegram_warn", `Failed to register bot commands: ${describeTelegramError(e)}`);
+  }
+}
+
+/**
+ * One-shot startup reachability probe (`getMe`).
+ *
+ * `fetch failed` on its own never says whether DNS, TCP, TLS, an egress firewall
+ * or the token is at fault, and the poll loop would otherwise retry in silence
+ * for minutes. Probe once, log the decoded cause plus the fix, and let polling
+ * continue — it auto-recovers as soon as the network allows.
+ */
+async function probeBotApi() {
+  if (!BASE) return { ok: false, skipped: true };
+  const startedAt = Date.now();
+  try {
+    const res = await telegramFetch(`${BASE}/getMe`, { timeoutMs: STARTUP_PROBE_TIMEOUT_MS });
+    if (res.ok) {
+      const data = await res.json().catch(() => null);
+      const username = data?.result?.username ? ` — @${data.result.username}` : "";
+      log("telegram", `Bot API reachable via ${API_BASE_LABEL} (${Date.now() - startedAt}ms)${username}`);
+      return { ok: true };
+    }
+    if (res.status === 401) {
+      log("telegram_error", "getMe 401 Unauthorized — TELEGRAM_BOT_TOKEN is invalid, revoked, or encrypted without the .envrypt key");
+    } else {
+      log("telegram_warn", `getMe HTTP ${res.status} from ${API_BASE_LABEL} — Telegram features may be degraded`);
+    }
+    return { ok: false, status: res.status };
+  } catch (error) {
+    log("telegram_warn", `Bot API unreachable (${API_BASE_LABEL}): ${describeTelegramError(error)}`);
+    log(
+      "telegram_warn",
+      "Telegram commands/notifications stay offline until this is fixed — run `npm run check:telegram` on this host, " +
+        "and set TELEGRAM_API_BASE to a reachable proxy if api.telegram.org is blocked by the network.",
+    );
+    return { ok: false, error };
   }
 }
 
@@ -693,7 +756,7 @@ export function startPolling(onMessage) {
 
   poll(onMessage, generation)
     .catch((error) => {
-      log("telegram_error", `Polling loop crashed: ${error?.message || error}`);
+      log("telegram_error", `Polling loop crashed: ${describeTelegramError(error)}`);
     })
     .finally(() => {
       _pollLoopActive = false;
@@ -705,7 +768,11 @@ export function startPolling(onMessage) {
       timer?.unref?.();
     });
 
-  registerCommands().catch(() => {});
+  // Probe first, then publish the command list — both are fire-and-forget so a
+  // blocked Bot API can never delay the daemon or stop the poll loop.
+  probeBotApi()
+    .then((probe) => (probe?.ok ? registerCommands() : null))
+    .catch(() => null);
   log("telegram", "Bot polling started");
 }
 
