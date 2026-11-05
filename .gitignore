@@ -54,4 +54,7 @@ discord-signals.json
 ARCHITECTURE_DIAGRAMS.md
 LIVE_REMEDIATION_PLAN.md
 ALGORITHM_REPORT.md
-test
+
+# Test suite (kept local — run with `npm test` / `npm run test:telegram`)
+test/
+
