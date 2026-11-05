@@ -62,8 +62,7 @@ import {
   truncateAddress,
 } from "../services/lp-menu.js";
 import {
-  MARKET_SURGE_FEE_TVL_PCT,
-  MARKET_SURGE_PRICE_CHANGE_PCT,
+  MARKET_SURGE_VOLUME_TVL_MULTIPLE,
   MESSAGE_LIMIT,
   SECTION_DIVIDER,
   escapeHtml,
@@ -754,28 +753,23 @@ test("deploy card market line prints MC, 24h volume and APR with N/A fallbacks",
   );
 });
 
-test("activity badge flags a surge from Meteora fee/TVL or 24h change", () => {
-  assert.equal(MARKET_SURGE_FEE_TVL_PCT, 5);
-  assert.equal(MARKET_SURGE_PRICE_CHANGE_PCT, 50);
-  // Hot pool: > 5 % of TVL earned in fees today.
+test("activity badge flags a surge when 24h volume beats 2x TVL", () => {
+  assert.equal(MARKET_SURGE_VOLUME_TVL_MULTIPLE, 2);
+  // Hot pool: traded more than twice its TVL in the last 24 h.
   assert.equal(
-    formatMarketActivityLine({ volume24h: 1_835_050, tvl: 61_968, feeTvl: 53.65 }),
-    "🚀 Surge / High Activity",
+    formatMarketActivityLine({ volume24h: 1_835_050, tvl: 61_968 }),
+    "🚀 Surge (High Vol)",
   );
-  // Price surge alone is enough.
-  assert.equal(
-    formatMarketActivityLine({ volume24h: 1_835_050, tvl: 61_968, feeTvl: 0.4, priceChange24h: 50 }),
-    "🚀 Surge / High Activity",
-  );
-  // Calm pool → plain activity numbers.
-  assert.equal(
-    formatMarketActivityLine({ volume24h: 123_100, tvl: 500_000, feeTvl: 0.42, priceChange24h: -3.5 }),
-    "📊 Vol: <b>$123.1K</b> · TVL: <b>$500.0K</b>",
-  );
-  // Missing metrics degrade gracefully instead of throwing.
-  assert.equal(formatMarketActivityLine({ volume24h: 123_100 }), "📊 Vol: <b>$123.1K</b> · TVL: N/A");
-  assert.equal(formatMarketActivityLine(), "📊 Activity: <b>N/A</b>");
-  assert.equal(formatMarketActivityLine({ feeTvl: 4.99, priceChange24h: 49.9 }), "📊 Activity: <b>N/A</b>");
+  // Exactly 2x TVL is not a surge — the rule is strictly greater.
+  assert.equal(formatMarketActivityLine({ volume24h: 200_000, tvl: 100_000 }), "📊 Active");
+  // Calm pool → plain activity badge.
+  assert.equal(formatMarketActivityLine({ volume24h: 123_100, tvl: 500_000 }), "📊 Active");
+  // Zero / missing metrics degrade to the volume line instead of throwing.
+  assert.equal(formatMarketActivityLine({ volume24h: 123_100 }), "📊 Vol: <b>$123.1K</b>");
+  assert.equal(formatMarketActivityLine({ volume24h: 123_100, tvl: 0 }), "📊 Vol: <b>$123.1K</b>");
+  assert.equal(formatMarketActivityLine({ tvl: 61_968 }), "📊 TVL: <b>$62.0K</b>");
+  assert.equal(formatMarketActivityLine(), "📊 Vol: <b>N/A</b>");
+  assert.equal(formatMarketActivityLine({ volume24h: 0, tvl: 0 }), "📊 Vol: <b>N/A</b>");
 });
 
 test("deploy card prints the market header right under the bin step line", () => {
@@ -798,7 +792,8 @@ test("deploy card prints the market header right under the bin step line", () =>
   assert.equal(lines[0], "🆕 <b>New Position: Anakin/SOL</b>");
   assert.equal(lines[1], "Binstep: 100 | BaseFee: 2%");
   assert.equal(lines[2], "🧢 MC: <b>$2.49M</b> · 📊 Vol 24h: <b>$123.1K</b> · 📈 APR: <b>153.3%</b>");
-  assert.equal(lines[3], "📊 Vol: <b>$123.1K</b> · TVL: <b>$500.0K</b>");
+  // 123.1K of volume on 500K of TVL is normal turnover → plain activity badge.
+  assert.equal(lines[3], "📊 Active");
   assert.equal(lines[4], SECTION_DIVIDER);
 
   // The extra header rows must not disturb the deployment controls.
@@ -819,42 +814,85 @@ test("deploy card prints the market header right under the bin step line", () =>
   );
   const bareLines = bare.text.split("\n");
   assert.equal(bareLines[2], "🧢 MC: N/A · 📊 Vol 24h: N/A · 📈 APR: N/A");
-  assert.equal(bareLines[3], "📊 Activity: <b>N/A</b>");
+  assert.equal(bareLines[3], "📊 Vol: <b>N/A</b>");
 
-  // A hot pool (fee/TVL > 5 %) shows the surge badge instead.
+  // A hot pool (24 h volume > 2x TVL) shows the surge badge instead.
   const surge = renderDashboard(
-    { ...session, pool: { ...session.pool, feeTvl: 12.5 } },
+    { ...session, pool: { ...session.pool, volume: 1_835_050, tvl: 61_968 } },
     { wallet: { sol: 1 } },
   );
-  assert.match(surge.text, /🚀 Surge \/ High Activity/);
+  assert.equal(surge.text.split("\n")[3], "🚀 Surge (High Vol)");
+
+  // Raw Meteora spellings (`fdv` / `trade_volume_24h` / `liquidity` /
+  // `fee_tvl_ratio`) feed the same header — no N/A on a pool with real data.
+  const raw = renderDashboard(
+    {
+      ...session,
+      pool: {
+        ...session.pool,
+        mcap: null,
+        volume: null,
+        feeTvl: null,
+        apr: null,
+        fdv: 2_490_000,
+        trade_volume_24h: 123_100,
+        liquidity: 500_000,
+        fee_tvl_ratio: 0.0042, // 0.42 %/day → APR 153.3 %
+      },
+    },
+    { wallet: { sol: 1 } },
+  );
+  const rawLines = raw.text.split("\n");
+  assert.equal(rawLines[2], "🧢 MC: <b>$2.49M</b> · 📊 Vol 24h: <b>$123.1K</b> · 📈 APR: <b>153.3%</b>");
+  assert.equal(rawLines[3], "📊 Active");
 });
 
 // ─── Meteora-native market metrics (zero external API) ────────────
-test("market metrics are derived from the Meteora pool object only", () => {
+test("market metrics are read from the Meteora pool object only", () => {
   // Discovery-API shaped entry (what `toPoolEntry` / `toTokenPoolEntry` build).
   assert.deepEqual(
     marketMetricsFromPool({ mcap: 2_490_000, volume: 123_100, feeTvl: 0.42, tvl: 500_000, apr: 153.3 }),
     { mcap: 2_490_000, volume24h: 123_100, apr: 153.3, feeTvl: 0.42, tvl: 500_000, priceChange24h: null },
   );
 
-  // Raw Meteora spellings are accepted too; APR falls back to fee/TVL × 365.
+  // Raw Meteora spellings: `trade_volume_24h`, `fdv`, `liquidity` and a
+  // fraction-shaped `fee_tvl_ratio` (0.02 = 2 %/day → APR × 365 × 100).
   const raw = marketMetricsFromPool({
-    token_x: { market_cap: 900_000, price_change_pct: -4.2 },
-    volume: { "24h": 250_000 },
-    fee_tvl_ratio: 2,
-    active_tvl: 61_968,
+    trade_volume_24h: 250_000,
+    fdv: 900_000,
+    liquidity: 61_968,
+    fee_tvl_ratio: 0.02,
+    price_change_pct: -4.2,
   });
   assert.equal(raw.mcap, 900_000);
   assert.equal(raw.volume24h, 250_000);
+  assert.equal(raw.tvl, 61_968);
   assert.equal(raw.feeTvl, 2);
   assert.equal(raw.apr, 730);
-  assert.equal(raw.tvl, 61_968);
   assert.equal(raw.priceChange24h, -4.2);
 
-  // A fraction-shaped `apr` (Meteora sometimes reports 0.0000117) never wins over
-  // the locally annualized fee/TVL ratio.
-  assert.equal(marketMetricsFromPool({ apr: 0.0000117, feeTvl: 1 }).apr, 365);
+  // Market cap / TVL chain: `fdv` → `market_cap` → `liquidity` → `tvl`.
+  assert.equal(marketMetricsFromPool({ market_cap: 500_000, liquidity: 70_000 }).mcap, 500_000);
+  assert.equal(marketMetricsFromPool({ liquidity: 70_000 }).mcap, 70_000);
+  assert.equal(marketMetricsFromPool({ tvl: 90_000 }).mcap, 90_000);
+
+  // Nested `volume.h24` and the token snapshot's market cap are accepted too.
+  const nested = marketMetricsFromPool({
+    token_x: { market_cap: 900_000, price_change_pct: -4.2 },
+    volume: { h24: 250_000 },
+    active_tvl: 61_968,
+  });
+  assert.equal(nested.mcap, 900_000);
+  assert.equal(nested.volume24h, 250_000);
+  assert.equal(nested.tvl, 61_968);
+  assert.equal(nested.priceChange24h, -4.2);
+
+  // A declared APR wins; without one the fee/TVL ratio annualizes locally
+  // (percent-shaped `feeTvl` × 365, fraction-shaped `fee_tvl_ratio` × 365 × 100).
+  assert.equal(marketMetricsFromPool({ apr: 0.0000117, feeTvl: 1 }).apr, 0.0000117);
   assert.equal(marketMetricsFromPool({ apr: 0.0000117 }).apr, 0.0000117);
+  assert.equal(marketMetricsFromPool({ feeTvl: 1 }).apr, 365);
+  assert.equal(marketMetricsFromPool({ fee_tvl_ratio: 0.01 }).apr, 365);
 
   // Nothing available → nulls, never a fabricated zero.
   const empty = {

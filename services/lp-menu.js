@@ -749,35 +749,42 @@ export function describeRange(session) {
 
 export function renderDashboard(session, { wallet = null, note = null } = {}) {
   const pool = session.pool || {};
+  // Market header inputs: MC / TVL, 24 h volume and APR, read straight from the
+  // Meteora pool object already in memory (`services/marketData.js`). Both the
+  // raw discovery spellings (`trade_volume_24h`, `fdv`, `liquidity`,
+  // `fee_tvl_ratio`) and the `toPoolEntry` UI spellings are accepted, so a valid
+  // pool metric always renders instead of `N/A`.
+  const market = marketMetricsFromPool(pool);
+  // The MC / TVL headline falls back to liquidity; a real supply figure is still
+  // needed (and only it) for "Range MC" and the TVL/MC health ratio.
+  const supplyMcap = market.mcap != null && market.mcap !== market.tvl ? market.mcap : null;
   const amountLabel = describeAmount(session, wallet);
   const twoSided = Number(session.upsidePct ?? 0) > 0;
-  const mcap = Number(pool.mcap ?? 0);
+  const mcap = Number(supplyMcap ?? 0);
   const down = Number(session.downsidePct ?? 0);
   const up = Number(session.upsidePct ?? 0);
   const binStep = pool.binStep ?? "?";
   const baseFee = pool.baseFee != null ? `${formatSolAmount(pool.baseFee, 2)}%` : "?";
-  const health = poolHealthLabel({ tvl: pool.tvl, mcap: pool.mcap });
+  const health = poolHealthLabel({ tvl: market.tvl, mcap: supplyMcap });
   const gasReserve = Number(config.management?.gasReserve ?? 0);
   const totalBins = Number(session.rangePreview?.totalBins ?? config.strategy?.defaultBinsBelow ?? 69);
   const binRent = estimateBinArrayRentSol(totalBins);
   const maxSol = maxSpendableSol({ sol: wallet?.sol ?? 0, gasReserve, totalBins });
   const presetSol = Number(config.management?.deployAmountSol ?? 0.5);
 
-  // Market header: MC / 24 h volume / APR + the activity badge, read straight
-  // from the Meteora pool object already in memory (`services/marketData.js`).
-  // No external request is made here, so the card renders instantly; missing
-  // fields degrade to `N/A` instead of blocking the deploy controls.
-  const market = marketMetricsFromPool(pool);
+  // Market header: MC / TVL, 24 h volume and APR + the ATH / surge badge. No
+  // external request is made here, so the card renders instantly; fields the
+  // pool genuinely lacks degrade to `N/A` instead of blocking the controls.
   const marketLine = formatMarketMetricsLine({
     mcap: market.mcap,
     volume24h: market.volume24h,
     apr: market.apr,
   });
+  // Native turnover badge: 24 h volume > 2 × TVL → surge, else plain activity,
+  // with a `📊 Vol: $X` fallback when one of the two metrics is zero/missing.
   const activityLine = formatMarketActivityLine({
     volume24h: market.volume24h,
     tvl: market.tvl,
-    feeTvl: market.feeTvl,
-    priceChange24h: market.priceChange24h,
   });
 
   const lines = [
@@ -793,8 +800,8 @@ export function renderDashboard(session, { wallet = null, note = null } = {}) {
       ? `💧 1 bin ≈ ${formatSolAmount(pool.activeBinSol)} SOL`
       : null,
     `${health.emoji} Pool Health: <b>${health.label}</b>${health.ratioPct != null ? ` (TVL/MC ${health.ratioPct.toFixed(1)}%)` : ""}`,
-    pool.tvl != null
-      ? `🩺 TVL ${formatUsd(pool.tvl)} · Fee/TVL ${pool.feeTvl != null ? `${Number(pool.feeTvl).toFixed(2)}%` : "?"} · APR≈${pool.apr != null && Number.isFinite(pool.apr) ? `${Number(pool.apr).toFixed(1)}%` : "?"}`
+    market.tvl != null
+      ? `🩺 TVL ${formatUsd(market.tvl)} · Fee/TVL ${market.feeTvl != null ? `${Number(market.feeTvl).toFixed(2)}%` : "?"} · APR≈${market.apr != null ? `${Number(market.apr).toFixed(1)}%` : "?"}`
       : null,
     "",
     `💰 Amount: <b>${amountLabel}</b>`,

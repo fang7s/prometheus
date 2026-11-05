@@ -109,47 +109,40 @@ export function formatSignedPct(value, digits = 2) {
 
 // ─── Deploy-card market header (native Meteora metrics only) ──────
 /**
- * A daily fee/TVL ratio (in %) at or above this means the pool is printing more
- * than 5 % of its TVL in fees per day — "exceptionally high activity".
+ * Turnover multiple that marks a pool as surging: 24 h volume above
+ * `2 × TVL` means the whole liquidity was traded more than twice in a day, so
+ * fees pile up fast — the deploy card flags it as a high-volume surge.
  */
-export const MARKET_SURGE_FEE_TVL_PCT = 5;
-
-/** A 24 h price change (in %) at or above this is treated as a surge. */
-export const MARKET_SURGE_PRICE_CHANGE_PCT = 50;
+export const MARKET_SURGE_VOLUME_TVL_MULTIPLE = 2;
 
 /**
- * Activity badge for the deploy card, computed **only** from the Meteora pool
- * object already held in memory (no external API):
+ * ATH / surge status for the deploy card, computed **only** from the Meteora
+ * pool object already held in memory (no external API):
  *
- *   🚀 Surge / High Activity            fee/TVL ≥ 5 % (or 24 h change ≥ +50 %)
- *   📊 Vol: $123.1K · TVL: $500.0K      normal activity
- *   📊 Activity: N/A                    every metric undefined
+ *   🚀 Surge (High Vol)                 24 h volume > 2 × TVL
+ *   📊 Active                           both metrics known, normal turnover
+ *   📊 Vol: $123.1K                     volume known but TVL missing/zero
+ *   📊 TVL: $62.0K                      TVL known but volume missing/zero
+ *   📊 Vol: N/A                         neither metric available
  *
- * Never throws: missing metrics degrade to `N/A` instead of a fake signal.
+ * Never throws: zero / missing metrics degrade to the plain `📊` line instead of
+ * a fake signal.
  */
-export function formatMarketActivityLine({
-  volume24h = null,
-  tvl = null,
-  feeTvl = null,
-  priceChange24h = null,
-  surgeFeeTvlPct = MARKET_SURGE_FEE_TVL_PCT,
-  surgePriceChangePct = MARKET_SURGE_PRICE_CHANGE_PCT,
-} = {}) {
-  const feeTvlPct = toFiniteNumber(feeTvl);
-  const changePct = toFiniteNumber(priceChange24h);
-  const feeThreshold = toFiniteNumber(surgeFeeTvlPct) ?? MARKET_SURGE_FEE_TVL_PCT;
-  const changeThreshold = toFiniteNumber(surgePriceChangePct) ?? MARKET_SURGE_PRICE_CHANGE_PCT;
-  const surging = (feeTvlPct != null && feeTvlPct >= feeThreshold)
-    || (changePct != null && changePct >= changeThreshold);
-  if (surging) return "🚀 Surge / High Activity";
+export function formatMarketActivityLine({ volume24h = null, tvl = null } = {}) {
+  const traded = toFiniteNumber(volume24h);
+  const locked = toFiniteNumber(tvl);
+  if (traded != null && traded > 0 && locked != null && locked > 0) {
+    return traded > locked * MARKET_SURGE_VOLUME_TVL_MULTIPLE
+      ? "🚀 Surge (High Vol)"
+      : "📊 Active";
+  }
 
-  const volume = formatCompactUsd(volume24h);
-  const locked = formatCompactUsd(tvl);
-  if (volume == null && locked == null) return "📊 Activity: <b>N/A</b>";
-  return [
-    `📊 Vol: ${volume ? `<b>${volume}</b>` : "N/A"}`,
-    `TVL: ${locked ? `<b>${locked}</b>` : "N/A"}`,
-  ].join(" · ");
+  // At least one metric is zero/missing — show whatever volume we do have.
+  const volume = formatCompactUsd(traded);
+  if (volume) return `📊 Vol: <b>${volume}</b>`;
+  const liquidity = formatCompactUsd(locked);
+  if (liquidity) return `📊 TVL: <b>${liquidity}</b>`;
+  return "📊 Vol: <b>N/A</b>";
 }
 
 /** `245.8%` / `19.6K%` — compact APR label (null for a missing value). */
