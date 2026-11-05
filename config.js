@@ -375,8 +375,6 @@ export const config = {
     minBinStep: Number(u.screenerMinBinStep ?? 80),
     maxBinStep: Number(u.screenerMaxBinStep ?? 125),
     minBaseFeePct: Number(u.screenerMinBaseFeePct ?? 0.3),
-    // DexScreener is only a fallback enrichment (mcap / pair age / 24h change).
-    dexScreener: u.screenerDexScreener ?? true,
     // In-memory snapshot TTL — /hot re-uses a fresh snapshot instead of refetching.
     cacheTtlSec: Math.max(0, Number(u.screenerCacheTtlSec ?? 300)),
     // Per-request deadline; every screener call is aborted after this.

@@ -184,25 +184,20 @@ export function getEvilPandaRecommendedParams() {
   };
 }
 
-// ─── Price series (OHLCV) for the indicator exit engine ────────────
-// Multi-layer price data:
-//   1. GeckoTerminal OHLCV (primary, keyless).
-//   2. DexScreener spot price (token endpoint → pair endpoint).
-//   3. DLMM active-bin spot (on-chain RPC via dlmm helpers).
-// Fallback spot samples are appended to a per-pool sliding window so
-// RSI/Bollinger/MACD can still be computed when OHLCV is unavailable.
-const GECKO_API = "https://api.geckoterminal.com/api/v2";
-const DEXSCREENER_API = "https://api.dexscreener.com/latest/dex";
+// ─── Price series for the indicator engine ────────────────────────
+// Price data comes from the chain ONLY: the DLMM active bin (Meteora SDK, via
+// the dlmm helpers). CoinGecko / GeckoTerminal and DexScreener were removed on
+// purpose — they answer HTTP 429 on their keyless tiers and must never be a
+// dependency of a running agent. Spot samples are appended to a per-pool sliding
+// window, and the pseudo-candles built from it feed RSI/Bollinger/MACD.
 const PRICE_SERIES_CACHE = new Map();
 const PRICE_SERIES_CACHE_MAX = 200;
 const MIN_CANDLES = 35; // MACD(12,26,9) needs slowPeriod + signalPeriod
 const PRICE_BUFFER_MAX = 50;         // sliding-window cap per pool
 const PRICE_BUFFER_MAX_AGE_MS = 30 * 60_000; // drop samples older than this
-const STALE_SERIES_MAX_MS = 30 * 60_000;     // max age of a stale OHLCV fallback
+const STALE_SERIES_MAX_MS = 30 * 60_000;     // max age of a stale fallback series
 const DEGRADED_CACHE_MS = 10_000;    // fallback re-poll window
-const GECKO_COOLDOWN_MS = 60_000;    // skip GT this long after a failure
-const RESOLVED_TOKEN_CACHE_MS = 10 * 60_000;
-const FETCH_TIMEOUT_MS = 8_000;
+const SPOT_LOG_INTERVAL_MS = 60_000; // throttle repeated fallback warnings
 
 /** poolAddress -> number[] (oldest → newest, max PRICE_BUFFER_MAX) */
 const inMemoryPriceBuffers = new Map();
@@ -210,20 +205,8 @@ const inMemoryPriceBuffers = new Map();
 const priceBufferTimes = new Map();
 /** poolAddress -> source tag so incompatible price units never mix */
 const priceBufferSources = new Map();
-/** poolAddress -> { tokenAddress, at } */
-const resolvedTokenCache = new Map();
-/** poolAddress -> epoch ms until which GeckoTerminal is skipped */
-const geckoCooldownUntil = new Map();
 /** poolAddress -> epoch ms of the last fallback-failure log */
 const spotErrorLoggedAt = new Map();
-
-function geckoOhlcvPath(timeframe) {
-  const tf = String(timeframe || "5m").trim().toLowerCase();
-  const unit = tf.endsWith("h") ? "hour" : "minute";
-  const aggregated = parseInt(tf, 10);
-  const aggregate = Number.isFinite(aggregated) && aggregated > 0 ? aggregated : (unit === "hour" ? 1 : 5);
-  return { unit, aggregate };
-}
 
 function emptySeries(timeframe) {
   return {
@@ -252,9 +235,8 @@ export function getInMemoryPriceBuffer(poolAddress) {
 
 /**
  * Append a spot price to the pool's sliding window.
- * A source change resets the window: DexScreener USD prices and active-bin
- * tokenY-per-tokenX prices are not interchangeable, so a series is always
- * built from one consistent unit.
+ * A source change resets the window, so a series is always built from one
+ * consistent price unit (the active-bin ratio is tokenY per tokenX).
  */
 function appendInMemoryPrice(poolAddress, price, source = "unknown") {
   const value = toSpotPrice(price);
@@ -295,7 +277,7 @@ function appendInMemoryPrice(poolAddress, price, source = "unknown") {
 
 function logSpotFailure(poolAddress, message) {
   const now = Date.now();
-  if (now - (spotErrorLoggedAt.get(poolAddress) || 0) < GECKO_COOLDOWN_MS) return;
+  if (now - (spotErrorLoggedAt.get(poolAddress) || 0) < SPOT_LOG_INTERVAL_MS) return;
   spotErrorLoggedAt.set(poolAddress, now);
   log("panda_warn", message);
 }
@@ -308,111 +290,7 @@ function cachePriceSeries(cacheKey, value, ttlMs) {
   }
 }
 
-/** Fetch JSON with a hard timeout so a slow API can't stall the 3s poller. */
-async function fetchJson(url, { timeoutMs = FETCH_TIMEOUT_MS } = {}) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), Math.max(1000, Number(timeoutMs) || FETCH_TIMEOUT_MS));
-  try {
-    const res = await fetch(url, { headers: { accept: "application/json" }, signal: controller.signal });
-    if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
-    return await res.json();
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-async function fetchGeckoCandles(poolAddress, timeframe, limit) {
-  const { unit, aggregate } = geckoOhlcvPath(timeframe);
-  const url = `${GECKO_API}/networks/solana/pools/${poolAddress}/ohlcv/${unit}`
-    + `?aggregate=${aggregate}&limit=${limit}`;
-  const payload = await fetchJson(url);
-  const rows = payload?.data?.attributes?.ohlcv_list;
-  if (!Array.isArray(rows) || rows.length === 0) throw new Error("empty ohlcv_list");
-
-  const candles = rows
-    .map((row) => ({
-      time: Number(row?.[0]),
-      open: Number(row?.[1]),
-      high: Number(row?.[2]),
-      low: Number(row?.[3]),
-      close: Number(row?.[4]),
-      volume: Number(row?.[5]),
-    }))
-    .filter((candle) => Number.isFinite(candle.time) && Number.isFinite(candle.close) && candle.close > 0)
-    .sort((a, b) => a.time - b.time);
-
-  if (candles.length < MIN_CANDLES) {
-    throw new Error(`insufficient candles (${candles.length} < ${MIN_CANDLES})`);
-  }
-  return candles;
-}
-
-/**
- * Pick the pair that actually belongs to the pool. When a pool address is
- * supplied we require an exact pairAddress match — DexScreener's token
- * endpoint returns every pair for a token and their prices can diverge.
- */
-function pickDexPair(pairs, poolAddress) {
-  if (!Array.isArray(pairs) || pairs.length === 0) return null;
-  const solana = pairs.filter((pair) => !pair?.chainId || String(pair.chainId).toLowerCase() === "solana");
-  const candidates = solana.length ? solana : pairs;
-  const target = String(poolAddress || "").toLowerCase();
-  if (target) {
-    const exact = candidates.find((pair) => String(pair?.pairAddress || "").toLowerCase() === target);
-    if (exact) return exact;
-  }
-  // With no exact pool match only a single unambiguous pair is trustworthy.
-  return candidates.length === 1 ? candidates[0] : null;
-}
-
-function spotFromDexPair(pair) {
-  const price = toSpotPrice(pair?.priceUsd) ?? toSpotPrice(pair?.priceNative);
-  if (price == null) return null;
-  return {
-    price,
-    source: "dexscreener",
-    tokenAddress: pair?.baseToken?.address || null,
-    pairAddress: pair?.pairAddress || null,
-  };
-}
-
-async function fetchDexScreenerTokenSpot(tokenAddress, poolAddress) {
-  const payload = await fetchJson(`${DEXSCREENER_API}/tokens/${encodeURIComponent(tokenAddress)}`);
-  return spotFromDexPair(pickDexPair(payload?.pairs, poolAddress));
-}
-
-async function fetchDexScreenerPairsSpot(poolAddress) {
-  const payload = await fetchJson(`${DEXSCREENER_API}/pairs/solana/${encodeURIComponent(poolAddress)}`);
-  const pairs = payload?.pairs || (payload?.pair ? [payload.pair] : []);
-  return spotFromDexPair(pickDexPair(pairs, poolAddress));
-}
-
-/**
- * DexScreener spot price. Uses the token endpoint when the base mint is known
- * (explicit param or previously resolved), then falls back to the pool endpoint.
- */
-async function fetchDexScreenerSpot({ pool_address, token_address }) {
-  const cachedToken = resolvedTokenCache.get(pool_address);
-  const knownToken = token_address
-    || (cachedToken && Date.now() - cachedToken.at < RESOLVED_TOKEN_CACHE_MS ? cachedToken.tokenAddress : null);
-
-  if (knownToken) {
-    try {
-      const tokenSpot = await fetchDexScreenerTokenSpot(knownToken, pool_address);
-      if (tokenSpot) return tokenSpot;
-    } catch (error) {
-      logSpotFailure(pool_address, `DexScreener token price failed for ${pool_address.slice(0, 8)}: ${error.message}`);
-    }
-  }
-
-  const pairSpot = await fetchDexScreenerPairsSpot(pool_address);
-  if (pairSpot?.tokenAddress) {
-    resolvedTokenCache.set(pool_address, { tokenAddress: pairSpot.tokenAddress, at: Date.now() });
-  }
-  return pairSpot;
-}
-
-/** Tertiary fallback: on-chain active-bin price via the dlmm helpers. */
+/** Active-bin spot price (on-chain, Meteora SDK via the dlmm helpers). */
 async function fetchActiveBinSpot(poolAddress) {
   try {
     const { getActiveBin } = await import("./dlmm.js");
@@ -454,16 +332,21 @@ function buildBufferSeries(poolAddress, buffer, timeframe) {
  * Analysis helper only — the exit hierarchy no longer consumes price series
  * (RSI/MACD were removed from the exit path). Kept for ad-hoc pool analysis.
  *
- * Primary: GeckoTerminal OHLCV. Fallbacks: DexScreener spot → DLMM active bin,
- * accumulated into a 50-point in-memory buffer so the indicators can still
- * compute when OHLCV is unavailable. Cached per (pool, timeframe, limit) and
- * never throws; returns { prices: [], currentPrice: null } if all sources fail.
+ * Sources: the on-chain DLMM active-bin price, accumulated into a 50-point
+ * in-memory buffer so the indicators can still compute. **No external market
+ * API is called** (CoinGecko / DexScreener were removed). Cached per
+ * (pool, timeframe, limit) and never throws; returns `{ prices: [],
+ * currentPrice: null }` if the chain read fails.
+ *
+ * `token_address` / `base_mint` are kept for call-site compatibility; they are
+ * no longer needed because the active-bin price comes straight from the pool.
+ *
  * @returns {Promise<{prices:number[], candles:Array, currentPrice:number|null, source:string, timeframe:string}>}
  */
 export async function fetchPriceSeries({
   pool_address,
-  token_address = null,
-  base_mint = null,
+  token_address = null, // eslint-disable-line no-unused-vars
+  base_mint = null, // eslint-disable-line no-unused-vars
   timeframe = "5m",
   limit = 120,
   cacheSec = 60,
@@ -478,44 +361,8 @@ export async function fetchPriceSeries({
   const cached = PRICE_SERIES_CACHE.get(cacheKey);
   if (!refresh && cached && now - cached.at < (cached.ttlMs ?? ttlMs)) return cached.value;
 
-  // ── 1) Primary: GeckoTerminal OHLCV ─────────────────────────────
-  const cooldownUntil = geckoCooldownUntil.get(pool_address) || 0;
-  if (refresh || now >= cooldownUntil) {
-    try {
-      const candles = await fetchGeckoCandles(pool_address, timeframe, requestedLimit);
-      const value = {
-        prices: candles.map((candle) => candle.close),
-        candles,
-        currentPrice: candles[candles.length - 1].close,
-        timeframe,
-        source: "geckoterminal",
-        fetchedAt: new Date().toISOString(),
-      };
-      geckoCooldownUntil.delete(pool_address);
-      cachePriceSeries(cacheKey, value, ttlMs);
-      return value;
-    } catch (error) {
-      geckoCooldownUntil.set(pool_address, Date.now() + GECKO_COOLDOWN_MS);
-      logSpotFailure(
-        pool_address,
-        `GeckoTerminal OHLCV unavailable for ${pool_address.slice(0, 8)} (${timeframe}): ${error.message}; using spot fallback`,
-      );
-    }
-  }
-
-  // ── 2) Secondary: DexScreener spot ──────────────────────────────
-  let spot = null;
-  try {
-    spot = await fetchDexScreenerSpot({
-      pool_address,
-      token_address: token_address || base_mint,
-    });
-  } catch (error) {
-    logSpotFailure(pool_address, `DexScreener spot failed for ${pool_address.slice(0, 8)}: ${error.message}`);
-  }
-
-  // ── 3) Tertiary: DLMM active-bin spot ───────────────────────────
-  if (!spot) spot = await fetchActiveBinSpot(pool_address);
+  // ── Sole source: DLMM active-bin spot (on-chain, Meteora SDK) ────
+  const spot = await fetchActiveBinSpot(pool_address);
 
   // ── In-memory buffer: append this spot sample, build fallback ───
   const buffer = spot

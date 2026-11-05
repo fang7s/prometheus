@@ -98,11 +98,83 @@ function toFiniteNumber(value) {
   return Number.isFinite(n) ? n : null;
 }
 
-/** `+8.10%` / `-8.10%` / `?` — signed PnL percentage. */
-export function formatSignedPct(value) {
+/** `+8.10%` / `-8.10%` / `?` — signed percentage (`digits` = decimals shown). */
+export function formatSignedPct(value, digits = 2) {
   const n = Number(value);
   if (value == null || !Number.isFinite(n)) return "?";
-  return `${n > 0 ? "+" : ""}${n.toFixed(2)}%`;
+  const requested = Number(digits);
+  const places = Number.isFinite(requested) ? Math.max(0, Math.min(6, Math.round(requested))) : 2;
+  return `${n > 0 ? "+" : ""}${n.toFixed(places)}%`;
+}
+
+// ─── Deploy-card market header (native Meteora metrics only) ──────
+/**
+ * A daily fee/TVL ratio (in %) at or above this means the pool is printing more
+ * than 5 % of its TVL in fees per day — "exceptionally high activity".
+ */
+export const MARKET_SURGE_FEE_TVL_PCT = 5;
+
+/** A 24 h price change (in %) at or above this is treated as a surge. */
+export const MARKET_SURGE_PRICE_CHANGE_PCT = 50;
+
+/**
+ * Activity badge for the deploy card, computed **only** from the Meteora pool
+ * object already held in memory (no external API):
+ *
+ *   🚀 Surge / High Activity            fee/TVL ≥ 5 % (or 24 h change ≥ +50 %)
+ *   📊 Vol: $123.1K · TVL: $500.0K      normal activity
+ *   📊 Activity: N/A                    every metric undefined
+ *
+ * Never throws: missing metrics degrade to `N/A` instead of a fake signal.
+ */
+export function formatMarketActivityLine({
+  volume24h = null,
+  tvl = null,
+  feeTvl = null,
+  priceChange24h = null,
+  surgeFeeTvlPct = MARKET_SURGE_FEE_TVL_PCT,
+  surgePriceChangePct = MARKET_SURGE_PRICE_CHANGE_PCT,
+} = {}) {
+  const feeTvlPct = toFiniteNumber(feeTvl);
+  const changePct = toFiniteNumber(priceChange24h);
+  const feeThreshold = toFiniteNumber(surgeFeeTvlPct) ?? MARKET_SURGE_FEE_TVL_PCT;
+  const changeThreshold = toFiniteNumber(surgePriceChangePct) ?? MARKET_SURGE_PRICE_CHANGE_PCT;
+  const surging = (feeTvlPct != null && feeTvlPct >= feeThreshold)
+    || (changePct != null && changePct >= changeThreshold);
+  if (surging) return "🚀 Surge / High Activity";
+
+  const volume = formatCompactUsd(volume24h);
+  const locked = formatCompactUsd(tvl);
+  if (volume == null && locked == null) return "📊 Activity: <b>N/A</b>";
+  return [
+    `📊 Vol: ${volume ? `<b>${volume}</b>` : "N/A"}`,
+    `TVL: ${locked ? `<b>${locked}</b>` : "N/A"}`,
+  ].join(" · ");
+}
+
+/** `245.8%` / `19.6K%` — compact APR label (null for a missing value). */
+function formatAprPct(apr) {
+  const n = toFiniteNumber(apr);
+  if (n == null) return null;
+  return Math.abs(n) >= 1_000 ? `${(n / 1_000).toFixed(1)}K%` : `${n.toFixed(1)}%`;
+}
+
+/**
+ * One-line market header for the deploy card, built from the Meteora pool
+ * fields (`pool.marketCap`, `pool.volume`, `pool.apr`) — no external request:
+ *
+ *   🧢 MC: $2.49M · 📊 Vol 24h: $123.1K · 📈 APR: 245.8%
+ *
+ * Every metric degrades to `N/A` independently, so a missing Meteora field never
+ * blanks the whole line.
+ */
+export function formatMarketMetricsLine({ mcap = null, volume24h = null, apr = null } = {}) {
+  const show = (rendered) => (rendered ? `<b>${rendered}</b>` : "N/A");
+  return [
+    `🧢 MC: ${show(formatCompactUsd(mcap))}`,
+    `📊 Vol 24h: ${show(formatCompactUsd(volume24h))}`,
+    `📈 APR: ${show(formatAprPct(apr))}`,
+  ].join(" · ");
 }
 
 // ─── Range geometry + progress bars ───────────────────────────────

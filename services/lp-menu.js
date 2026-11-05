@@ -51,12 +51,16 @@ import {
   computeRangePositionPct,
   escapeHtml,
   formatCompactUsd,
+  formatMarketActivityLine,
+  formatMarketMetricsLine,
   formatMoney,
   formatRangeStatus,
   formatSolAmount,
   formatUsd,
   renderProgressBar,
+  SECTION_DIVIDER,
 } from "./telegramFormat.js";
+import { marketMetricsFromPool } from "./marketData.js";
 
 // The pure formatters live in `services/telegramFormat.js` (shared with
 // `telegram.js` and the `/positions` view). They stay re-exported here so every
@@ -65,6 +69,8 @@ export {
   computeRangePositionPct,
   escapeHtml,
   formatCompactUsd,
+  formatMarketActivityLine,
+  formatMarketMetricsLine,
   formatMoney,
   formatRangeStatus,
   formatSolAmount,
@@ -757,10 +763,29 @@ export function renderDashboard(session, { wallet = null, note = null } = {}) {
   const maxSol = maxSpendableSol({ sol: wallet?.sol ?? 0, gasReserve, totalBins });
   const presetSol = Number(config.management?.deployAmountSol ?? 0.5);
 
+  // Market header: MC / 24 h volume / APR + the activity badge, read straight
+  // from the Meteora pool object already in memory (`services/marketData.js`).
+  // No external request is made here, so the card renders instantly; missing
+  // fields degrade to `N/A` instead of blocking the deploy controls.
+  const market = marketMetricsFromPool(pool);
+  const marketLine = formatMarketMetricsLine({
+    mcap: market.mcap,
+    volume24h: market.volume24h,
+    apr: market.apr,
+  });
+  const activityLine = formatMarketActivityLine({
+    volume24h: market.volume24h,
+    tvl: market.tvl,
+    feeTvl: market.feeTvl,
+    priceChange24h: market.priceChange24h,
+  });
+
   const lines = [
     `🆕 <b>New Position: ${escapeHtml(pool.name || "pool")}</b>`,
     `Binstep: ${binStep} | BaseFee: ${baseFee}`,
-    "─────────────────────────",
+    marketLine,
+    activityLine,
+    SECTION_DIVIDER,
     pool.activeBinId != null
       ? `🎯 Active bin: <b>${pool.activeBinId}</b>${pool.activeBinSol != null ? ` · ${formatSolAmount(pool.activeBinSol)} SOL in bin` : ""}`
       : null,
@@ -1494,6 +1519,8 @@ async function attachLiquidityChart(msg, session, view) {
 async function presentDashboard(msg, { note = null, messageId = null } = {}) {
   const session = touch(getLpSession(msg));
 
+  // The card is rendered 100 % from memory: the market header is derived from the
+  // Meteora pool object below, so no external market API can delay this view.
   // Resolve the bin range for display (state stores %, the preview stores IDs).
   if (session.pool?.activeBinId != null && session.pool?.binStep) {
     try {

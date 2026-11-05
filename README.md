@@ -11,10 +11,9 @@
 
 While keeping the strong core liquidity interaction logic of Meridian, **Prometheus** introduces several key architectural enhancements:
 
-* **🛡️ Multi-Layer Price Pipeline (Bulletproof Fallback):**
-  * **Primary:** GeckoTerminal API for standard historical OHLCV data.
-  * **Secondary:** DexScreener Pair API for instant spot prices on newly launched tokens.
-  * **Tertiary / Buffer:** In-memory sliding window buffer (capped at 50 price points) to compute indicators even during external API downtime.
+* **🛡️ Price Pipeline (on-chain only, no third-party rate limits):**
+  * **Source:** the Meteora DLMM active bin (`getActiveBin`) — the same SDK that signs the deploys.
+  * **Buffer:** in-memory sliding window (capped at 50 price points) that builds the pseudo-candles for the indicators, so no external market API (CoinGecko / GeckoTerminal / DexScreener) is ever needed — those answer HTTP 429 on their keyless tiers and have been removed.
 * **🐼 Evil Panda Confluence Exit Engine:**
   * Strict multi-indicator exit validation combining **RSI(2) saturation ($\ge 70-80$)**, **Bollinger Bands Upper penetration**, and **MACD/Supertrend momentum shifts**.
   * Features a **3-tick confirmation poller** to completely eliminate loss from fakeout candles.
@@ -31,7 +30,7 @@ While keeping the strong core liquidity interaction logic of Meridian, **Prometh
 [Meteora DLMM / Jupiter Data]
              │
              ▼
-[Multi-Layer Price Engine] ─── (GeckoTerminal -> DexScreener -> In-Memory Buffer)
+[Multi-Layer Price Engine] ─── (Meteora DLMM active bin -> In-Memory Buffer)
              │
              ▼
 [Indicator Pipeline] ───────── (RSI(2), Bollinger Bands, MACD / Supertrend)

@@ -62,15 +62,20 @@ import {
   truncateAddress,
 } from "../services/lp-menu.js";
 import {
+  MARKET_SURGE_FEE_TVL_PCT,
+  MARKET_SURGE_PRICE_CHANGE_PCT,
   MESSAGE_LIMIT,
   SECTION_DIVIDER,
   escapeHtml,
+  formatMarketActivityLine,
+  formatMarketMetricsLine,
   formatOpenPositionsMessage,
   formatOutOfRangeAlert,
   formatProgressBar,
   formatTreeRows,
   renderProgressBar,
 } from "../services/telegramFormat.js";
+import { marketMetricsFromPool } from "../services/marketData.js";
 import {
   PNL_CARD_CAPTION_LIMIT,
   PNL_CARD_DEFAULT_HEIGHT,
@@ -729,6 +734,139 @@ test("active position lines show bold status, range position and market cap", ()
   assert.match(text, /PnL -\$4\.20 \(-8\.10%\)/);
   assert.match(text, /📍 Range Position: <b>100%<\/b> \[██████████\]/);
   assert.match(text, /🧢 MC: <b>\$1\.25M<\/b>/);
+});
+
+// ─── Deploy card market header (Meteora-native MC / Vol / APR) ─────
+test("deploy card market line prints MC, 24h volume and APR with N/A fallbacks", () => {
+  assert.equal(
+    formatMarketMetricsLine({ mcap: 2_490_000, volume24h: 123_100, apr: 245.8 }),
+    "🧢 MC: <b>$2.49M</b> · 📊 Vol 24h: <b>$123.1K</b> · 📈 APR: <b>245.8%</b>",
+  );
+  assert.equal(
+    formatMarketMetricsLine({ mcap: null, volume24h: 123_100, apr: 19_582.25 }),
+    "🧢 MC: N/A · 📊 Vol 24h: <b>$123.1K</b> · 📈 APR: <b>19.6K%</b>",
+  );
+  // Nothing known → every metric degrades independently, never a fake zero.
+  assert.equal(formatMarketMetricsLine(), "🧢 MC: N/A · 📊 Vol 24h: N/A · 📈 APR: N/A");
+  assert.equal(
+    formatMarketMetricsLine({ mcap: 0, volume24h: "0", apr: null }),
+    "🧢 MC: N/A · 📊 Vol 24h: N/A · 📈 APR: N/A",
+  );
+});
+
+test("activity badge flags a surge from Meteora fee/TVL or 24h change", () => {
+  assert.equal(MARKET_SURGE_FEE_TVL_PCT, 5);
+  assert.equal(MARKET_SURGE_PRICE_CHANGE_PCT, 50);
+  // Hot pool: > 5 % of TVL earned in fees today.
+  assert.equal(
+    formatMarketActivityLine({ volume24h: 1_835_050, tvl: 61_968, feeTvl: 53.65 }),
+    "🚀 Surge / High Activity",
+  );
+  // Price surge alone is enough.
+  assert.equal(
+    formatMarketActivityLine({ volume24h: 1_835_050, tvl: 61_968, feeTvl: 0.4, priceChange24h: 50 }),
+    "🚀 Surge / High Activity",
+  );
+  // Calm pool → plain activity numbers.
+  assert.equal(
+    formatMarketActivityLine({ volume24h: 123_100, tvl: 500_000, feeTvl: 0.42, priceChange24h: -3.5 }),
+    "📊 Vol: <b>$123.1K</b> · TVL: <b>$500.0K</b>",
+  );
+  // Missing metrics degrade gracefully instead of throwing.
+  assert.equal(formatMarketActivityLine({ volume24h: 123_100 }), "📊 Vol: <b>$123.1K</b> · TVL: N/A");
+  assert.equal(formatMarketActivityLine(), "📊 Activity: <b>N/A</b>");
+  assert.equal(formatMarketActivityLine({ feeTvl: 4.99, priceChange24h: 49.9 }), "📊 Activity: <b>N/A</b>");
+});
+
+test("deploy card prints the market header right under the bin step line", () => {
+  const session = getLpSession({ chat: { id: 41 }, from: { id: 42 } });
+  session.pool = {
+    address: "AnakinPool11111111111111111111111111111111",
+    name: "Anakin/SOL",
+    binStep: 100,
+    baseFee: 2,
+    tvl: 500_000,
+    mcap: 2_490_000,
+    volume: 123_100,
+    feeTvl: 0.42,
+    apr: 153.3,
+    activeBinId: 1234,
+  };
+
+  const view = renderDashboard(session, { wallet: { sol: 1 } });
+  const lines = view.text.split("\n");
+  assert.equal(lines[0], "🆕 <b>New Position: Anakin/SOL</b>");
+  assert.equal(lines[1], "Binstep: 100 | BaseFee: 2%");
+  assert.equal(lines[2], "🧢 MC: <b>$2.49M</b> · 📊 Vol 24h: <b>$123.1K</b> · 📈 APR: <b>153.3%</b>");
+  assert.equal(lines[3], "📊 Vol: <b>$123.1K</b> · TVL: <b>$500.0K</b>");
+  assert.equal(lines[4], SECTION_DIVIDER);
+
+  // The extra header rows must not disturb the deployment controls.
+  const labels = view.keyboard.flat().map((button) => button.text);
+  assert.ok(labels.includes("⚡ Preset A"));
+  assert.ok(labels.includes("⚡ Preset B"));
+  assert.ok(labels.some((label) => label.includes("QUICK ZAP")));
+  assert.ok(labels.some((label) => label.includes("LIQUIDITY AMOUNT")));
+  assert.ok(labels.some((label) => label.includes("RANGE")));
+  assert.ok(labels.some((label) => label.includes("STRATEGY")));
+  assert.ok(labels.includes("✅ Continue"));
+  assert.ok(labels.includes("⚡ Deploy Position"));
+
+  // No Meteora metrics at all → N/A everywhere, the card still renders.
+  const bare = renderDashboard(
+    { ...session, pool: { ...session.pool, mcap: null, volume: null, feeTvl: null, apr: null, tvl: null } },
+    { wallet: { sol: 1 } },
+  );
+  const bareLines = bare.text.split("\n");
+  assert.equal(bareLines[2], "🧢 MC: N/A · 📊 Vol 24h: N/A · 📈 APR: N/A");
+  assert.equal(bareLines[3], "📊 Activity: <b>N/A</b>");
+
+  // A hot pool (fee/TVL > 5 %) shows the surge badge instead.
+  const surge = renderDashboard(
+    { ...session, pool: { ...session.pool, feeTvl: 12.5 } },
+    { wallet: { sol: 1 } },
+  );
+  assert.match(surge.text, /🚀 Surge \/ High Activity/);
+});
+
+// ─── Meteora-native market metrics (zero external API) ────────────
+test("market metrics are derived from the Meteora pool object only", () => {
+  // Discovery-API shaped entry (what `toPoolEntry` / `toTokenPoolEntry` build).
+  assert.deepEqual(
+    marketMetricsFromPool({ mcap: 2_490_000, volume: 123_100, feeTvl: 0.42, tvl: 500_000, apr: 153.3 }),
+    { mcap: 2_490_000, volume24h: 123_100, apr: 153.3, feeTvl: 0.42, tvl: 500_000, priceChange24h: null },
+  );
+
+  // Raw Meteora spellings are accepted too; APR falls back to fee/TVL × 365.
+  const raw = marketMetricsFromPool({
+    token_x: { market_cap: 900_000, price_change_pct: -4.2 },
+    volume: { "24h": 250_000 },
+    fee_tvl_ratio: 2,
+    active_tvl: 61_968,
+  });
+  assert.equal(raw.mcap, 900_000);
+  assert.equal(raw.volume24h, 250_000);
+  assert.equal(raw.feeTvl, 2);
+  assert.equal(raw.apr, 730);
+  assert.equal(raw.tvl, 61_968);
+  assert.equal(raw.priceChange24h, -4.2);
+
+  // A fraction-shaped `apr` (Meteora sometimes reports 0.0000117) never wins over
+  // the locally annualized fee/TVL ratio.
+  assert.equal(marketMetricsFromPool({ apr: 0.0000117, feeTvl: 1 }).apr, 365);
+  assert.equal(marketMetricsFromPool({ apr: 0.0000117 }).apr, 0.0000117);
+
+  // Nothing available → nulls, never a fabricated zero.
+  const empty = {
+    mcap: null,
+    volume24h: null,
+    apr: null,
+    feeTvl: null,
+    tvl: null,
+    priceChange24h: null,
+  };
+  assert.deepEqual(marketMetricsFromPool({}), empty);
+  assert.deepEqual(marketMetricsFromPool(null), empty);
 });
 
 test("open positions stay text-only (no PnL card generator in lp-menu)", () => {

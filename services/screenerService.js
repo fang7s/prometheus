@@ -13,13 +13,15 @@
  *        · `volume_24h:desc`          → 24h volume / turnover
  *        · `fee_tvl_ratio_24h:desc`   → APR % (fee yield annualized)
  *        · `base_token_market_cap:desc` → market-cap quality
- *   2. DexScreener (`/latest/dex/pairs/solana/<pool>`) — fallback enrichment
- *      for market cap, pair age and 24h price change when Meteora omits them.
+ *   2. **Meteora only.** Everything else (market cap, pair age, 24 h price change,
+ *      24 h volume) comes from the same discovery payload. There is **no
+ *      CoinGecko and no DexScreener request** anywhere in the screener — the
+ *      digest never depends on a second, rate-limited third party.
  *
  * Design invariants (see CLAUDE.md conventions):
  *   - **Non-blocking.** Every request is bounded by `AbortSignal.timeout()` *and*
- *     `withTimeout()`, fan-out is capped (4 feeds + ≤6 DexScreener lookups, 3 at
- *     a time), and the CPU work is a few dozen plain objects. Nothing in here is
+ *     `withTimeout()`, fan-out is capped at the four discovery feeds, and the CPU
+ *     work is a few dozen plain objects. Nothing in here is
  *     awaited by the 3 s PnL poller, the management cycle or the Telegram poll
  *     loop — the scheduler only *starts* the work and walks away.
  *   - **Offline-testable.** Normalization, scoring, ranking, message rendering,
@@ -39,7 +41,6 @@ import { MESSAGE_LIMIT, SECTION_DIVIDER, bold, code, escapeHtml, formatCompactUs
 
 // ─── Endpoints ───────────────────────────────────────────────────
 const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
-const DEXSCREENER_BASE = "https://api.dexscreener.com/latest/dex";
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 
 // ─── Public constants ────────────────────────────────────────────
@@ -101,11 +102,6 @@ export function sortFieldFor(metric, timeframe = "24h") {
   return `${base}_${window}`;
 }
 
-/** DexScreener lookups are capped and serialized in small batches. */
-const DEX_LOOKUP_LIMIT = 6;
-const DEX_CONCURRENCY = 3;
-const DEX_CACHE_TTL_MS = 5 * 60_000;
-
 // ─── Small numeric helpers ───────────────────────────────────────
 function finite(value) {
   if (value == null || value === "") return null;
@@ -164,7 +160,6 @@ export function getScreenerSettings(overrides = {}) {
     minBaseFeePct: Math.max(0, finite(s.minBaseFeePct) ?? DEFAULT_MIN_BASE_FEE_PCT),
     fetchTimeoutMs: clampInt(s.fetchTimeoutMs, 500, 30_000, 6_000),
     cacheTtlMs: Math.max(0, finite(s.cacheTtlSec) ?? 300) * 1000,
-    dexScreener: s.dexScreener !== false,
     snoozeHours: positive(s.snoozeHours) ?? 6,
     muteHours: positive(s.muteHours) ?? 24,
   };
@@ -211,11 +206,6 @@ export function buildHotFeedUrl({ sort, pageSize = 50, timeframe = "24h", filter
   ];
   if (filter) params.push(`filter_by=${encodeURIComponent(filter)}`);
   return `${POOL_DISCOVERY_BASE}/pools?${params.join("&")}`;
-}
-
-/** DexScreener pair URL for a Meteora pool address. */
-export function buildDexScreenerUrl(poolAddress) {
-  return `${DEXSCREENER_BASE}/pairs/solana/${encodeURIComponent(String(poolAddress ?? "").trim())}`;
 }
 
 // ─── Row normalization + client-side floors ──────────────────────
@@ -544,81 +534,6 @@ export function rankHotPools(feedResults = [], settings = {}) {
   return { pools, feedErrors, scanned };
 }
 
-// ─── DexScreener enrichment (fallback only) ──────────────────────
-const _dexCache = new Map(); // pool address -> { at, pair }
-
-/**
- * Fetch one DexScreener pair with a short-lived cache. Never throws: enrichment
- * is optional, so a rate-limited or missing pair simply leaves the Meteora
- * values in place.
- */
-export async function fetchDexScreenerPair(poolAddress, { timeoutMs = 4_000, now = Date.now(), fetchImpl = fetchJson } = {}) {
-  const address = String(poolAddress ?? "").trim();
-  if (!address) return null;
-  const cached = _dexCache.get(address);
-  if (cached && now - cached.at < DEX_CACHE_TTL_MS) return cached.pair;
-
-  try {
-    const payload = await fetchImpl(buildDexScreenerUrl(address), {
-      timeoutMs,
-      label: "dexscreener pair",
-    });
-    const pair = Array.isArray(payload?.pairs)
-      ? payload.pairs.find((entry) => String(entry?.pairAddress ?? "") === address) ?? payload.pairs[0] ?? null
-      : null;
-    _dexCache.set(address, { at: now, pair });
-    // Bound the cache: enrichment is best-effort, never a memory leak.
-    if (_dexCache.size > 200) {
-      const oldest = [..._dexCache.entries()].sort((a, b) => a[1].at - b[1].at).slice(0, 100);
-      for (const [key] of oldest) _dexCache.delete(key);
-    }
-    return pair;
-  } catch (error) {
-    log("screener_warn", `DexScreener enrichment failed for ${address.slice(0, 8)}: ${error?.message || error}`);
-    return null;
-  }
-}
-
-/**
- * Fill gaps (market cap, pair age, 24h price change) from DexScreener.
- * Only the top `DEX_LOOKUP_LIMIT` pools are looked up, `DEX_CONCURRENCY` at a
- * time — the digest must never fan out into dozens of requests.
- *
- * @returns {Promise<object[]>} pools (same order) with `dexScreener: true` when enriched
- */
-export async function enrichWithDexScreener(pools = [], settings = {}, { now = Date.now(), fetchImpl = fetchJson } = {}) {
-  const list = (Array.isArray(pools) ? pools : []).map((pool) => ({ ...pool }));
-  if (settings?.dexScreener === false) return list;
-
-  const targets = list.filter((pool) => pool?.pool).slice(0, DEX_LOOKUP_LIMIT);
-  for (let i = 0; i < targets.length; i += DEX_CONCURRENCY) {
-    const batch = targets.slice(i, i + DEX_CONCURRENCY);
-    const pairs = await Promise.all(
-      batch.map((pool) =>
-        fetchDexScreenerPair(pool.pool, { timeoutMs: settings?.fetchTimeoutMs, now, fetchImpl }),
-      ),
-    );
-    batch.forEach((pool, offset) => {
-      const pair = pairs[offset];
-      if (!pair) return;
-      const target = list.find((entry) => entry.pool === pool.pool);
-      if (!target) return;
-      target.dexScreener = true;
-      target.mcap = target.mcap ?? finite(pair.marketCap) ?? finite(pair.fdv);
-      target.dexLiquidity = finite(pair.liquidity?.usd);
-      target.priceChangePct = target.priceChangePct ?? finite(pair.priceChange?.h24);
-      target.dexVolume24h = finite(pair.volume?.h24);
-      const createdAt = finite(pair.pairCreatedAt);
-      // DexScreener's `pairCreatedAt` is epoch **milliseconds**; Meteora's is too.
-      if (target.poolCreatedAt == null && createdAt != null && createdAt > 1e12) target.poolCreatedAt = createdAt;
-      if (target.volumeWindowUsd == null && target.dexVolume24h != null) target.volumeWindowUsd = target.dexVolume24h;
-      // Re-score: market cap and volume may have just become known.
-      target.score = computeHotScore(target);
-    });
-  }
-  return list;
-}
-
 // ─── Snapshot cache + single flight ──────────────────────────────
 /**
  * The digest snapshot is cached in memory so a Snooze/Mute re-render, a second
@@ -703,7 +618,6 @@ export function resetScreenerState() {
   _cache.key = null;
   _inflight = null;
   _lastSnapshot = null;
-  _dexCache.clear();
   _suppression.until = 0;
   _suppression.mode = null;
   _suppression.hours = null;
@@ -727,7 +641,6 @@ function cacheKeyFor(settings) {
     settings.minBinStep,
     settings.maxBinStep,
     settings.minBaseFeePct,
-    settings.dexScreener ? "dex" : "nodex",
   ].join("|");
 }
 
@@ -748,9 +661,10 @@ export async function collectHotPools(settings, { fetchImpl = fetchJson } = {}) 
   }
 
   const ranked = rankHotPools(results, settings);
-  const pools = ranked.pools.length > 0 ? await enrichWithDexScreener(ranked.pools, settings, { fetchImpl }) : [];
-  // Enrichment can change the score (market cap / volume gaps filled), so keep
-  // the published order consistent with the published score.
+  // Meteora is the only source: the ranked rows already carry market cap, pair
+  // age, 24 h volume and 24 h price change, so no enrichment request is made.
+  const pools = ranked.pools.length > 0 ? ranked.pools.map((pool) => ({ ...pool })) : [];
+  // Keep the published order consistent with the published score.
   pools.sort((a, b) => {
     if ((b.score ?? 0) !== (a.score ?? 0)) return (b.score ?? 0) - (a.score ?? 0);
     return (finite(b.feeWindowUsd) ?? 0) - (finite(a.feeWindowUsd) ?? 0);
