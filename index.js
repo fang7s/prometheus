@@ -28,8 +28,8 @@ import {
   createLiveMessage,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, getTrackedPositions, getTrackedPosition, setPositionInstruction, confirmPeak, registerExitSignal } from "./state.js";
-import { detectExit, formatExitLog, parseInstructionOverrides } from "./exit-rules.js";
+import { getLastBriefingDate, setLastBriefingDate, getTrackedPositions, getTrackedPosition, getPositionConfig, setPositionInstruction, confirmPeak, registerExitSignal } from "./state.js";
+import { EXIT_PRIORITY, detectExit, formatExitLog, parseInstructionOverrides } from "./exit-rules.js";
 // `withDeadline` rejects with TimeoutError; the local `withTimeout` below is the
 // non-throwing shutdown helper and keeps its existing contract.
 import { isTimeoutError, withTimeout as withDeadline } from "./utils/timeout.js";
@@ -346,6 +346,42 @@ function dispatchClosedPositionPnlCard(pos, result) {
 async function executeRuleClose(position, decision, { liveMessage = null } = {}) {
   // Exact priority reason, e.g. `[EXIT] Priority 1: TP hit (+5.00%) — HYPE/USDC`
   log("rule_engine", formatExitLog(position.pair, decision));
+
+  // Priority 2 (range out) honours the position's OWN `autoRebalance` flag: when
+  // it is enabled the position is closed and redeployed around the live active
+  // bin with the same strategy / size / TP-SL config instead of simply closing.
+  // Priority 1 (hard TP/SL) always closes — rebalancing a hit TP/SL would defeat
+  // the risk rule. The flag is per position and defaults to false.
+  if (decision?.priority === EXIT_PRIORITY.RANGE) {
+    const positionConfig = getPositionConfig(position.position);
+    if (positionConfig.autoRebalance === true) {
+      const { rebalancePosition } = await import("./services/positionActions.js");
+      const result = await rebalancePosition({
+        position_address: position.position,
+        position,
+        reason: `${decision.headline || decision.name}: ${decision.reason}`,
+      }).catch((error) => ({ success: false, error: error.message }));
+      if (result?.success) {
+        log(
+          "rule_engine",
+          `[REBALANCE] ${position.pair} auto-rebalanced around the active bin` +
+          `${result.new_position ? ` → ${result.new_position}` : ""}`,
+        );
+        return `${position.pair}: auto-rebalanced — ${decision.headline || decision.name}`;
+      }
+      if (result?.closed) {
+        // The close went through but the redeploy did not — the position is flat,
+        // so the normal close path below must not run again.
+        return `${position.pair}: closed — ${decision.headline || decision.name} ` +
+          `(auto-rebalance redeploy failed: ${result.error})`;
+      }
+      log(
+        "rule_engine_warn",
+        `[REBALANCE] ${position.pair} auto-rebalance failed (${result?.error}) — closing instead`,
+      );
+    }
+  }
+
   await liveMessage?.toolStart("close_position");
   const res = await executeTool("close_position", {
     position_address: position.position,

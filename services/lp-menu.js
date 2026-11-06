@@ -61,6 +61,12 @@ import {
   SECTION_DIVIDER,
 } from "./telegramFormat.js";
 import { marketMetricsFromPool } from "./marketData.js";
+import {
+  DEFAULT_POSITION_CONFIG,
+  getPositionConfig,
+  normalizePositionConfig,
+  setPositionConfig,
+} from "../state.js";
 
 // The pure formatters live in `services/telegramFormat.js` (shared with
 // `telegram.js` and the `/positions` view). They stay re-exported here so every
@@ -169,6 +175,20 @@ export function parseRangeInput(text) {
   if (downsidePct >= 100) return null;
   if (downsidePct === 0 && upsidePct === 0 && upperPct == null) return null;
   return { downsidePct, upsidePct, upperPct };
+}
+
+/**
+ * Accepts "7.5", "+7.5%", "-30%", "30 %" — a bare number is unsigned.
+ * Returns the signed number, or null when the text is not a percentage input.
+ * Used by the per-position ✏️ Custom TP / SL / slippage prompts.
+ */
+export function parsePercentInput(text) {
+  const raw = String(text ?? "").trim().replace(/%/g, "").replace(",", ".").trim();
+  if (!raw) return null;
+  if (!/^[+-]?\d+(?:\.\d+)?$/.test(raw)) return null;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value === 0) return null;
+  return value;
 }
 
 /** True when the text looks like a Solana address (for paste-a-pool support). */
@@ -346,6 +366,14 @@ export function getLpSession(msg) {
     chartMessageId: null,
     chartSignature: null,
     deploying: false,
+    // Positions exactly as rendered in 📊 My Positions — the `lp:pos*:<index>`
+    // callbacks resolve through this list so every TP/SL · slippage · claim ·
+    // rebalance · close action targets the position the user tapped.
+    positions: [],
+    // Target of a "✏️ Custom" TP / SL / slippage prompt (index + address + field).
+    pendingPosition: null,
+    // Guards against double-tapping a position action while it is executing.
+    positionBusy: false,
     updatedAt: Date.now(),
   };
   sessions.set(key, session);
@@ -987,6 +1015,27 @@ export function formatMarketCapLine(mcap) {
   return compact ? `🧢 MC: <b>${compact}</b>` : null;
 }
 
+/** `+5%` / `-50%` — signed percent with trailing zeros trimmed. */
+export function formatSignedPercent(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "?";
+  const rounded = Number(n.toFixed(2));
+  return `${rounded > 0 ? "+" : ""}${rounded}%`;
+}
+
+/**
+ * `⚙️ Settings: TP +5% | SL -50% | Slip 10%` — the ACTIVE values of one
+ * position. A position without a persisted config resolves to the defaults
+ * (TP +5 % / SL -50 % / 1000 BPS = 10 %), never to another pool's values.
+ */
+export function formatPositionConfigLine(positionConfig = null) {
+  const cfg = normalizePositionConfig(positionConfig ?? DEFAULT_POSITION_CONFIG);
+  const slipPct = Number((cfg.slippageBps / 100).toFixed(2));
+  const line = `⚙️ Settings: TP ${formatSignedPercent(cfg.tpPercent)} | ` +
+    `SL ${formatSignedPercent(cfg.slPercent)} | Slip ${slipPct}%`;
+  return cfg.autoRebalance ? `${line} · ♻️ auto-rebalance ON` : line;
+}
+
 /**
  * Attach the live token market cap to open positions. Jupiter's token search is
  * the same source the screening view uses, so a `/positions` refresh costs at
@@ -1030,8 +1079,38 @@ export function formatPositionLine(position, index, mode = "USD") {
       `${Number.isFinite(pnlPct) ? ` (${pnlSign}${pnlPct.toFixed(2)}%)` : ""}`,
     `   🎁 Unclaimed ${formatMoney(position?.unclaimed_fees_usd, mode)}${bins ? ` · ${bins}` : ""}`,
     metrics ? `   ${metrics}` : null,
+    // This position's OWN TP/SL/slippage — independent per pool.
+    `   ${formatPositionConfigLine(position?.config)}`,
     `   ⏱ ${Number.isFinite(age) ? `${age}m` : "?"} · 🆔 <code>${escapeHtml(String(position?.position || "?").slice(0, 12))}…</code>`,
   ].filter((line) => line != null).join("\n");
+}
+
+/**
+ * Inline action rows for 📊 My Positions — one block per open position.
+ *
+ * Every callback carries the INDEX of that position inside the rendered list
+ * (`session.positions`), so 🎯 TP/SL, ⚙️ slippage, 💸 claim, ⚖️ rebalance and
+ * 🔴 close act on exactly one pool and can never modify another position.
+ */
+export function buildPositionsKeyboard(positions = []) {
+  const list = Array.isArray(positions) ? positions : [];
+  const rows = [];
+  if (list.length) rows.push([btn("──────── ⚙️ POSITION CONTROLS ────────", "noop")]);
+  list.forEach((position, index) => {
+    const tag = index + 1;
+    rows.push([
+      btn(`🎯 Set TP/SL · ${tag}`, `postp:${index}`),
+      btn(`⚙️ Slippage · ${tag}`, `posslip:${index}`),
+    ]);
+    rows.push([
+      btn(`💸 Collect Fees · ${tag}`, `posact:claim:${index}`),
+      btn(`⚖️ Rebalance · ${tag}`, `posact:rebal:${index}`),
+    ]);
+    rows.push([btn(`🔴 Close Position · ${tag}`, `posact:close:${index}`)]);
+  });
+  rows.push(BACK_ROW("positions:refresh"));
+  rows.push([btn("💧 New LP Position", "new_position")]);
+  return rows;
 }
 
 export function renderPositions({ positions = [], wallet = null, note = null, mode = null } = {}) {
@@ -1045,7 +1124,7 @@ export function renderPositions({ positions = [], wallet = null, note = null, mo
     "",
   ].filter((line) => line != null);
 
-  const keyboard = [BACK_ROW("positions:refresh"), [btn("💧 New LP Position", "new_position")]];
+  const keyboard = buildPositionsKeyboard(list);
 
   if (list.length === 0) {
     return {
@@ -1069,6 +1148,96 @@ export function renderPositions({ positions = [], wallet = null, note = null, mo
       "Tap 🔄 Refresh for up-to-date PnL.",
     ].filter((line) => line != null).join("\n"),
     keyboard,
+  };
+}
+
+// ─── Per-position settings sub-views ──────────────────────────────
+/** Shared header of the 🎯 TP/SL and ⚙️ Slippage sub-menus. */
+function positionSettingsHeader(title, position, index, note) {
+  const pair = position?.pair || `Position #${index + 1}`;
+  return [
+    title,
+    "═══════════════════════",
+    `Pool: <b>${escapeHtml(pair)}</b> · #${index + 1}`,
+    `🆔 <code>${escapeHtml(truncateAddress(position?.position))}</code>`,
+    "",
+    formatPositionConfigLine(position?.config),
+    "",
+    note ? `<i>${escapeHtml(note)}</i>` : null,
+  ].filter((line) => line != null);
+}
+
+/**
+ * 🎯 Set TP/SL for ONE position. The presets write only to this position's
+ * persisted config (`state.json → positions[address].config`), so the other
+ * open pools keep their own thresholds.
+ */
+export function renderPositionTpSlView({ position = null, index = 0, note = null } = {}) {
+  const cfg = normalizePositionConfig(position?.config ?? DEFAULT_POSITION_CONFIG);
+  const isTp = (value) => Number(cfg.tpPercent) === value;
+  const isSl = (value) => Number(cfg.slPercent) === -Math.abs(value);
+
+  return {
+    text: [
+      ...positionSettingsHeader("🎯 <b>Set TP/SL</b>", position, index, note),
+      "",
+      "These thresholds apply to <b>this position only</b> — changing them never",
+      "touches another pool or the global defaults.",
+      "",
+      "Pick a preset or tap ✏️ Custom and send an exact value.",
+    ].join("\n"),
+    keyboard: [
+      [btn("──────── 🎯 TAKE PROFIT ────────", "noop")],
+      [
+        btn(mark(isTp(5), "🎯 TP +5%"), `posset:tp:5:${index}`),
+        btn(mark(isTp(10), "🎯 TP +10%"), `posset:tp:10:${index}`),
+        btn(mark(isTp(20), "🎯 TP +20%"), `posset:tp:20:${index}`),
+      ],
+      [btn("✏️ Custom TP", `posset:tp:custom:${index}`)],
+      [btn("──────── 🛑 STOP LOSS ────────", "noop")],
+      [
+        btn(mark(isSl(20), "🛑 SL -20%"), `posset:sl:20:${index}`),
+        btn(mark(isSl(30), "🛑 SL -30%"), `posset:sl:30:${index}`),
+        btn(mark(isSl(50), "🛑 SL -50%"), `posset:sl:50:${index}`),
+      ],
+      [btn("✏️ Custom SL", `posset:sl:custom:${index}`)],
+      [btn(mark(cfg.autoRebalance, `♻️ Auto-Rebalance: ${cfg.autoRebalance ? "ON" : "OFF"}`), `posset:auto:${cfg.autoRebalance ? 0 : 1}:${index}`)],
+      [btn("⬅️ Back", "positions"), btn("🏠 Main Menu", "main")],
+    ],
+  };
+}
+
+/**
+ * ⚙️ Slippage tolerance for ONE position (1 % · 3 % · 5 % · 10 %).
+ * Stored in BPS on that position's config and used for its deposit/withdraw
+ * transactions only.
+ */
+export function renderPositionSlippageView({ position = null, index = 0, note = null } = {}) {
+  const cfg = normalizePositionConfig(position?.config ?? DEFAULT_POSITION_CONFIG);
+  const isBps = (value) => Number(cfg.slippageBps) === value;
+
+  return {
+    text: [
+      ...positionSettingsHeader("⚙️ <b>Slippage</b>", position, index, note),
+      "",
+      `Current tolerance: <b>${cfg.slippageBps} BPS (${Number((cfg.slippageBps / 100).toFixed(2))}%)</b>`,
+      "",
+      "Slippage is used when this position zaps in, rebalances or closes.",
+      "It is stored per position — other pools keep their own tolerance.",
+    ].join("\n"),
+    keyboard: [
+      [btn("──────── ⚙️ SLIPPAGE ────────", "noop")],
+      [
+        btn(mark(isBps(100), "1%"), `posset:slip:100:${index}`),
+        btn(mark(isBps(300), "3%"), `posset:slip:300:${index}`),
+      ],
+      [
+        btn(mark(isBps(500), "5%"), `posset:slip:500:${index}`),
+        btn(mark(isBps(1000), "10%"), `posset:slip:1000:${index}`),
+      ],
+      [btn("✏️ Custom slippage", `posset:slip:custom:${index}`)],
+      [btn("⬅️ Back", "positions"), btn("🏠 Main Menu", "main")],
+    ],
   };
 }
 
@@ -1573,17 +1742,29 @@ async function presentHubView(msg, view, { messageId = null } = {}) {
 }
 
 /** 📊 My Positions — open Meteora DLMM positions with live PnL / unclaimed fees. */
-export async function showPositionsView(msg, { force = false, messageId = null } = {}) {
+export async function showPositionsView(msg, { force = false, messageId = null, note: viewNote = null } = {}) {
+  const session = touch(getLpSession(msg));
+  // Opening the list cancels any pending ✏️ Custom prompt — position actions
+  // always start from the freshly rendered list below.
+  session.awaiting = null;
+  session.pendingPosition = null;
+
   let positions = [];
-  let note = null;
+  let note = viewNote;
   try {
     // Lazy import: keeps this module light and avoids pulling the SDK wrapper in tests.
     const { getMyPositions } = await import("../tools/dlmm.js");
     const snapshot = await networkDeadline(getMyPositions({ force, silent: true }), "positions read");
-    if (snapshot?.error) note = snapshot.error;
+    if (snapshot?.error && !note) note = snapshot.error;
     positions = Array.isArray(snapshot?.positions) ? snapshot.positions : [];
     // Live market cap for the `🧢 MC` line — bounded, cached and non-fatal.
     positions = await enrichPositionsWithMarketCap(positions, { force });
+    // Attach each position's OWN persisted config (defaults + fallbacks applied)
+    // so the card shows per-pool TP/SL/slippage, never a global value.
+    positions = positions.map((position) => ({
+      ...position,
+      config: getPositionConfig(position.position),
+    }));
   } catch (error) {
     if (await reportTimeout("positions read", error)) {
       note = TIMEOUT_NOTE;
@@ -1592,6 +1773,8 @@ export async function showPositionsView(msg, { force = false, messageId = null }
       log("lp_ui_warn", `Positions view failed: ${error.message}`);
     }
   }
+  // Cache the rendered order: `lp:pos*:<index>` callbacks resolve through it.
+  session.positions = positions;
   const wallet = await getWalletSnapshot();
   return presentHubView(msg, renderPositions({ positions, wallet, note }), { messageId });
 }
@@ -2066,6 +2249,46 @@ export async function handleLpText(msg) {
     return true;
   }
 
+  // ✏️ Custom TP / SL / slippage for ONE position (opened from 🎯 / ⚙️).
+  if (awaiting === "postp" || awaiting === "possl" || awaiting === "posslip") {
+    const percent = parsePercentInput(text);
+    if (percent == null) {
+      await sendHTML("❌ Could not read that value. Send a number like <code>7.5</code> or <code>-30%</code>.");
+      return true;
+    }
+    const target = active.pendingPosition;
+    if (!target?.address) {
+      active.awaiting = null;
+      active.pendingPosition = null;
+      await sendHTML("⚠️ No position selected — open 📊 My Positions and tap 🎯 Set TP/SL again.");
+      return true;
+    }
+    const field = awaiting === "postp" ? "tp" : awaiting === "possl" ? "sl" : "slip";
+    const patch = field === "tp"
+      ? { tpPercent: Math.abs(percent) }
+      : field === "sl"
+        ? { slPercent: -Math.abs(percent) }
+        : { slippageBps: Math.round(Math.abs(percent) * 100) };
+    const index = Number(target.index) || 0;
+    const updated = setPositionConfig(target.address, patch);
+    active.awaiting = null;
+    active.pendingPosition = null;
+    if (!updated) {
+      await sendHTML("⚠️ That position is no longer tracked — it may have closed.");
+      await showPositionsView(msg, { force: true, messageId: active.messageId });
+      return true;
+    }
+    const cached = Array.isArray(active.positions) ? active.positions[index] : null;
+    if (cached) cachePositionConfig(active, index, cached, updated);
+    await showPositionSettingsView(msg, {
+      kind: field === "slip" ? "slippage" : "tpsl",
+      index,
+      note: `✅ Saved: ${formatPositionConfigLine(updated)}`,
+      messageId: active.messageId,
+    });
+    return true;
+  }
+
   if (awaiting === "address") {
     const address = extractPoolAddress(text);
     if (!address) {
@@ -2093,12 +2316,148 @@ export async function handleLpText(msg) {
 }
 
 
+// ─── Per-position actions (TP/SL · slippage · fees · rebalance · close) ──
+/**
+ * Re-read the live position snapshot and cache it on the session (each entry
+ * carries its own persisted config). Used when a button arrives for a list the
+ * session no longer has (e.g. the bot restarted between render and tap).
+ */
+async function refreshSessionPositions(session, { force = false } = {}) {
+  const { getMyPositions } = await import("../tools/dlmm.js");
+  const snapshot = await networkDeadline(getMyPositions({ force, silent: true }), "positions read");
+  const list = Array.isArray(snapshot?.positions) ? snapshot.positions : [];
+  session.positions = list.map((position) => ({
+    ...position,
+    config: getPositionConfig(position.position),
+  }));
+  return session.positions;
+}
+
+/** Resolve the position targeted by a `lp:pos*:<index>` callback. */
+async function resolvePositionTarget(session, index) {
+  const cached = Array.isArray(session.positions) ? session.positions[index] : null;
+  if (cached?.position) return cached;
+  try {
+    const list = await refreshSessionPositions(session);
+    return list[index] ?? null;
+  } catch (error) {
+    log("lp_ui_warn", `Position lookup failed: ${error.message}`);
+    return null;
+  }
+}
+
+/** Keep the session cache in sync after a config write. */
+function cachePositionConfig(session, index, position, config) {
+  const next = { ...position, config };
+  if (!Array.isArray(session.positions)) session.positions = [];
+  session.positions[index] = next;
+  return next;
+}
+
+/** Render the 🎯 TP/SL or ⚙️ Slippage sub-menu of one position. */
+async function showPositionSettingsView(msg, { kind = "tpsl", index = 0, note = null, messageId = null } = {}) {
+  const session = touch(getLpSession(msg));
+  const position = await resolvePositionTarget(session, index);
+  if (!position) {
+    await sendHTML("⚠️ That position is no longer open — refreshing the list.");
+    await showPositionsView(msg, { force: true, messageId: msg.messageId });
+    return;
+  }
+  const view = kind === "slippage"
+    ? renderPositionSlippageView({ position, index, note })
+    : renderPositionTpSlView({ position, index, note });
+  session.messageId = await presentMessage(view, messageId ?? msg.messageId);
+}
+
+/**
+ * Execute one 💸 / ⚖️ / 🔴 action on a single position and re-render the list.
+ *
+ * Close goes through `executeTool("close_position")` so the existing post-effects
+ * (notification, closed PnL card, base-token → SOL auto-swap) always run: closing
+ * from the menu is the same immediate exit + swap back to SOL as a rule close.
+ * Claim goes through `executeTool("claim_fees")` so the fee is removed from the
+ * position without closing it.
+ */
+async function runPositionAction(msg, { kind, index = 0 } = {}) {
+  const session = touch(getLpSession(msg));
+  const position = await resolvePositionTarget(session, index);
+  if (!position) {
+    await sendHTML("⚠️ That position is no longer open — refreshing the list.");
+    await showPositionsView(msg, { force: true, messageId: msg.messageId });
+    return;
+  }
+  if (session.positionBusy) {
+    await sendHTML("⏳ Another position action is still running — give it a moment.");
+    return;
+  }
+
+  const pair = position.pair || `#${index + 1}`;
+  session.positionBusy = true;
+  try {
+    if (kind === "claim") {
+      const { executeTool } = await import("../tools/executor.js");
+      const result = await executeTool("claim_fees", { position_address: position.position })
+        .catch((error) => ({ error: error.message }));
+      const ok = result?.success !== false && !result?.error && !result?.blocked;
+      const note = !ok
+        ? `Claim failed for ${pair}: ${result?.error || result?.reason || "unknown"}`
+        : result?.dry_run === true
+          ? `🧪 DRY RUN — would collect fees for ${pair}`
+          : `💸 Fees collected for ${pair}`;
+      await showPositionsView(msg, { force: true, messageId: msg.messageId, note });
+      return;
+    }
+
+    if (kind === "rebal") {
+      const { rebalancePosition } = await import("./positionActions.js");
+      const result = await rebalancePosition({
+        position_address: position.position,
+        position,
+        reason: "Manual rebalance (LP menu)",
+      }).catch((error) => ({ success: false, error: error.message }));
+      const note = result.success
+        ? result.dry_run === true
+          ? `🧪 DRY RUN — would rebalance ${pair} around the active bin`
+          : `⚖️ Rebalanced ${pair}` +
+            (result.new_position ? ` — new range around the active bin (${truncateAddress(result.new_position)})` : "")
+        : `Rebalance failed for ${pair}: ${result.error}${result.closed ? " (position is closed)" : ""}`;
+      await showPositionsView(msg, { force: true, messageId: msg.messageId, note });
+      return;
+    }
+
+    if (kind === "close") {
+      const { executeTool } = await import("../tools/executor.js");
+      const result = await executeTool("close_position", {
+        position_address: position.position,
+        reason: "Manual close (LP menu)",
+      }).catch((error) => ({ error: error.message }));
+      const ok = result?.success !== false && !result?.error && !result?.blocked;
+      const note = !ok
+        ? `Close failed for ${pair}: ${result?.error || result?.reason || "unknown"}`
+        : result?.dry_run === true
+          ? `🧪 DRY RUN — would close ${pair}`
+          : `🔴 ${pair} closed and swapped back to SOL` +
+            (result?.pnl_pct != null ? ` · PnL ${formatSignedPercent(result.pnl_pct)}` : "");
+      await showPositionsView(msg, { force: true, messageId: msg.messageId, note });
+      return;
+    }
+
+    await sendHTML("⚠️ Unknown position action.");
+  } finally {
+    session.positionBusy = false;
+  }
+}
+
 // ─── Callback router ──────────────────────────────────────────────
 export async function handleLpCallback(msg) {
   const raw = String(msg?.callbackData ?? msg?.text ?? "").trim();
   if (!raw.startsWith(CALLBACK_PREFIX)) return false;
 
-  const [action, arg] = raw.slice(CALLBACK_PREFIX.length).split(":");
+  // `lp:<action>:<arg>:<more…>` — the per-position buttons carry extra
+  // segments (`lp:posset:tp:10:0`), so the tail is kept as `parts`.
+  const parts = raw.slice(CALLBACK_PREFIX.length).split(":");
+  const action = parts[0];
+  const arg = parts[1];
   const session = touch(getLpSession(msg));
   const ack = (text = "") => answerCallbackQuery(msg.callbackQueryId, text).catch(() => {});
 
@@ -2158,6 +2517,101 @@ export async function handleLpCallback(msg) {
   if (action === "positions") {
     await ack(arg === "refresh" ? "Refreshing positions…" : "");
     await showPositionsView(msg, { force: arg === "refresh", messageId: msg.messageId });
+    return true;
+  }
+
+  // ─── Per-position controls (independent TP/SL · slippage · actions) ───
+  if (action === "postp" || action === "posslip") {
+    await ack();
+    // Opening a settings sub-menu (also the ⬅️ Back target of the ✏️ Custom
+    // prompt) ends any pending plain-text value.
+    session.awaiting = null;
+    session.pendingPosition = null;
+    await showPositionSettingsView(msg, {
+      kind: action === "posslip" ? "slippage" : "tpsl",
+      index: Number.parseInt(arg, 10) || 0,
+      messageId: msg.messageId,
+    });
+    return true;
+  }
+
+  if (action === "posset") {
+    // lp:posset:<tp|sl|slip|auto>:<value|custom>:<index>
+    const field = String(arg || "").toLowerCase();
+    const value = String(parts[2] ?? "");
+    const index = Number.parseInt(parts[3], 10) || 0;
+    const kind = field === "slip" ? "slippage" : "tpsl";
+    const target = await resolvePositionTarget(session, index);
+    if (!target) {
+      await ack("Position not found");
+      await showPositionsView(msg, { force: true, messageId: msg.messageId });
+      return true;
+    }
+
+    if (value === "custom") {
+      // Consumed by handleLpText — the session remembers WHICH position (and
+      // which field) the next plain-text message belongs to.
+      session.awaiting = field === "slip" ? "posslip" : field === "sl" ? "possl" : "postp";
+      session.pendingPosition = { index, address: target.position, field };
+      session.messageId = msg.messageId;
+      const prompt = field === "slip"
+        ? "Send the slippage tolerance, e.g. <code>2.5</code> or <code>15%</code> (max 50%)."
+        : field === "sl"
+          ? "Send the stop-loss %, e.g. <code>-25</code> or <code>-40%</code>."
+          : "Send the take-profit %, e.g. <code>7.5</code> or <code>12%</code>.";
+      await ack("Send the value");
+      session.messageId = await presentMessage(
+        {
+          text: [
+            "✏️ <b>Custom value</b>",
+            "",
+            `Pool: <b>${escapeHtml(target.pair || `#${index + 1}`)}</b>`,
+            "🧩 Applies to <b>this position only</b>.",
+            "",
+            prompt,
+            "",
+            "<i>Send /lp to cancel.</i>",
+          ].join("\n"),
+          keyboard: [[btn("⬅️ Back", `${kind === "slippage" ? "posslip" : "postp"}:${index}`)]],
+        },
+        msg.messageId,
+      );
+      return true;
+    }
+
+    const patch = field === "tp"
+      ? { tpPercent: Number(value) }
+      : field === "sl"
+        ? { slPercent: -Math.abs(Number(value)) }
+        : field === "slip"
+          ? { slippageBps: Number(value) }
+          : { autoRebalance: value === "1" || value === "true" };
+
+    // Only THIS position's config is written — other pools keep their values.
+    const updated = setPositionConfig(target.position, patch);
+    if (!updated) {
+      await ack("Position not tracked");
+      await showPositionsView(msg, { force: true, messageId: msg.messageId });
+      return true;
+    }
+    cachePositionConfig(session, index, target, updated);
+    await ack(`Saved for #${index + 1}`);
+    await showPositionSettingsView(msg, {
+      kind,
+      index,
+      note: "✅ Saved — this position only",
+      messageId: msg.messageId,
+    });
+    return true;
+  }
+
+  if (action === "posact") {
+    const kind = String(arg || "").toLowerCase();
+    const index = Number.parseInt(parts[2], 10) || 0;
+    await ack(
+      kind === "claim" ? "Collecting fees…" : kind === "rebal" ? "Rebalancing…" : "Closing…",
+    );
+    await runPositionAction(msg, { kind, index });
     return true;
   }
 

@@ -290,7 +290,7 @@ auto-swap on close (executor.js:610)
 | File | Shape | Mutated by |
 |---|---|---|
 | `user-config.json` | Flat keys (e.g. `minTvl`, `deployAmountSol`); nested `chartIndicators`. | `config.js` (load), `update_config` tool, `evolveThresholds`, setup wizard. **NEVER gitignored but you must `.gitignore` it locally** — README says so. |
-| `state.json` | `{ positions: { [address]: {position, pool, pool_name, strategy, bin_range, amount_sol, active_bin_at_deploy, deployed_at, out_of_range_since, last_claim_at, total_fees_claimed_usd, rebalance_count, closed, closed_at, notes, peak_pnl_pct, pending_*, trailing_active, instruction, _lastBriefingDate, recentEvents[]} }` | `state.js` |
+| `state.json` | `{ positions: { [address]: {position, pool, pool_name, strategy, bin_range, amount_sol, active_bin_at_deploy, config{tpPercent 5, slPercent -50, slippageBps 1000, autoRebalance false}, deployed_at, out_of_range_since, has_entered_range, last_claim_at, total_fees_claimed_usd, rebalance_count, last_rebalance_at, rebalanced_into, closed, closed_at, notes, peak_pnl_pct, pending_*, trailing_active, instruction, _lastBriefingDate, recentEvents[]} }` | `state.js` |
 | `lessons.json` | `{ lessons: [{id, rule, tags, outcome, sourceType, confidence, role, pinned, context, ...}], performance: [{position, pool, pnl_pct, pnl_usd, fees_earned_usd, range_efficiency, minutes_held, close_reason, signal_snapshot, ...}] }` | `lessons.js` |
 | `pool-memory.json` | `{ [poolAddress]: { name, base_mint, deploys[], total_deploys, avg_pnl_pct, win_rate, adjusted_win_rate, cooldown_until, base_mint_cooldown_until, notes[], snapshots[] } }` | `pool-memory.js` |
 | `decision-log.json` | `{ decisions: [{id, ts, type, actor, pool, summary, reason, risks[], metrics{}, rejected[]}] }` max 100 | `decision-log.js` (called from deploy/close/skip in `tools/dlmm.js`, `index.js`) |
@@ -406,7 +406,7 @@ npm run check                  # syntax + offline env audit + utils/rpc tests
 | `/pause` / `/resume` / `/stop` | index.js | Toggle cron jobs / graceful shutdown. |
 | Free-form chat | `agentLoop` with `agentType=GENERAL` | Intent-matched tool subset. |
 | `cfg:*` callback queries | `applySettingsMenuCallback` | Settings menu button presses. |
-| `lp:*` callback queries | `handleLpCallback` | LP menu button presses (pool select, amount, range, strategy, continue, deploy). |
+| `lp:*` callback queries | `handleLpCallback` | LP menu button presses (pool select, amount, range, strategy, continue, deploy) plus the per-position controls `lp:postp:<i>` (🎯 TP/SL), `lp:posslip:<i>` (⚙️ slippage), `lp:posset:<field>:<value>:<i>`, and `lp:posact:<claim\|rebal\|close>:<i>`. |
 | LP custom text input | `handleLpText` | Amount (`0.5`, `50%`), range (`-30 +40`) and pasted pool addresses — consumed before the busy queue. |
 
 **Auth** (`telegram.js#isAuthorizedIncomingMessage`):

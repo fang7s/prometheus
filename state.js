@@ -17,6 +17,165 @@ const STATE_FILE = repoPath("state.json");
 const MAX_RECENT_EVENTS = 20;
 const MAX_INSTRUCTION_LENGTH = 280;
 
+// ─── Per-position configuration ─────────────────────────────────
+/**
+ * Independent management parameters for ONE position. Every tracked position
+ * owns its own copy under `positions[address].config`, so changing TP/SL or
+ * slippage for the DIAMOND-SOL position never touches any other open position
+ * (nor the global `config.management` defaults).
+ *
+ * Defaults applied to every newly opened position:
+ *   TP +5.0 % · SL -50.0 % · Slippage 10 % (1000 BPS) · auto-rebalance off
+ */
+export const DEFAULT_POSITION_CONFIG = Object.freeze({
+  /** Take-profit threshold % — Priority 1 exit when total PnL >= +tpPercent. */
+  tpPercent: 5,
+  /** Stop-loss threshold % — Priority 1 exit when total PnL <= slPercent. */
+  slPercent: -50,
+  /** Deposit / withdraw slippage tolerance in BPS (1000 BPS = 10 %). */
+  slippageBps: 1000,
+  /** Close + redeploy around the active bin when the position drifts out of range. */
+  autoRebalance: false,
+});
+
+/** Accepted range for every per-position knob — anything unusable falls back. */
+export const POSITION_CONFIG_LIMITS = Object.freeze({
+  tpPercent: Object.freeze({ min: 0.1, max: 10_000 }),
+  slPercent: Object.freeze({ min: -100, max: -0.1 }),
+  slippageBps: Object.freeze({ min: 1, max: 5_000 }),
+});
+
+function clampConfigNumber(value, { min, max }) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  return Math.min(max, Math.max(min, n));
+}
+
+function roundConfigNumber(value, digits = 2) {
+  return Number(Number(value).toFixed(digits));
+}
+
+function configBoolOrNull(value) {
+  if (value == null) return null;
+  if (typeof value === "boolean") return value;
+  const raw = String(value).trim().toLowerCase();
+  if (!raw) return null;
+  if (/^(true|1|yes|on|enabled?)$/.test(raw)) return true;
+  if (/^(false|0|no|off|disabled?)$/.test(raw)) return false;
+  return null;
+}
+
+/** `base` with defaults applied, so a partial base still yields a full config. */
+function normalizeConfigBase(base) {
+  const source = base && typeof base === "object" ? base : {};
+  return {
+    tpPercent: Number.isFinite(Number(source.tpPercent)) ? Number(source.tpPercent) : DEFAULT_POSITION_CONFIG.tpPercent,
+    slPercent: Number.isFinite(Number(source.slPercent)) ? Number(source.slPercent) : DEFAULT_POSITION_CONFIG.slPercent,
+    slippageBps: Number.isFinite(Number(source.slippageBps)) ? Number(source.slippageBps) : DEFAULT_POSITION_CONFIG.slippageBps,
+    autoRebalance: typeof source.autoRebalance === "boolean" ? source.autoRebalance : DEFAULT_POSITION_CONFIG.autoRebalance,
+  };
+}
+
+/**
+ * Pure normalizer for a position config patch. Accepts camelCase and the
+ * snake_case variants found in older state.json records, fills every missing or
+ * unusable value from `base` (default-backed) and clamps the numbers so a bad
+ * input can never disable risk management.
+ *
+ * @param {object} patch - partial config from the UI / state.json
+ * @param {object} base - current config the patch is applied on top of
+ * @returns {{tpPercent:number, slPercent:number, slippageBps:number, autoRebalance:boolean}}
+ */
+export function normalizePositionConfig(patch = {}, base = DEFAULT_POSITION_CONFIG) {
+  const source = patch && typeof patch === "object" ? patch : {};
+  const fallback = normalizeConfigBase(base);
+
+  const rawTp = source.tpPercent ?? source.tp_percent ?? source.takeProfitPct ?? source.take_profit_pct;
+  const tpNumber = Number(rawTp);
+  const tp = Number.isFinite(tpNumber) && tpNumber > 0
+    ? clampConfigNumber(tpNumber, POSITION_CONFIG_LIMITS.tpPercent)
+    : null;
+
+  // Stop-loss is always stored as a negative %: a bare "30" means -30 %.
+  const rawSl = source.slPercent ?? source.sl_percent ?? source.stopLossPct ?? source.stop_loss_pct;
+  const slNumber = Number(rawSl);
+  const slCandidate = Number.isFinite(slNumber) && slNumber !== 0
+    ? clampConfigNumber(slNumber > 0 ? -slNumber : slNumber, POSITION_CONFIG_LIMITS.slPercent)
+    : null;
+
+  // Slippage may arrive as BPS (1000) or as a percentage (10 %).
+  const rawSlip = source.slippageBps ?? source.slippage_bps ?? source.slippage;
+  const slipNumber = Number(rawSlip);
+  let slip = Number.isFinite(slipNumber) && slipNumber > 0
+    ? clampConfigNumber(slipNumber, POSITION_CONFIG_LIMITS.slippageBps)
+    : null;
+  if (slip == null) {
+    const pct = Number(source.slippagePct ?? source.slippage_pct);
+    if (Number.isFinite(pct) && pct > 0) slip = clampConfigNumber(pct * 100, POSITION_CONFIG_LIMITS.slippageBps);
+  }
+
+  const autoRebalance = configBoolOrNull(source.autoRebalance ?? source.auto_rebalance)
+    ?? fallback.autoRebalance;
+
+  return {
+    tpPercent: roundConfigNumber(tp ?? fallback.tpPercent),
+    slPercent: roundConfigNumber(slCandidate ?? fallback.slPercent),
+    slippageBps: Math.round(slip ?? fallback.slippageBps),
+    autoRebalance,
+  };
+}
+
+/**
+ * Complete config for a persisted position record. Records written before
+ * per-position configs existed simply resolve to the defaults.
+ */
+export function resolvePositionConfig(record = null) {
+  return normalizePositionConfig(record?.config ?? record?.position_config ?? {});
+}
+
+/**
+ * Config of one position, addressed by its position account (`positionAddress`).
+ * Unknown positions resolve to the defaults so callers never see `undefined`.
+ */
+export function getPositionConfig(position_address) {
+  const state = load();
+  return resolvePositionConfig(state.positions?.[position_address] ?? null);
+}
+
+/**
+ * Persist an independent config change for ONE position. Only the supplied keys
+ * change — every other position keeps its own values and the global defaults are
+ * never written. Returns the merged config, or null when the position is
+ * unknown (e.g. it was already closed and pruned).
+ *
+ * @param {string} position_address - position account address
+ * @param {object} patch - e.g. `{ tpPercent: 10 }`, `{ slippageBps: 300 }`
+ * @returns {object|null}
+ */
+export function setPositionConfig(position_address, patch = {}) {
+  const state = load();
+  const pos = state.positions?.[position_address];
+  if (!pos) {
+    log("state", `Cannot update config — position ${position_address} is not tracked`);
+    return null;
+  }
+  const base = resolvePositionConfig(pos);
+  const next = normalizePositionConfig(patch, base);
+  const changed = Object.keys(next).some((key) => next[key] !== base[key]);
+  pos.config = next;
+  if (changed) {
+    pushEvent(state, {
+      action: "position_config",
+      position: position_address,
+      pool_name: pos.pool_name || pos.pool,
+      config: next,
+    });
+    log("state", `Position ${position_address} config → ${JSON.stringify(next)}`);
+  }
+  save(state);
+  return next;
+}
+
 function sanitizeStoredText(text, maxLen = MAX_INSTRUCTION_LENGTH) {
   if (text == null) return null;
   const cleaned = String(text)
@@ -73,6 +232,7 @@ export function trackPosition({
   entry_tvl = null,
   entry_volume = null,
   entry_holders = null,
+  config = null,
 }) {
   const state = load();
   state.positions[position] = {
@@ -80,6 +240,10 @@ export function trackPosition({
     pool,
     pool_name,
     strategy,
+    // Independent per-position management settings. A brand-new position always
+    // starts from the defaults (TP +5 % / SL -50 % / 1000 BPS slippage / no
+    // auto-rebalance) unless the caller (e.g. a rebalance) inherits a config.
+    config: normalizePositionConfig(config ?? {}),
     bin_range,
     amount_sol,
     amount_x,
@@ -202,6 +366,37 @@ export function recordClaim(position_address, fees_usd) {
   pos.total_fees_claimed_usd = (pos.total_fees_claimed_usd || 0) + (fees_usd || 0);
   pos.notes.push(`Claimed ~$${fees_usd?.toFixed(2) || "?"} fees at ${pos.last_claim_at}`);
   save(state);
+}
+
+/**
+ * Record a rebalance (close + redeploy around the active bin) for one position.
+ * The tracked record belongs to the OLD position account, which is already
+ * marked closed by `closePosition()` — the counter and the note still land on
+ * it so the history stays auditable, and `rebalanced_into` points at the fresh
+ * position account.
+ *
+ * @param {string} position_address - position account that was rebalanced
+ * @param {{reason?: string|null, new_position?: string|null}} [details]
+ * @returns {boolean} true when the position was tracked
+ */
+export function recordRebalance(position_address, { reason = null, new_position = null } = {}) {
+  const state = load();
+  const pos = state.positions?.[position_address];
+  if (!pos) return false;
+  pos.rebalance_count = (pos.rebalance_count || 0) + 1;
+  pos.last_rebalance_at = new Date().toISOString();
+  if (new_position) pos.rebalanced_into = new_position;
+  pos.notes.push(`Rebalanced at ${pos.last_rebalance_at}${reason ? `: ${reason}` : ""}`);
+  pushEvent(state, {
+    action: "rebalance",
+    position: position_address,
+    pool_name: pos.pool_name || pos.pool,
+    reason,
+    new_position,
+  });
+  save(state);
+  log("state", `Position ${position_address} rebalanced${new_position ? ` into ${new_position}` : ""}`);
+  return true;
 }
 
 /**
@@ -377,6 +572,8 @@ export function getStateSummary() {
       initial_fee_tvl_24h: p.initial_fee_tvl_24h,
       rebalance_count: p.rebalance_count,
       instruction: p.instruction || null,
+      // Independent per-position management settings (defaults if absent).
+      config: resolvePositionConfig(p),
     })),
     last_updated: state.lastUpdated,
     recent_events: (state.recentEvents || []).slice(-10),

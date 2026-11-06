@@ -11,8 +11,12 @@
  *
  *   Priority 1 — Hard TP / SL
  *     Total PnL % (unrealized value + claimable/claimed fees vs the initial
- *     deposit — see `resolveTotalPnlPct()`) against
- *     `config.management.takeProfitPct` / `stopLossPct`.
+ *     deposit — see `resolveTotalPnlPct()`) against THIS position's own
+ *     `config.tpPercent` / `config.slPercent` from state.json (defaults
+ *     +5 % / -50 % when the record carries no config, so legacy positions and
+ *     other pools are unaffected — see `resolvePositionConfig()`).
+ *     `config.management.takeProfitPct` / `stopLossPct` remain the fallback the
+ *     caller passes in and are overridden per position.
  *     A trailing take-profit (armed peak → drop) belongs to the same family.
  *   Priority 2 — Range out
  *     the active bin has moved FAR above or FAR below the position's outer bounds
@@ -35,7 +39,7 @@
  */
 
 import { log } from "./logger.js";
-import { getTrackedPosition, refreshPositionState } from "./state.js";
+import { getTrackedPosition, refreshPositionState, resolvePositionConfig } from "./state.js";
 import { monitorPosition } from "./services/positionMonitor.js";
 
 /** The two automatic exit priorities, in strict evaluation order. */
@@ -399,7 +403,16 @@ export function detectExit(position, managementConfig = {}) {
   const trackedBefore = getTrackedPosition(position.position);
   const overrides = parseInstructionOverrides(trackedBefore?.instruction);
 
-  const cfg = { ...managementConfig };
+  // Independent per-position TP/SL: this position's own persisted config wins
+  // over the global `config.management` defaults (which are only a fallback for
+  // records written before per-position configs existed). Editing TP/SL on one
+  // pool therefore never changes the exit thresholds of another position.
+  const positionConfig = resolvePositionConfig(trackedBefore);
+  const cfg = {
+    ...managementConfig,
+    takeProfitPct: positionConfig.tpPercent,
+    stopLossPct: positionConfig.slPercent,
+  };
   const applied = {};
   for (const [key, value] of Object.entries(overrides)) {
     if (value == null || !Number.isFinite(value)) continue;

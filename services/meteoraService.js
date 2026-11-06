@@ -885,6 +885,9 @@ async function openStrategyLeg({ pool, wallet, connection, sdk, leg, range, slip
  * @param {boolean} [params.track]          Persist to state.json for exit management.
  * @param {object} [params.meta]            Extra screening metadata for tracking/decision log.
  * @param {string} [params.source]          Decision-log actor tag.
+ * @param {object} [params.config]          Independent per-position config (TP/SL/slippage/
+ *                                          auto-rebalance) persisted for the new position.
+ *                                          Omitted → state.js defaults.
  */
 export async function openDlmmPosition({
   poolAddress,
@@ -901,6 +904,7 @@ export async function openDlmmPosition({
   track = true,
   meta = {},
   source = "TELEGRAM_LP_UI",
+  config: positionConfig = null,
 }) {
   const isDryRun = Boolean(dryRun);
   if (!isDryRun && process.env.ENABLE_LIVE_TRADING !== "true") {
@@ -1032,6 +1036,9 @@ export async function openDlmmPosition({
         amount_x: Number((xLeg.toNumber() / 10 ** snapshot.tokenXDecimals).toFixed(6)),
         active_bin: snapshot.activeBinId,
         initial_value_usd: meta.initial_value_usd ?? null,
+        // Per-position management config. Omitted → state.js applies the
+        // defaults (TP +5 % / SL -50 % / 1000 BPS slippage / no auto-rebalance).
+        config: positionConfig,
       });
     }
   }
