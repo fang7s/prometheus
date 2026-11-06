@@ -6,7 +6,15 @@ import { isTimeoutError } from "./utils/timeout.js";
 // real transport cause (ENOTFOUND / ECONNREFUSED / ETIMEDOUT / CERT_*) inside
 // `error.cause`, so every log line used to read "fetch failed" with no clue
 // whether DNS, the network, TLS or the token was at fault.
-import { describeTelegramError, resolveTelegramApiBase } from "./utils/telegramNet.js";
+// `TELEGRAM_HTTP_TIMEOUT_MS` is the shared 15 s Bot API deadline and
+// `isTransientTelegramError` classifies timeout / AbortError / ETIMEDOUT
+// failures so UI edits can retry once instead of dying on a stale card.
+import {
+  TELEGRAM_HTTP_TIMEOUT_MS,
+  describeTelegramError,
+  isTransientTelegramError,
+  resolveTelegramApiBase,
+} from "./utils/telegramNet.js";
 // Pure, synchronous layout helpers (tree branches, dividers, progress bars,
 // monospace blocks). No I/O, no imports of its own — so no import cycle with
 // `services/lp-menu.js` (which imports this module).
@@ -15,8 +23,14 @@ import { formatOutOfRangeAlert } from "./services/telegramFormat.js";
 const USER_CONFIG_PATH = repoPath("user-config.json");
 
 // ─── Resiliency knobs ────────────────────────────────────────────
-/** Outbound Bot API calls (sendMessage/edit/answer) never hang longer than this. */
-const TELEGRAM_HTTP_TIMEOUT_MS = 15_000;
+// Every outbound Bot API call (sendMessage / editMessageText /
+// answerCallbackQuery) is bounded by the shared 15 s deadline
+// `TELEGRAM_HTTP_TIMEOUT_MS` (imported above), applied inside `telegramFetch` —
+// no call site can fall back to Node's short defaults any more.
+/** Media uploads (multipart photo bodies) get a doubled, still-bounded ceiling. */
+const TELEGRAM_UPLOAD_TIMEOUT_MS = TELEGRAM_HTTP_TIMEOUT_MS * 2;
+/** A timed-out inline-keyboard edit is retried once after this delay (500 ms). */
+const TELEGRAM_UI_RETRY_DELAY_MS = 500;
 /** getUpdates long-poll window. The server holds the request for 30 s. */
 const POLL_WINDOW_TIMEOUT_MS = 40_000;
 /** Exponential backoff for polling failures (fetch failed / TELEGRAM_ERROR). */
@@ -24,8 +38,8 @@ const POLL_BACKOFF_BASE_MS = 1_000;
 const POLL_BACKOFF_MAX_MS = 60_000;
 /** A handler slower than this is reported (it no longer blocks the poll loop). */
 const SLOW_HANDLER_WARN_MS = 5_000;
-/** Startup reachability probe deadline (getMe). */
-const STARTUP_PROBE_TIMEOUT_MS = 8_000;
+/** Startup reachability probe (getMe) — same 15 s ceiling as every other call. */
+const STARTUP_PROBE_TIMEOUT_MS = TELEGRAM_HTTP_TIMEOUT_MS;
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN || null;
 /**
@@ -139,56 +153,120 @@ export function isEnabled() {
 /**
  * `fetch` with a hard deadline. `AbortSignal.timeout` aborts the socket, so a
  * stalled Bot API connection can never wedge the caller.
+ *
+ * EVERY request to `TELEGRAM_API_BASE` goes through here with the shared 15 s
+ * `TELEGRAM_HTTP_TIMEOUT_MS` ceiling (long polling and media uploads opt into a
+ * longer, still-bounded window — see the call sites).
  */
 async function telegramFetch(url, { timeoutMs = TELEGRAM_HTTP_TIMEOUT_MS, ...init } = {}) {
-  return fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+  // Never shorter than the shared 15 s Bot API deadline: callers may only extend
+  // it (long polling 40 s, media uploads 30 s), never fall back to a short one.
+  const deadlineMs = Math.max(TELEGRAM_HTTP_TIMEOUT_MS, Number(timeoutMs) || 0);
+  return fetch(url, { ...init, signal: AbortSignal.timeout(deadlineMs) });
+}
+
+/**
+ * One Bot API request. Transport failures (including the 15 s
+ * `AbortSignal.timeout` abort) are re-thrown so the caller decides whether to
+ * retry; HTTP-level failures are returned as `{ ok: false }` with the body.
+ *
+ * @returns {Promise<{ok: boolean, data: object|null, status: number, errorText: string}>}
+ */
+async function requestTelegram(method, { json = null, form = null, timeoutMs = TELEGRAM_HTTP_TIMEOUT_MS } = {}) {
+  const init = { method: "POST", timeoutMs };
+  if (form) {
+    init.body = form;
+  } else {
+    init.headers = { "Content-Type": "application/json" };
+    init.body = JSON.stringify(json ?? {});
+  }
+  const res = await telegramFetch(`${BASE}/${method}`, init);
+  if (!res.ok) {
+    const errorText = await res.text().catch(() => "");
+    return { ok: false, data: null, status: res.status, errorText: String(errorText || "").slice(0, 200) };
+  }
+  return { ok: true, data: await res.json(), status: res.status, errorText: "" };
+}
+
+/** Log a Bot API HTTP failure (401 = bad/encrypted token, everything else = API). */
+function logTelegramHttpFailure(method, status, errorText, { ui = false } = {}) {
+  if (status === 401) {
+    log("telegram_error", `${method} 401 Unauthorized — check TELEGRAM_BOT_TOKEN in .env (invalid, revoked, or encrypted without .envrypt key)`);
+    return;
+  }
+  // UI edits are cosmetic: "message is not modified" / a deleted message is
+  // routine, so they are reported as warnings instead of errors.
+  log(ui ? "telegram_warn" : "telegram_error", `${method} ${status}: ${String(errorText || "").slice(0, 200)}`);
 }
 
 async function postTelegram(method, body) {
   if (!TOKEN || !chatId) return null;
   try {
-    const res = await telegramFetch(`${BASE}/${method}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, ...body }),
-    });
-    if (!res.ok) {
-      const err = await res.text();
-      if (res.status === 401) {
-        log("telegram_error", `${method} 401 Unauthorized — check TELEGRAM_BOT_TOKEN in .env (invalid, revoked, or encrypted without .envrypt key)`);
-      } else {
-        log("telegram_error", `${method} ${res.status}: ${err.slice(0, 200)}`);
-      }
+    const result = await requestTelegram(method, { json: { chat_id: chatId, ...body } });
+    if (!result.ok) {
+      logTelegramHttpFailure(method, result.status, result.errorText);
       return null;
     }
-    return await res.json();
+    return result.data;
   } catch (e) {
     log("telegram_error", `${method} failed: ${describeTelegramError(e)}`);
     return null;
   }
 }
 
-async function postTelegramRaw(method, body) {
+/**
+ * Bot API call for UI MUTATIONS — `editMessageText`, `editMessageMedia` and
+ * `answerCallbackQuery`.
+ *
+ * A timed-out edit is cosmetic: the card on screen simply keeps its previous
+ * text/keyboard, and the handler that already ran must not be disturbed. So a
+ * transient transport failure (`AbortError`, `TimeoutError` from
+ * `AbortSignal.timeout`, `ETIMEDOUT`, a socket reset …) is retried ONCE silently
+ * after {@link TELEGRAM_UI_RETRY_DELAY_MS} (500 ms); only when the retry fails too
+ * is anything logged — as a warning, never an error — and the caller gets `null`
+ * so it can fall back to a fresh send. This function never throws.
+ *
+ * @param {string} method - Bot API method name
+ * @param {object} [options]
+ * @param {object|null} [options.json] - JSON body (already includes chat_id)
+ * @param {FormData|null} [options.form] - multipart body (media edits)
+ * @param {number} [options.timeoutMs] - per-attempt deadline (default 15 s)
+ * @param {number} [options.retries] - silent retries for transient failures (default 1)
+ * @returns {Promise<object|null>} parsed Bot API response, or null on failure
+ */
+async function postTelegramUi(method, {
+  json = null,
+  form = null,
+  timeoutMs = TELEGRAM_HTTP_TIMEOUT_MS,
+  retries = 1,
+} = {}) {
   if (!TOKEN) return null;
-  try {
-    const res = await telegramFetch(`${BASE}/${method}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) {
-      const err = await res.text();
-      if (res.status === 401) {
-        log("telegram_error", `${method} 401 Unauthorized — check TELEGRAM_BOT_TOKEN in .env (invalid, revoked, or encrypted without .envrypt key)`);
+  let attempts = 0;
+  for (;;) {
+    try {
+      const result = await requestTelegram(method, { json, form, timeoutMs });
+      if (result.ok) return result.data;
+      logTelegramHttpFailure(method, result.status, result.errorText, { ui: true });
+      return null;
+    } catch (e) {
+      const transient = isTransientTelegramError(e);
+      if (transient && attempts < retries) {
+        // Silent retry: the first timeout is expected network noise, not an error.
+        attempts += 1;
+        await sleep(TELEGRAM_UI_RETRY_DELAY_MS);
+        continue;
+      }
+      if (transient) {
+        log(
+          "telegram_warn",
+          `${method} unavailable after ${attempts + 1} attempt(s) at ${timeoutMs}ms — ${describeTelegramError(e)} ` +
+          "— UI state kept as-is (the card keeps its previous content)",
+        );
       } else {
-        log("telegram_error", `${method} ${res.status}: ${err.slice(0, 200)}`);
+        log("telegram_error", `${method} failed: ${describeTelegramError(e)}`);
       }
       return null;
     }
-    return await res.json();
-  } catch (e) {
-    log("telegram_error", `${method} failed: ${describeTelegramError(e)}`);
-    return null;
   }
 }
 
@@ -212,18 +290,26 @@ export async function sendHTML(html) {
 
 export async function editMessage(text, messageId) {
   if (!TOKEN || !chatId || !messageId) return null;
-  return postTelegram("editMessageText", {
-    message_id: messageId,
-    text: String(text).slice(0, 4096),
+  // UI mutation: 15 s deadline + one silent retry on a transient timeout.
+  return postTelegramUi("editMessageText", {
+    json: {
+      chat_id: chatId,
+      message_id: messageId,
+      text: String(text).slice(0, 4096),
+    },
   });
 }
 
 export async function editMessageWithButtons(text, messageId, inlineKeyboard) {
   if (!TOKEN || !chatId || !messageId) return null;
-  return postTelegram("editMessageText", {
-    message_id: messageId,
-    text: String(text).slice(0, 4096),
-    reply_markup: { inline_keyboard: inlineKeyboard },
+  // UI mutation: 15 s deadline + one silent retry on a transient timeout.
+  return postTelegramUi("editMessageText", {
+    json: {
+      chat_id: chatId,
+      message_id: messageId,
+      text: String(text).slice(0, 4096),
+      reply_markup: { inline_keyboard: inlineKeyboard },
+    },
   });
 }
 
@@ -248,11 +334,15 @@ export async function sendHTMLWithButtons(html, inlineKeyboard) {
  */
 export async function editHTMLWithButtons(html, messageId, inlineKeyboard) {
   if (!TOKEN || !chatId || !messageId) return null;
-  return postTelegram("editMessageText", {
-    message_id: messageId,
-    text: String(html).slice(0, 4096),
-    parse_mode: "HTML",
-    reply_markup: { inline_keyboard: inlineKeyboard },
+  // UI mutation: 15 s deadline + one silent retry on a transient timeout.
+  return postTelegramUi("editMessageText", {
+    json: {
+      chat_id: chatId,
+      message_id: messageId,
+      text: String(html).slice(0, 4096),
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: inlineKeyboard },
+    },
   });
 }
 
@@ -280,9 +370,14 @@ function claimCallbackAnswer(callbackQueryId) {
 export async function answerCallbackQuery(callbackQueryId, text = "") {
   if (!TOKEN || !callbackQueryId) return null;
   if (!claimCallbackAnswer(callbackQueryId)) return null;
-  return postTelegramRaw("answerCallbackQuery", {
-    callback_query_id: callbackQueryId,
-    ...(text ? { text: String(text).slice(0, 200) } : {}),
+  // UI mutation: a dropped ack only leaves the button spinner running until
+  // Telegram clears it, so a transient timeout is retried once and then ignored
+  // (warn level) — it must never throw into the callback handler.
+  return postTelegramUi("answerCallbackQuery", {
+    json: {
+      callback_query_id: callbackQueryId,
+      ...(text ? { text: String(text).slice(0, 200) } : {}),
+    },
   });
 }
 
@@ -291,22 +386,16 @@ async function postTelegramMultipart(method, form) {
   if (!TOKEN || !chatId) return null;
   if (typeof FormData === "undefined" || typeof Blob === "undefined") return null;
   try {
-    const res = await telegramFetch(`${BASE}/${method}`, {
-      method: "POST",
-      body: form,
-      // Photo uploads are slower than JSON calls.
-      timeoutMs: TELEGRAM_HTTP_TIMEOUT_MS * 2,
+    const result = await requestTelegram(method, {
+      form,
+      // Photo uploads are slower than JSON calls: still bounded, just not 15 s.
+      timeoutMs: TELEGRAM_UPLOAD_TIMEOUT_MS,
     });
-    if (!res.ok) {
-      const err = await res.text();
-      if (res.status === 401) {
-        log("telegram_error", `${method} 401 Unauthorized — check TELEGRAM_BOT_TOKEN in .env (invalid, revoked, or encrypted without .envrypt key)`);
-      } else {
-        log("telegram_error", `${method} ${res.status}: ${err.slice(0, 200)}`);
-      }
+    if (!result.ok) {
+      logTelegramHttpFailure(method, result.status, result.errorText);
       return null;
     }
-    return await res.json();
+    return result.data;
   } catch (e) {
     log("telegram_error", `${method} failed: ${describeTelegramError(e)}`);
     return null;
@@ -351,7 +440,9 @@ export async function editPhotoWithCaption(html, messageId, pngBuffer, inlineKey
   }
   form.append("media", JSON.stringify(media));
   form.append("chart.png", new Blob([pngBuffer], { type: "image/png" }), "chart.png");
-  const res = await postTelegramMultipart("editMessageMedia", form);
+  // UI mutation (media edit): 15 s deadline + one silent retry on a transient
+  // timeout, so a slow upload can never leave the chart view half-updated.
+  const res = await postTelegramUi("editMessageMedia", { form });
   return res?.result?.message_id ?? (res ? messageId : null);
 }
 

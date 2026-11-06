@@ -29,6 +29,7 @@ import net from "node:net";
 import tls from "node:tls";
 import "../envcrypt.js"; // loads .env (and decrypts envrypt values) before anything reads process.env
 import {
+  TELEGRAM_HTTP_TIMEOUT_MS,
   describeTelegramError,
   maskBotToken,
   parseApiBaseTarget,
@@ -40,10 +41,12 @@ import {
 const argv = new Set(process.argv.slice(2));
 const OFFLINE = argv.has("--offline");
 const JSON_OUTPUT = argv.has("--json");
+// Mirrors the production Bot API deadline (15 s) so a probe failure here means
+// the bot itself would fail too. Override with `--timeout=<ms>`.
 const TIMEOUT_MS = (() => {
   const raw = [...argv].find((arg) => arg.startsWith("--timeout="));
   const value = Number(raw?.split("=")[1]);
-  return Number.isFinite(value) && value >= 1_000 ? value : 8_000;
+  return Number.isFinite(value) && value >= 1_000 ? value : TELEGRAM_HTTP_TIMEOUT_MS;
 })();
 
 function say(line = "") {

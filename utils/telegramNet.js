@@ -16,6 +16,20 @@
 /** Bot API origin used when `TELEGRAM_API_BASE` is unset. */
 export const DEFAULT_TELEGRAM_API_BASE = "https://api.telegram.org";
 
+/**
+ * Deadline for every non-polling Bot API request (`sendMessage`,
+ * `editMessageText`, `answerCallbackQuery`, media edits …) — 15 s.
+ *
+ * The budget is deliberately generous: inline-keyboard taps used to die with
+ * `timed out (no response from the Bot API)` when Telegram's gateway or an
+ * intermediate relay was slow, leaving the user on a stale card even though the
+ * handler had already finished. `editMessageText` in particular now retries once
+ * after this deadline expires (see `telegram.js#postTelegramUi`).
+ *
+ * `getUpdates` is the single exception: long polling keeps its own 40 s window.
+ */
+export const TELEGRAM_HTTP_TIMEOUT_MS = 15_000;
+
 const DEFAULT_PORTS = { "https:": 443, "http:": 80 };
 
 /**
@@ -126,6 +140,55 @@ export function telegramErrorDetails(error) {
   const ordered = [...codes].sort((a, b) => rank(a) - rank(b));
 
   return { codes: ordered, endpoints };
+}
+
+/**
+ * Transport codes that mean "no usable response" — the socket timed out, the
+ * request was aborted at its deadline, or the connection died mid-flight.
+ * Every Bot API edit/ack is idempotent, so these can be retried safely.
+ */
+export const TELEGRAM_TRANSIENT_CODES = Object.freeze([
+  "ETIMEDOUT",
+  "ABORT_ERR",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_BODY_TIMEOUT",
+  "UND_ERR_SOCKET",
+  "UND_ERR_CLOSED",
+  "ECONNRESET",
+  "EPIPE",
+]);
+
+/** `AbortSignal.timeout()` / classic abort error names. */
+const TRANSIENT_ERROR_NAMES = Object.freeze(["TimeoutError", "AbortError"]);
+
+/**
+ * True when a Bot API failure is transient — a timeout (`AbortSignal.timeout()`
+ * surfaces as a DOMException named `TimeoutError`), an `AbortError`, `ETIMEDOUT`
+ * or a socket that died mid-request.
+ *
+ * Such failures must never break the active UI: `telegram.js` retries UI edits
+ * once and then logs a warning instead of tearing the view down. Pure and
+ * offline-testable — accepts the raw undici `TypeError("fetch failed")` (the real
+ * code lives on `error.cause`, sometimes inside an `AggregateError`).
+ */
+export function isTransientTelegramError(error) {
+  if (!error) return false;
+
+  let transientByName = false;
+  const walk = (err, depth = 0) => {
+    if (!err || depth > 5 || typeof err !== "object") return;
+    if (!transientByName && TRANSIENT_ERROR_NAMES.includes(String(err.name || ""))) {
+      transientByName = true;
+    }
+    for (const nested of Array.isArray(err.errors) ? err.errors : []) walk(nested, depth + 1);
+    walk(err.cause, depth + 1);
+  };
+  walk(error);
+  if (transientByName) return true;
+
+  const { codes } = telegramErrorDetails(error);
+  return codes.some((code) => TELEGRAM_TRANSIENT_CODES.includes(code));
 }
 
 /**
