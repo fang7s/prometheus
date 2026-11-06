@@ -1113,7 +1113,16 @@ export function buildPositionsKeyboard(positions = []) {
   return rows;
 }
 
-export function renderPositions({ positions = [], wallet = null, note = null, mode = null } = {}) {
+/**
+ * 📊 My Positions card — THE single position-management renderer.
+ *
+ * Both entry points use it, with no layout divergence:
+ *   - `/start` → 📊 My Positions  (`lp:positions` callback)
+ *   - the `/positions` command    (`index.js#telegramHandler`)
+ *
+ * `renderPositions` is kept as an alias for existing imports/tests.
+ */
+export function renderPositionsView({ positions = [], wallet = null, note = null, mode = null } = {}) {
   const list = Array.isArray(positions) ? positions : [];
   const unit = currencyMode({ mode });
   const maxPositions = Number(config.risk?.maxPositions ?? 0);
@@ -1150,6 +1159,14 @@ export function renderPositions({ positions = [], wallet = null, note = null, mo
     keyboard,
   };
 }
+
+/**
+ * Legacy alias of {@link renderPositionsView} — same card, same
+ * `buildPositionsKeyboard()` inline controls. Kept so existing imports/tests
+ * keep working while every entry point (`/start` hub *and* `/positions`) renders
+ * the unified position-management view.
+ */
+export const renderPositions = renderPositionsView;
 
 // ─── Per-position settings sub-views ──────────────────────────────
 /** Shared header of the 🎯 TP/SL and ⚙️ Slippage sub-menus. */
@@ -1434,7 +1451,7 @@ export function renderHelpView() {
       "═══════════════════════",
       "<b>Dashboard</b>",
       "• 💧 New LP Position — screening list, paste a pool address or a token CA",
-      "• 📊 My Positions — open DLMM positions with live PnL / unclaimed fees",
+      "• 📊 My Positions — manage open positions (TP/SL · slippage · claim · rebalance · close)",
       "• 🔥 Top Trending — pools ranked by 24h volume",
       "• 💰 Balance — SOL / USDC / USDT + SPL tokens",
       "• 📅 Profit Calendar — closed-position PnL history",
@@ -1443,7 +1460,7 @@ export function renderHelpView() {
       "<b>Commands</b>",
       "/lp — this dashboard",
       "/lp &lt;token mint | pool address&gt; — every DLMM pair for a token",
-      "/positions — plain-text position list",
+      "/positions — the same 📊 My Positions card as /start (live controls)",
       "/close &lt;n&gt; · /closeall — close positions",
       "/settings — config menu · /help — command list",
       "",
@@ -1776,7 +1793,8 @@ export async function showPositionsView(msg, { force = false, messageId = null, 
   // Cache the rendered order: `lp:pos*:<index>` callbacks resolve through it.
   session.positions = positions;
   const wallet = await getWalletSnapshot();
-  return presentHubView(msg, renderPositions({ positions, wallet, note }), { messageId });
+  // ONE renderer for `/start → 📊 My Positions` and the `/positions` command.
+  return presentHubView(msg, renderPositionsView({ positions, wallet, note }), { messageId });
 }
 
 /** 💰 Balance — full SOL / USDC / USDT + SPL token breakdown. */

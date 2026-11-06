@@ -755,7 +755,7 @@ const BOT_COMMANDS = [
   { command: "help",       description: "Show commands" },
   { command: "status",     description: "Wallet + positions snapshot" },
   { command: "wallet",     description: "Wallet, deploy amount, HiveMind status" },
-  { command: "positions",  description: "List open positions" },
+  { command: "positions",  description: "Manage positions — TP/SL · slippage · claim · rebalance" },
   { command: "pool",       description: "Run AI screening, or /pool <n> for position detail" },
   { command: "close",      description: "Close one position by index" },
   { command: "closeall",   description: "Close all open positions" },
@@ -917,10 +917,10 @@ export async function notifySwap({ inputSymbol, outputSymbol, amountIn, amountOu
 }
 
 /**
- * Management-cycle range alert, rendered in the same structured tree layout as
- * `/positions`. `position` is the in-memory snapshot the management cycle
- * already holds — passing it adds the range bar, PnL and value rows without a
- * single extra RPC/API read.
+ * Management-cycle range alert, rendered in the structured tree layout of
+ * `services/telegramFormat.js#formatOutOfRangeAlert`. `position` is the
+ * in-memory snapshot the management cycle already holds — passing it adds the
+ * range bar, PnL and value rows without a single extra RPC/API read.
  */
 export async function notifyOutOfRange({
   pair = null,

@@ -13,6 +13,7 @@ import {
   buildDashboardKeyboard,
   buildHubKeyboard,
   buildNewPositionKeyboard,
+  buildPositionsKeyboard,
   buildQuickTokenPicks,
   buildTokenPoolsKeyboard,
   buildTrendingKeyboard,
@@ -51,6 +52,7 @@ import {
   renderMainMenu,
   renderNewPositionView,
   renderPositions,
+  renderPositionsView,
   renderProfitCalendar,
   renderRangeBar,
   renderReferralsView,
@@ -2207,7 +2209,60 @@ test("out-of-range alerts reuse the same tree layout", () => {
   assert.match(minimal, /Monitoring — no action taken yet/);
 });
 
-test("management cycle and /positions share the pure tree helpers", () => {
+test("/positions and /start → My Positions share ONE renderer and keyboard", () => {
+  const positions = [
+    {
+      position: "Pos1111111111111111111111111111111111111111",
+      pair: "DIAMOND/SOL",
+      in_range: true,
+      total_value_usd: 52.4,
+      pnl_usd: 4.2,
+      pnl_pct: 8.1,
+      unclaimed_fees_usd: 1.15,
+    },
+  ];
+
+  // Canonical name and the legacy alias render the identical card.
+  const view = renderPositionsView({ positions, mode: "USD" });
+  assert.deepEqual(view, renderPositions({ positions, mode: "USD" }));
+
+  // …with the per-position settings line and the dynamic control keyboard.
+  assert.match(view.text, /⚙️ Settings: TP \+5% \| SL -50% \| Slip 10%/);
+  assert.deepEqual(view.keyboard, buildPositionsKeyboard(positions));
+  const callbacks = view.keyboard.flat().map((button) => button.callback_data);
+  for (const expected of [
+    "lp:postp:0",
+    "lp:posslip:0",
+    "lp:posact:claim:0",
+    "lp:posact:rebal:0",
+    "lp:posact:close:0",
+    "lp:positions:refresh",
+    "lp:main",
+  ]) {
+    assert.ok(callbacks.includes(expected), `missing ${expected}`);
+  }
+
+  // `/positions` (index.js) routes to the shared view and no longer renders the
+  // legacy tree/ASCII layout.
+  const indexSrc = fs.readFileSync(path.join(ROOT, "index.js"), "utf8");
+  const positionsHandler = indexSrc.slice(
+    indexSrc.indexOf('if (text === "/positions")'),
+    indexSrc.indexOf("// /pool (no argument)"),
+  );
+  assert.match(positionsHandler, /showPositionsView\(/, "/positions must open the shared view");
+  assert.equal(
+    /formatOpenPositionsMessage\(/.test(positionsHandler),
+    false,
+    "the legacy position layout must not be wired to /positions",
+  );
+  assert.equal(
+    /formatOpenPositionsMessage/.test(indexSrc),
+    false,
+    "index.js must not reference the legacy position builder at all",
+  );
+});
+
+test("management cycle keeps the pure tree helpers", () => {
   const indexSrc = fs.readFileSync(path.join(ROOT, "index.js"), "utf8");
   const management = indexSrc.slice(
     indexSrc.indexOf("export async function runManagementCycle"),
@@ -2216,12 +2271,6 @@ test("management cycle and /positions share the pure tree helpers", () => {
   assert.match(management, /formatTreeRows\(/, "management report uses the tree layout");
   assert.match(management, /formatProgressBar\(/, "management report uses the progress bar");
   assert.match(management, /SECTION_DIVIDER/, "management report uses section dividers");
-
-  const positionsHandler = indexSrc.slice(
-    indexSrc.indexOf('if (text === "/positions")'),
-    indexSrc.indexOf("// /pool (no argument)"),
-  );
-  assert.match(positionsHandler, /formatOpenPositionsMessage\(/);
 
   const telegramSrc = fs.readFileSync(path.join(ROOT, "telegram.js"), "utf8");
   assert.match(telegramSrc, /formatOutOfRangeAlert\(/);

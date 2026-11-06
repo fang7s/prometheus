@@ -45,12 +45,12 @@ import {
   showLpMainMenu,
   showNewPositionView,
   showPoolListView,
+  showPositionsView,
   forgetLpMessageView,
   handleLpCallback,
   handleLpText,
   openAddressQuery as openLpAddressQuery,
   openPoolByAddress as openLpPoolByAddress,
-  enrichPositionsWithMarketCap,
 } from "./services/lp-menu.js";
 // Hot Fees Opportunity digest — read-only ranking broadcast (/hot, /screener)
 // plus its inline keyboard. The service owns fetch + cache + rendering; this
@@ -73,7 +73,6 @@ import {
   SECTION_DIVIDER,
   computeRangePositionPct,
   formatMoney,
-  formatOpenPositionsMessage,
   formatProgressBar,
   formatSignedPct,
   formatTreeRows,
@@ -1705,7 +1704,7 @@ function formatHelpText() {
     "/help — show commands",
     "/status — wallet + positions snapshot",
     "/wallet — wallet, deploy amount, HiveMind status",
-    "/positions — list open positions",
+    "/positions — manage open positions (same card as /start → 📊 My Positions)",
     "/pool — run AI screening (LLM picks a candidate, code executes the entry)",
     "/pool <n> — detailed info for one open position",
     "/close <n> — close one position by index",
@@ -2274,7 +2273,7 @@ async function telegramHandler(msg) {
     try {
       const [wallet, positions] = await Promise.all([getWalletBalances(), getMyPositions({ force: true })]);
       const suffix = text === "/status" && positions.total_positions
-        ? `\n\nUse /positions for the numbered list.`
+        ? `\n\nUse /positions for the position management view (TP/SL · slippage · claim · rebalance · close).`
         : "";
       await sendMessage(`${formatWalletStatus(wallet, positions)}${suffix}`).catch(() => {});
     } catch (e) {
@@ -2289,20 +2288,15 @@ async function telegramHandler(msg) {
   }
 
   if (text === "/positions") {
+    // Unified with `/start` → 📊 My Positions: the SAME position-management
+    // card (per-position TP/SL · slippage · collect fees · rebalance · close)
+    // and the same `buildPositionsKeyboard()` inline controls. The legacy
+    // tree/ASCII layout is no longer reachable from this command.
     try {
-      const { positions = [], total_positions } = await getMyPositions({ force: true });
-      // Live market cap is a display-only enrichment — failures leave it off.
-      // Skipped entirely when there is nothing to show (no wasted HTTP call).
-      const enriched = positions.length ? await enrichPositionsWithMarketCap(positions) : [];
-      // 100 % local rendering: tree branches, dividers, progress bars and
-      // monospace blocks are built synchronously from this snapshot.
-      await sendHTML(formatOpenPositionsMessage({
-        positions: enriched,
-        totalPositions: total_positions ?? enriched.length,
-        mode: config.management.solMode ? "SOL" : "USD",
-        maxPositions: config.risk.maxPositions,
-      }));
-    } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
+      await showPositionsView(msg, { force: true });
+    } catch (e) {
+      await sendMessage(isTimeoutError(e) ? TIMEOUT_MESSAGE : `Error: ${e.message}`).catch(() => {});
+    }
     return;
   }
 

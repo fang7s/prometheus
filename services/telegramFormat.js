@@ -313,7 +313,13 @@ export function formatOpenPositionBlock(position, index = 0, mode = "USD") {
 }
 
 /**
- * `/positions` — open positions in the structured tree layout (HTML).
+ * LEGACY tree-layout position list (HTML) — kept as a pure formatter only.
+ *
+ * `/positions` no longer uses it: the command renders the unified
+ * 📊 My Positions card (`services/lp-menu.js#renderPositionsView`, complete with
+ * 🎯 TP/SL · ⚙️ Slippage · 💸 Collect Fees · ⚖️ Rebalance · 🔴 Close inline
+ * controls), exactly like `/start → 📊 My Positions`. Nothing wires this builder
+ * to a command any more — see `index.js#telegramHandler`.
  *
  * Pure local formatting: the caller passes the already-fetched snapshots
  * (optionally enriched with `mcap`), nothing here touches the network.
@@ -362,7 +368,7 @@ export function formatOpenPositionsMessage({
 }
 
 /**
- * `⚠️ Out of Range` alert (HTML) with the same tree layout as `/positions`.
+ * `⚠️ Out of Range` alert (HTML) — same tree layout as the legacy position list.
  *
  * Accepts either the flat `{ pair, minutesOOR }` pair or the full in-memory
  * position snapshot (`position`), which adds the range bar, PnL and value rows.
