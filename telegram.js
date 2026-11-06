@@ -403,6 +403,37 @@ async function postTelegramMultipart(method, form) {
 }
 
 /**
+ * Delete one of the bot's own messages.
+ *
+ * Used when a menu is replaced by a FRESH message at the bottom of the chat, so
+ * the chat never accumulates stale inline keyboards (`/start`, `/positions`,
+ * `/screener`, hub sub-views, …). Failure is routine — Telegram refuses
+ * messages older than 48 h and chats where the bot lacks the right — so it is
+ * logged at info level only: this never throws and never blocks the new card
+ * that has already been sent.
+ *
+ * @param {number|string|null} messageId
+ * @returns {Promise<boolean>} true when Telegram confirmed the deletion
+ */
+export async function deleteMessage(messageId) {
+  if (!TOKEN || !chatId || !messageId) return false;
+  try {
+    const result = await requestTelegram("deleteMessage", {
+      json: { chat_id: chatId, message_id: Number(messageId) || messageId },
+    });
+    if (result.ok) return true;
+    log(
+      "telegram",
+      `deleteMessage ${result.status ?? ""}: ${String(result.errorText || "").slice(0, 160)}`,
+    );
+    return false;
+  } catch (e) {
+    log("telegram", `deleteMessage failed: ${describeTelegramError(e)}`);
+    return false;
+  }
+}
+
+/**
  * Send a PNG as a photo with an HTML caption and optional inline keyboard.
  * Returns the new message id (or null when Telegram is not configured).
  */

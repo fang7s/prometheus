@@ -35,6 +35,7 @@ import {
   sendPhotoWithCaption,
   editPhotoWithCaption,
   answerCallbackQuery,
+  deleteMessage,
 } from "../telegram.js";
 import {
   openDlmmPosition,
@@ -1488,6 +1489,15 @@ export function forgetLpMessageView(messageId) {
   else _lastView.clear();
 }
 
+/**
+ * Edit ONE message in place.
+ *
+ * Reserved for LOCAL sub-card actions on the card the user is touching right
+ * now: amount / range / strategy / preset buttons on the deploy dashboard, the
+ * 🎯 TP/SL presets, ⚙️ slippage toggles, ♻️ auto-rebalance, ✏️ custom prompts
+ * and the deploy confirmation card. Screen switches never come through here —
+ * they use {@link presentFreshMessage} so the newest card lands at the bottom.
+ */
 async function presentMessage({ text, keyboard }, messageId = null) {
   const signature = viewSignature(text, keyboard);
   if (messageId) {
@@ -1506,23 +1516,63 @@ async function presentMessage({ text, keyboard }, messageId = null) {
 }
 
 /**
+ * Post a MAJOR view as a FRESH message at the bottom of the chat.
+ *
+ * A screen switch (`/start`, `/positions`, `/screener`, 📊 My Positions, pool
+ * lists, the deploy dashboard, …) must never edit a menu that may sit far up the
+ * chat history — the user would keep staring at an old message and have to
+ * scroll down to find the new one. So the view is always sent as a NEW message
+ * and the menu it replaces is deleted right after it (best-effort: Telegram
+ * refuses messages older than 48 h, which is not an error for us).
+ *
+ * @param {{text: string, keyboard: Array}} view
+ * @param {{previousId?: number|string|null, session?: object|null}} [options]
+ * @returns {Promise<number|null>} the new message id
+ */
+async function presentFreshMessage(view, { previousId = null, session = null } = {}) {
+  const signature = viewSignature(view.text, view.keyboard);
+  const sent = await sendHTMLWithButtons(view.text, view.keyboard);
+  const id = sent?.result?.message_id ?? null;
+  // The send failed (Telegram offline / timeout): keep the previous card intact
+  // rather than dropping the user on a blank screen.
+  if (!id) return previousId ?? null;
+
+  _lastView.set(id, signature);
+  if (_lastView.size > 200) _lastView.clear();
+
+  if (previousId && Number(previousId) !== Number(id)) {
+    const deleted = await deleteMessage(previousId);
+    if (deleted) {
+      _lastView.delete(previousId);
+      // The replaced message can no longer host the dashboard chart.
+      if (session && Number(session.chartMessageId) === Number(previousId)) session.chartMessageId = null;
+    }
+  }
+  return id;
+}
+
+/**
  * Root dashboard — sent by `/start`, `/lp`, `/dashboard`, `lp:main` and every
  * 🏠 Main Menu button. Clears any in-progress position selection so nothing
  * stale leaks into the hub.
  */
-export async function showLpMainMenu({ messageId = null, force = false, note = null, msg = null } = {}) {
+export async function showLpMainMenu({ messageId = null, force = false, note = null, msg = null, fresh = true } = {}) {
   const session = msg ? getLpSession(msg) : null;
   if (session) {
     session.awaiting = null;
     session.pool = null;
-    session.messageId = messageId ?? session.messageId;
   }
 
   const wallet = await getWalletSnapshot({ force });
   const view = renderDashboardHub({ wallet, note });
-  const newMessageId = await presentMessage(view, messageId ?? session?.messageId ?? null);
-  if (session) session.messageId = newMessageId;
-  return newMessageId;
+  // Fresh message at the bottom: `/start` and 🏠 Main Menu never edit a distant
+  // menu. The previous menu message is retired right after the new one lands.
+  if (!session) {
+    if (!fresh) return presentMessage(view, messageId);
+    const sent = await sendHTMLWithButtons(view.text, view.keyboard);
+    return sent?.result?.message_id ?? null;
+  }
+  return presentHubView(msg, view, { messageId, fresh });
 }
 
 /**
@@ -1530,13 +1580,12 @@ export async function showLpMainMenu({ messageId = null, force = false, note = n
  * pool address, or paste a token CA to search all of its pairs).
  * `sort: "volume"` re-orders the same candidates by 24h volume.
  */
-export async function showPoolListView({ messageId = null, force = false, note = null, msg = null, sort = "fee" } = {}) {
+export async function showPoolListView({ messageId = null, force = false, note = null, msg = null, sort = "fee", fresh = true } = {}) {
   const session = msg ? getLpSession(msg) : null;
   if (session) {
     session.awaiting = null;
     session.pool = null;
     session.listKind = "list";
-    session.messageId = messageId ?? session.messageId;
   }
 
   let pools = [];
@@ -1564,9 +1613,7 @@ export async function showPoolListView({ messageId = null, force = false, note =
       ? `🔥 <b>Top Trending</b> · ${pools.length} pool(s) by 24h volume`
       : null,
   });
-  const newMessageId = await presentMessage(view, messageId ?? session?.messageId ?? null);
-  if (session) session.messageId = newMessageId;
-  return newMessageId;
+  return presentHubView(msg, view, { messageId, fresh });
 }
 
 /**
@@ -1574,12 +1621,11 @@ export async function showPoolListView({ messageId = null, force = false, note =
  * Puts the session in "awaiting address" mode: the next plain-text message may
  * be a token CA (list its DLMM pools) or a pool address (open it directly).
  */
-export async function showNewPositionView({ messageId = null, note = null, msg = null } = {}) {
+export async function showNewPositionView({ messageId = null, note = null, msg = null, fresh = true } = {}) {
   const session = msg ? touch(getLpSession(msg)) : null;
   if (session) {
     session.awaiting = "address";
     session.pool = null;
-    session.messageId = messageId ?? session.messageId;
   }
 
   // No network here: quick picks come from cached screening data + defaults.
@@ -1588,9 +1634,7 @@ export async function showNewPositionView({ messageId = null, note = null, msg =
     tokenQuery: session?.tokenQuery ?? null,
   });
   const view = renderNewPositionView({ picks, note });
-  const newMessageId = await presentMessage(view, messageId ?? session?.messageId ?? null);
-  if (session) session.messageId = newMessageId;
-  return newMessageId;
+  return presentHubView(msg, view, { messageId, fresh });
 }
 
 /**
@@ -1598,13 +1642,12 @@ export async function showNewPositionView({ messageId = null, note = null, msg =
  * Jupiter organic scores. The resulting pools become `session.pools`, so each
  * numbered button (`lp:pool:<n>`) opens the normal Quick Zap dashboard.
  */
-export async function showTrendingView({ messageId = null, force = false, note = null, msg = null } = {}) {
+export async function showTrendingView({ messageId = null, force = false, note = null, msg = null, fresh = true } = {}) {
   const session = msg ? touch(getLpSession(msg)) : null;
   if (session) {
     session.awaiting = null;
     session.pool = null;
     session.listKind = "trending";
-    session.messageId = messageId ?? session.messageId;
   }
 
   let pools = [];
@@ -1624,9 +1667,7 @@ export async function showTrendingView({ messageId = null, force = false, note =
     wallet,
     note: scanError ? `Scan error: ${scanError}` : note,
   });
-  const newMessageId = await presentMessage(view, messageId ?? session?.messageId ?? null);
-  if (session) session.messageId = newMessageId;
-  return newMessageId;
+  return presentHubView(msg, view, { messageId, fresh });
 }
 
 // ─── Liquidity chart attachment ───────────────────────────────────
@@ -1649,7 +1690,7 @@ export function chartSignature({ poolAddress = null, activeBinId = null, minBinI
  * Any failure (canvas not installed, RPC/bin fetch error, Telegram offline)
  * leaves the text dashboard untouched — this helper never throws.
  */
-async function attachLiquidityChart(msg, session, view) {
+async function attachLiquidityChart(msg, session, view, { force = false } = {}) {
   const pool = session?.pool;
   if (!pool?.address || !view?.text || !msg) return null;
 
@@ -1662,7 +1703,7 @@ async function attachLiquidityChart(msg, session, view) {
     minBinId: range?.minBinId ?? null,
     maxBinId: range?.maxBinId ?? null,
   });
-  if (session.chartSignature === signature && session.chartMessageId) return session.chartMessageId;
+  if (!force && session.chartSignature === signature && session.chartMessageId) return session.chartMessageId;
 
   let chart = null;
   try {
@@ -1693,23 +1734,38 @@ async function attachLiquidityChart(msg, session, view) {
   }
 
   const caption = chart.buildPhotoCaption(view.text);
-  if (session.chartMessageId) {
-    const edited = await editPhotoWithCaption(caption, session.chartMessageId, buffer);
+  const previousChartId = session.chartMessageId;
+  // In-place dashboard updates keep editing the same photo…
+  if (!force && previousChartId) {
+    const edited = await editPhotoWithCaption(caption, previousChartId, buffer);
     if (edited) {
       session.chartSignature = signature;
-      return session.chartMessageId;
+      return previousChartId;
     }
   }
+  // …while a fresh dashboard posts a NEW chart at the bottom and retires the old
+  // one, so the chart can never be stranded high up in the chat history.
   const sent = await sendPhotoWithCaption(caption, buffer);
   if (sent) {
     session.chartMessageId = sent;
     session.chartSignature = signature;
+    if (previousChartId && Number(previousChartId) !== Number(sent)) {
+      await deleteMessage(previousChartId).catch(() => false);
+    }
     return sent;
   }
   return null;
 }
 
-async function presentDashboard(msg, { note = null, messageId = null } = {}) {
+/**
+ * Deploy dashboard (Quick Zap / amount / range / strategy).
+ *
+ * `fresh: true` when the dashboard is OPENED (pool selection, `/lp <pool>`,
+ * digest “Open n”) → a new card at the bottom + the previous menu retired.
+ * `fresh: false` for its own micro-buttons (preset, amount, range, strategy,
+ * refresh) → those edit the active card in place.
+ */
+async function presentDashboard(msg, { note = null, messageId = null, fresh = false } = {}) {
   const session = touch(getLpSession(msg));
 
   // The card is rendered 100 % from memory: the market header is derived from the
@@ -1735,13 +1791,15 @@ async function presentDashboard(msg, { note = null, messageId = null } = {}) {
 
   const wallet = await getWalletSnapshot();
   const view = renderDashboard(session, { wallet, note });
-  const id = messageId ?? session.messageId ?? msg?.messageId ?? null;
-  const newId = await presentMessage(view, id);
+  const previousId = messageId ?? session.messageId ?? msg?.messageId ?? null;
+  const newId = fresh
+    ? await presentFreshMessage(view, { previousId, session })
+    : await presentMessage(view, previousId);
   session.messageId = newId;
 
   // Best-effort photo chart; the text card above is always the source of truth.
   try {
-    await attachLiquidityChart(msg, session, view);
+    await attachLiquidityChart(msg, session, view, { force: fresh });
   } catch (error) {
     log("lp_ui_warn", `Chart attach failed: ${error.message}`);
   }
@@ -1749,17 +1807,36 @@ async function presentDashboard(msg, { note = null, messageId = null } = {}) {
 }
 
 // ─── Dashboard navigation ────────────────────────────────────────
-/** Shared presenter: keeps the session pointed at the message being edited. */
-async function presentHubView(msg, view, { messageId = null } = {}) {
+/**
+ * Shared presenter for every MAJOR hub screen.
+ *
+ * `fresh` defaults to **true**: opening a screen always posts a new card at the
+ * BOTTOM of the chat and then retires the menu it replaced, so the user never
+ * has to scroll back up to find the view they just asked for. Pass
+ * `fresh: false` only to re-render the very same card in place.
+ */
+async function presentHubView(msg, view, { messageId = null, fresh = true } = {}) {
   const session = msg ? touch(getLpSession(msg)) : null;
-  const id = messageId ?? session?.messageId ?? msg?.messageId ?? null;
-  const newId = await presentMessage(view, id);
-  if (session) session.messageId = newId;
+  const previousId = messageId ?? session?.messageId ?? msg?.messageId ?? null;
+  const newId = fresh
+    ? await presentFreshMessage(view, { previousId, session })
+    : await presentMessage(view, previousId);
+  if (session) {
+    session.messageId = newId;
+    // Leaving the deploy dashboard: its chart photo would otherwise be stranded
+    // high up in the chat. Retire it together with the card it belonged to.
+    if (fresh && session.chartMessageId && Number(session.chartMessageId) !== Number(newId)) {
+      const chartId = session.chartMessageId;
+      session.chartMessageId = null;
+      session.chartSignature = null;
+      await deleteMessage(chartId).catch(() => false);
+    }
+  }
   return newId;
 }
 
 /** 📊 My Positions — open Meteora DLMM positions with live PnL / unclaimed fees. */
-export async function showPositionsView(msg, { force = false, messageId = null, note: viewNote = null } = {}) {
+export async function showPositionsView(msg, { force = false, messageId = null, note: viewNote = null, fresh = true } = {}) {
   const session = touch(getLpSession(msg));
   // Opening the list cancels any pending ✏️ Custom prompt — position actions
   // always start from the freshly rendered list below.
@@ -1794,17 +1871,18 @@ export async function showPositionsView(msg, { force = false, messageId = null, 
   session.positions = positions;
   const wallet = await getWalletSnapshot();
   // ONE renderer for `/start → 📊 My Positions` and the `/positions` command.
-  return presentHubView(msg, renderPositionsView({ positions, wallet, note }), { messageId });
+  // Always a fresh bottom card: the list must be visible immediately.
+  return presentHubView(msg, renderPositionsView({ positions, wallet, note }), { messageId, fresh });
 }
 
 /** 💰 Balance — full SOL / USDC / USDT + SPL token breakdown. */
-export async function showBalancesView(msg, { force = true, messageId = null } = {}) {
+export async function showBalancesView(msg, { force = true, messageId = null, fresh = true } = {}) {
   const wallet = await getWalletSnapshot({ force });
-  return presentHubView(msg, renderBalances({ wallet }), { messageId });
+  return presentHubView(msg, renderBalances({ wallet }), { messageId, fresh });
 }
 
 /** 📅 Profit Calendar — closed-position performance from the lessons history. */
-export async function showProfitCalendarView(msg, { hours = 24, messageId = null } = {}) {
+export async function showProfitCalendarView(msg, { hours = 24, messageId = null, fresh = true } = {}) {
   let summary = null;
   let history = null;
   let note = null;
@@ -1816,33 +1894,33 @@ export async function showProfitCalendarView(msg, { hours = 24, messageId = null
     note = `History unavailable: ${error.message}`;
     log("lp_ui_warn", `Profit calendar failed: ${error.message}`);
   }
-  return presentHubView(msg, renderProfitCalendar({ summary, history, hours, note }), { messageId });
+  return presentHubView(msg, renderProfitCalendar({ summary, history, hours, note }), { messageId, fresh });
 }
 
-export async function showChainView(msg, { messageId = null } = {}) {
-  return presentHubView(msg, renderChainView(), { messageId });
+export async function showChainView(msg, { messageId = null, fresh = true } = {}) {
+  return presentHubView(msg, renderChainView(), { messageId, fresh });
 }
 
-export async function showWalletView(msg, { force = false, messageId = null } = {}) {
+export async function showWalletView(msg, { force = false, messageId = null, fresh = true } = {}) {
   const wallet = await getWalletSnapshot({ force });
-  return presentHubView(msg, renderWalletView({ wallet }), { messageId });
+  return presentHubView(msg, renderWalletView({ wallet }), { messageId, fresh });
 }
 
-export async function showDammView(msg, { messageId = null } = {}) {
-  return presentHubView(msg, renderDammView(), { messageId });
+export async function showDammView(msg, { messageId = null, fresh = true } = {}) {
+  return presentHubView(msg, renderDammView(), { messageId, fresh });
 }
 
-export async function showReferralsView(msg, { messageId = null } = {}) {
-  return presentHubView(msg, renderReferralsView(), { messageId });
+export async function showReferralsView(msg, { messageId = null, fresh = true } = {}) {
+  return presentHubView(msg, renderReferralsView(), { messageId, fresh });
 }
 
-export async function showDonateView(msg, { messageId = null } = {}) {
+export async function showDonateView(msg, { messageId = null, fresh = true } = {}) {
   const wallet = await getWalletSnapshot();
-  return presentHubView(msg, renderDonateView({ wallet }), { messageId });
+  return presentHubView(msg, renderDonateView({ wallet }), { messageId, fresh });
 }
 
-export async function showHelpView(msg, { messageId = null } = {}) {
-  return presentHubView(msg, renderHelpView(), { messageId });
+export async function showHelpView(msg, { messageId = null, fresh = true } = {}) {
+  return presentHubView(msg, renderHelpView(), { messageId, fresh });
 }
 
 // ─── Pool selection ───────────────────────────────────────────────
@@ -1873,7 +1951,8 @@ async function selectPool(msg, index) {
 
   session.pool = pool;
   session.awaiting = null;
-  await presentDashboard(msg, { note, messageId: msg.messageId });
+  // Opening a pool is a SCREEN SWITCH: new dashboard at the bottom, old list gone.
+  await presentDashboard(msg, { note, messageId: msg.messageId, fresh: true });
 }
 
 // ─── Preset application ───────────────────────────────────────────
@@ -2094,12 +2173,13 @@ export async function openPoolByAddress(msg, address, { quiet = false } = {}) {
 
   session.pool = { ...entry, address };
   session.awaiting = null;
-  await presentDashboard(msg, { note, messageId: msg.messageId });
+  // Opened from a command, the digest or a pasted address — always a fresh card.
+  await presentDashboard(msg, { note, messageId: msg.messageId, fresh: true });
   return true;
 }
 
 // ─── Token mint search ────────────────────────────────────────────
-async function presentTokenPools(msg, result, { note = null, messageId = null } = {}) {
+async function presentTokenPools(msg, result, { note = null, messageId = null, fresh = true } = {}) {
   const session = touch(getLpSession(msg));
   session.pools = tokenPoolEntries(result?.pools);
   session.pool = null;
@@ -2115,10 +2195,9 @@ async function presentTokenPools(msg, result, { note = null, messageId = null } 
     wallet,
     note,
   });
-  const id = messageId ?? session.messageId ?? msg?.messageId ?? null;
-  const newId = await presentMessage(view, id);
-  session.messageId = newId;
-  return newId;
+  // Token pool search is a SCREEN SWITCH (pasted CA / `/lp <mint>` / `lp:tok`) →
+  // the list lands at the bottom of the chat.
+  return presentHubView(msg, view, { messageId, fresh });
 }
 
 /**

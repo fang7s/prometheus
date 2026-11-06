@@ -23,6 +23,7 @@ import {
   editMessageWithButtons,
   editHTMLWithButtons,
   answerCallbackQuery,
+  deleteMessage,
   notifyOutOfRange,
   isEnabled as telegramEnabled,
   createLiveMessage,
@@ -1602,13 +1603,31 @@ function renderSettingsMenu(page = "main") {
   return { text: summary, keyboard: [...nav, ...rows, ...footer] };
 }
 
-async function showSettingsMenu({ messageId = null, page = "main" } = {}) {
+/**
+ * Render the ⚙️ settings menu.
+ *
+ * `fresh: true` (menu OPENED / page switched, incl. the hub's ⚙️ Settings button)
+ * posts a NEW message at the bottom and retires the previous menu, so opening the
+ * settings from a menu high up in the chat never edits that old message.
+ * `fresh: false` re-renders the SAME page in place after a toggle/step/set —
+ * exactly the local micro-action that in-place edits are reserved for.
+ *
+ * @returns {Promise<number|null>} the message id now holding the menu
+ */
+async function showSettingsMenu({ messageId = null, page = "main", fresh = false } = {}) {
   const menu = renderSettingsMenu(page);
-  if (messageId) {
-    await editMessageWithButtons(menu.text, messageId, menu.keyboard);
-  } else {
-    await sendMessageWithButtons(menu.text, menu.keyboard);
+  if (messageId && !fresh) {
+    const edited = await editMessageWithButtons(menu.text, messageId, menu.keyboard);
+    if (edited) return messageId;
   }
+  const sent = await sendMessageWithButtons(menu.text, menu.keyboard);
+  const newId = sent?.result?.message_id ?? null;
+  if (messageId && newId && Number(messageId) !== Number(newId)) {
+    // Best-effort cleanup of the menu this one replaces.
+    await deleteMessage(messageId).catch(() => false);
+  }
+  if (messageId) forgetLpMessageView(messageId);
+  return newId;
 }
 
 function normalizeMenuValue(key, raw) {
@@ -1643,13 +1662,19 @@ async function applySettingsMenuCallback(msg) {
   }
   if (action === "show") {
     await answerCallbackQuery(msg.callbackQueryId);
-    await editMessageWithButtons(formatConfigSnapshot(), msg.messageId, [[settingButton("Back", "cfg:page:main")]]);
+    // A full config view is a screen of its own: fresh at the bottom.
+    const sent = await sendMessageWithButtons(formatConfigSnapshot(), [[settingButton("Back", "cfg:page:main")]]);
+    const newId = sent?.result?.message_id ?? null;
+    if (newId && msg.messageId && Number(newId) !== Number(msg.messageId)) {
+      await deleteMessage(msg.messageId).catch(() => false);
+    }
     return;
   }
   if (action === "page") {
     page = parts[2] || "main";
     await answerCallbackQuery(msg.callbackQueryId);
-    await showSettingsMenu({ messageId: msg.messageId, page });
+    // Page switch / menu entry → fresh bottom message (the tapped menu is retired).
+    await showSettingsMenu({ messageId: msg.messageId, page, fresh: true });
     return;
   }
 

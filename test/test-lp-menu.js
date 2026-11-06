@@ -2262,6 +2262,75 @@ test("/positions and /start → My Positions share ONE renderer and keyboard", (
   );
 });
 
+test("major screens post a fresh bottom message; only local sub-cards edit in place", () => {
+  const src = fs.readFileSync(path.join(ROOT, "services", "lp-menu.js"), "utf8");
+
+  // The fresh presenter sends a NEW message and retires the menu it replaced.
+  const freshStart = src.indexOf("async function presentFreshMessage");
+  const freshEnd = src.indexOf("export async function showLpMainMenu");
+  assert.ok(freshStart > 0 && freshEnd > freshStart, "presentFreshMessage must exist");
+  const fresh = src.slice(freshStart, freshEnd);
+  assert.match(fresh, /sendHTMLWithButtons\(/, "fresh views are SENT, never edited");
+  assert.equal(/editHTMLWithButtons\(/.test(fresh), false, "fresh views must not edit an old message");
+  assert.match(fresh, /deleteMessage\(previousId\)/, "the replaced menu is deleted");
+
+  // The hub presenter defaults to fresh…
+  assert.match(
+    src,
+    /async function presentHubView\(msg, view, \{ messageId = null, fresh = true \} = \{\}\)/,
+  );
+
+  // …and every major screen exposes the same `fresh = true` default.
+  for (const fn of [
+    "showLpMainMenu",
+    "showPoolListView",
+    "showNewPositionView",
+    "showTrendingView",
+    "showPositionsView",
+    "showBalancesView",
+    "showProfitCalendarView",
+    "showChainView",
+    "showWalletView",
+    "showDammView",
+    "showReferralsView",
+    "showDonateView",
+    "showHelpView",
+  ]) {
+    assert.match(
+      src,
+      new RegExp(`export async function ${fn}\\([^)]*fresh = true`),
+      `${fn} must present a fresh bottom message`,
+    );
+  }
+
+  // Micro-actions stay in place: the dashboard defaults to editing its own card.
+  assert.match(
+    src,
+    /async function presentDashboard\(msg, \{ note = null, messageId = null, fresh = false \} = \{\}\)/,
+  );
+  // Opening a pool is a screen switch → fresh.
+  const selectPoolSrc = src.slice(src.indexOf("async function selectPool"), src.indexOf("// ─── Preset application"));
+  assert.match(selectPoolSrc, /presentDashboard\(msg, \{ note, messageId: msg\.messageId, fresh: true \}\)/);
+
+  // telegram.js exposes the delete API used to retire replaced menus.
+  const telegramSrc = fs.readFileSync(path.join(ROOT, "telegram.js"), "utf8");
+  assert.match(telegramSrc, /export async function deleteMessage\(/);
+  assert.match(telegramSrc, /requestTelegram\("deleteMessage"/);
+
+  // Settings: opening a page is fresh, a toggle re-renders the SAME page in place.
+  const indexSrc = fs.readFileSync(path.join(ROOT, "index.js"), "utf8");
+  assert.match(
+    indexSrc,
+    /showSettingsMenu\(\{ messageId: msg\.messageId, page, fresh: true \}\)/,
+    "page switches open a fresh bottom message",
+  );
+  assert.match(
+    indexSrc,
+    /showSettingsMenu\(\{ messageId: msg\.messageId, page \}\)/,
+    "toggle/step/set keep editing the active menu",
+  );
+});
+
 test("management cycle keeps the pure tree helpers", () => {
   const indexSrc = fs.readFileSync(path.join(ROOT, "index.js"), "utf8");
   const management = indexSrc.slice(
